@@ -188,6 +188,65 @@ fn stroke_run(frames: Vec<Frame>) -> Recorded {
     }
 }
 
+/// A frame of the near stroke with a bar up, at `at`, whose UI took `gpu` and `owner` ms.
+fn bar_frame(at: f64, gpu: Option<f64>, owner: f64) -> Frame {
+    Frame {
+        gpu_ui_ms: gpu,
+        ui_ms: Some(owner),
+        ..stroke_frame(at, (0.0, 0.0, false), 0.0)
+    }
+}
+
+/// `costs`' two numbers, GPU then owner.
+fn ui_numbers(costs: [(&'static str, Unit, Value); 2]) -> [Value; 2] {
+    costs.map(|(_, _, value)| value)
+}
+
+#[test]
+fn the_uis_cost_is_the_p99_of_its_stroke_by_the_records_two_fields() {
+    let frames = vec![
+        bar_frame(0.0, Some(0.02), 0.002),
+        bar_frame(6.0, Some(0.04), 0.001),
+        bar_frame(12.0, None, 0.003),
+    ];
+    let costs = strokes::ui_costs(&stroke_run(frames));
+    assert_eq!(costs[0].0, "render.stroke_near.ui_gpu_p99_ms");
+    assert_eq!(costs[1].0, "render.stroke_near.ui_owner_p99_ms");
+    assert_eq!(
+        ui_numbers(costs),
+        [Value::Of(0.04), Value::Of(0.003)],
+        "a frame the GPU didn't time is left out"
+    );
+}
+
+/// Frames of another stroke aren't this run's measure.
+#[test]
+fn the_uis_cost_is_taken_over_the_near_stroke_alone() {
+    let mut elsewhere = bar_frame(0.0, Some(9.0), 9.0);
+    elsewhere.segment = Some("stroke_far".to_owned());
+    let frames = vec![elsewhere, bar_frame(6.0, Some(0.04), 0.001)];
+    let costs = strokes::ui_costs(&stroke_run(frames));
+    assert_eq!(ui_numbers(costs), [Value::Of(0.04), Value::Of(0.001)]);
+}
+
+/// A record with no UI in it says so, rather than a zero that would pass any budget.
+#[test]
+fn a_run_with_no_ui_lacks_its_cost() {
+    let frames = vec![stroke_frame(0.0, (0.0, 0.0, false), 0.0)];
+    let costs = strokes::ui_costs(&stroke_run(frames));
+    assert_eq!(ui_numbers(costs), [Value::Lacking, Value::Lacking]);
+}
+
+#[test]
+fn the_records_ui_fields_are_read() {
+    let run = r#"{"bench":"render","result":"run","open_ms":1}"#;
+    let line = r#"{"bench":"render","result":"frame","time_ms":1,"ui_ms":0.002,"gpu_ui_ms":0.03}"#;
+    let recorded = Recorded::parse(&format!("{run}\n{line}\n")).unwrap();
+    let frame = recorded.frames.first().unwrap();
+    assert_eq!(frame.ui_ms, Some(0.002));
+    assert_eq!(frame.gpu_ui_ms, Some(0.03));
+}
+
 #[test]
 fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
     let frames = vec![

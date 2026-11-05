@@ -458,7 +458,7 @@ impl Renderer {
                 // Over the scene, under the UI.
                 overlay.draw(&mut pass);
                 drop(pass);
-                encode_ui(frame, ui, ui_view.as_ref());
+                encode_ui(frame, ui, ui_view.as_ref(), &mut stamps);
                 tick_readback = finish_stamps(timer.as_mut(), frame, &mut stamps);
             };
             submit(gpu, uploads, commands, passes);
@@ -505,9 +505,14 @@ fn prepare_ui(
     Ok(Some(display.unwrap_or_else(|| image.view().clone())))
 }
 
-/// Encodes the UI's pass of its own on `view`, over what the frame has drawn; with no view,
-/// nothing.
-fn encode_ui(frame: &mut CommandEncoder, ui: &UiPass, view: Option<&TextureView>) {
+/// Encodes the UI's pass of its own on `view`, over what the frame has drawn, stamped by `stamps`;
+/// with no view, nothing, and no stamp taken.
+fn encode_ui(
+    frame: &mut CommandEncoder,
+    ui: &UiPass,
+    view: Option<&TextureView>,
+    stamps: &mut Stamps,
+) {
     let Some(view) = view else {
         return;
     };
@@ -522,6 +527,7 @@ fn encode_ui(frame: &mut CommandEncoder, ui: &UiPass, view: Option<&TextureView>
                 store: StoreOp::Store,
             },
         })],
+        timestamp_writes: stamps.render(GpuPhase::Ui),
         ..RenderPassDescriptor::default()
     });
     ui.draw(&mut pass);

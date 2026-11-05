@@ -601,6 +601,7 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
         frames: options.frames(),
         script: options.script(),
         record: options.record_setup(render.timing(), opening),
+        show_bar: options.show_bar,
     };
     let mut owner = start(project, Arc::clone(&gpu), setup)?;
     if let Some(note) = &note {
@@ -1262,6 +1263,7 @@ mod tests {
             frames: Some(frames),
             script: None,
             record: None,
+            show_bar: false,
         }
     }
 

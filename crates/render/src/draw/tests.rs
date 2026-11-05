@@ -459,8 +459,10 @@ fn every_phase_plausible(times: &GpuTimes) {
         total < Duration::from_secs(10),
         "a frame, not a run: {total:?}"
     );
+    assert_eq!(times.phase(GpuPhase::Ui), None, "this frame shows no UI");
     let phases: Vec<(GpuPhase, Duration)> = GpuPhase::ALL
         .iter()
+        .filter(|&&phase| phase != GpuPhase::Ui)
         .map(|&phase| (phase, times.phase(phase).expect("every phase ran")))
         .collect();
     for &(phase, took) in &phases {

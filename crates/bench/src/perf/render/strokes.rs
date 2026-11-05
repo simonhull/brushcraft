@@ -48,6 +48,11 @@
 //! ≤ 1; and the big brush exact ≤ 2 s after its 2 s stroke (the spec's provisional figure).
 //!
 //! A run whose record lacks a segment (an older app) gives no sample of its metrics.
+//!
+//! **The UI's cost** ([`ui_costs`]) comes from a run of its own, the near stroke with a bar up
+//! (`--show-bar`), p99 over the segment's frames: the UI's pass on the GPU and bringing it up to
+//! date on the owner thread. Those runs' other metrics aren't kept, so what the strokes above
+//! measure is as it was. No ceiling: the spec's budgets are the 4090's.
 
 use crate::perf::metric::Unit;
 use crate::perf::render::{Frame, Recorded, Value, percentile};
@@ -97,6 +102,26 @@ const NAMES: [[&str; 12]; 5] = [
     names!("stroke_heavy"),
     names!("stroke_huge"),
 ];
+
+/// The stroke the UI's cost is measured over.
+const UI_SEGMENT: &str = "stroke_near";
+
+/// The UI's pass on the GPU, p99 over the stroke, by its name after the scale.
+const UI_GPU: &str = "render.stroke_near.ui_gpu_p99_ms";
+
+/// The UI's work on the owner thread, p99 over the stroke, by its name after the scale.
+const UI_OWNER: &str = "render.stroke_near.ui_owner_p99_ms";
+
+/// The UI's cost in `recorded`, a run with a bar up, by name after the scale.
+pub(crate) fn ui_costs(recorded: &Recorded) -> [(&'static str, Unit, Value); 2] {
+    let frames: Vec<&Frame> = recorded.in_segment(UI_SEGMENT).collect();
+    let gpu: Vec<f64> = frames.iter().filter_map(|frame| frame.gpu_ui_ms).collect();
+    let owner: Vec<f64> = frames.iter().filter_map(|frame| frame.ui_ms).collect();
+    [
+        (UI_GPU, Unit::Ms, percentile(&gpu, 99).into()),
+        (UI_OWNER, Unit::Ms, percentile(&owner, 99).into()),
+    ]
+}
 
 /// The big brush's time until exact after its pen-up, at most, in ms: the M1 spec's provisional
 /// "≤ 2 s after a 2 s stroke" (the strokes script's huge stroke lasts 2 s).

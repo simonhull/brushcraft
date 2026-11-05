@@ -31,6 +31,7 @@
 //! - `cpu_ms`: the frame's CPU time on its latency path: the owner thread's input, brush, feed and
 //!   uploads, then the render thread's encode and submit; and those phases, with the owner's upkeep
 //!   and jobs (after the hand-off) and the render thread's acquire and present, each `<phase>_ms`;
+//! - `ui_ms`: bringing the UI up to date for the frame on the owner thread, in no other time here;
 //! - `gpu_wait_ms`: how long the frame waited, once due, for the GPU to finish an earlier one (the
 //!   frame loop keeps at most [`render::FRAMES_IN_FLIGHT`] unfinished): 0 while the GPU keeps up;
 //! - `cut_readback_dropped`, `request_readback_dropped`, `timing_readback_dropped`: whether the
@@ -39,7 +40,8 @@
 //!   them as `readbacks_dropped`, so a regression shows;
 //! - `gpu_ms`: the whole frame on the GPU, and each of its phases ([`GpuPhase`]) as
 //!   `gpu_<phase>_ms`, the sum of its passes (`null` for a phase the frame didn't run, or whose
-//!   timestamps the GPU didn't write);
+//!   timestamps the GPU didn't write). `gpu_ui_ms` is the UI's pass, outside `gpu_ms`, which ends
+//!   at the tone pass with a bar showing or not;
 //! - `lod_<stage>_ms`: the level choice's own stages, timed by its queries (bounds, choose, relax,
 //!   sweep, emit, post; 0 for a stage that didn't run: the bounds, with no tile changed);
 //! - from the frame's cut: `drawn` (whether it came back), `triangles`, `cut`, `tiles_per_level`
@@ -389,6 +391,7 @@ impl FrameRecord {
             .with("between_ms", owner_ms(owner.between))
             .with("feed_ms", owner_ms(owner.feed))
             .with("uploads_ms", owner_ms(owner.uploads))
+            .with("ui_ms", owner_ms(owner.ui))
             .with("upkeep_ms", owner_ms(owner.upkeep))
             .with("prepare_ms", owner_ms(owner.prepare))
             .with("jobs_ms", owner_ms(owner.jobs))

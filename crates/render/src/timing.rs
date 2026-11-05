@@ -57,6 +57,12 @@
 //! waited for after each frame, the gap was 0.00–0.35 ms. Clamped, the uploads are the gap from
 //! that frame's end to the next pass, and the total runs from then.
 //!
+//! **The UI's pass stands outside the total.** It comes after the tone pass, a frame with no UI
+//! encodes none and claims no stamp for it, and [`GpuPhase::Ui`] has its own. The total ends at the
+//! tone pass as it did before the UI had a stamp, so a frame's `gpu_ms` means the same with a bar
+//! showing or not, and records compare across that change. The frame timed next is still clamped
+//! to the UI's end, where this frame really ended.
+//!
 //! A tick of zero or all ones is no time: a pass with one is unwritten, and its phase (and any
 //! gap beside it) is absent rather than wrong.
 //!
@@ -130,11 +136,14 @@ pub enum GpuPhase {
     /// The last pass: the tone map (with the edge filter while moving), or the debug view, and
     /// the overlay.
     Tone,
+    /// The UI's pass, after all of that, in a frame that shows any UI. It stands outside the
+    /// frame's total ([`GpuTimes::total`]).
+    Ui,
 }
 
 impl GpuPhase {
     /// Every phase, in order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Uploads,
         Self::Bounds,
         Self::LevelChoice,
@@ -143,6 +152,7 @@ impl GpuPhase {
         Self::Shade,
         Self::Accumulate,
         Self::Tone,
+        Self::Ui,
     ];
 
     /// The phase's name in records: lowercase, one word.
@@ -157,6 +167,7 @@ impl GpuPhase {
             Self::Shade => "shade",
             Self::Accumulate => "accumulate",
             Self::Tone => "tone",
+            Self::Ui => "ui",
         }
     }
 
@@ -189,6 +200,11 @@ pub(crate) enum Span {
 }
 
 impl Span {
+    /// Whether it counts towards the frame's total: all but the UI's pass (the module notes).
+    const fn in_total(self) -> bool {
+        !matches!(self, Self::Pass(GpuPhase::Ui, _))
+    }
+
     /// Its pass's timestamps; `None` for work between passes.
     const fn pair(self) -> Option<Pair> {
         match self {
@@ -233,7 +249,7 @@ impl Ticks<'_> {
 pub struct GpuTimes {
     /// The frame they are of.
     frame: u64,
-    /// From the frame's first timestamp to its last.
+    /// From the frame's first timestamp to the tone pass's end.
     total: Duration,
     /// Each phase's time, by [`GpuPhase::ALL`]'s order; `None` for a phase the frame didn't run.
     phases: [Option<Duration>; GpuPhase::ALL.len()],
@@ -246,7 +262,8 @@ impl GpuTimes {
         self.frame
     }
 
-    /// From the frame's first timestamp to its last: the whole frame's GPU time.
+    /// From the frame's first timestamp to the tone pass's end: the whole frame's GPU time, the
+    /// UI's pass aside ([`GpuPhase::Ui`]).
     #[must_use]
     pub const fn total(&self) -> Duration {
         self.total
@@ -332,9 +349,11 @@ impl GpuTimes {
                 *slot = None;
             }
         }
-        let written = stamped.iter().flatten().flatten();
-        let first = written.clone().map(|&(begin, _)| begin).min()?;
-        let last = written.map(|&(_, end)| end).max()?;
+        let stamps = spans.iter().zip(&stamped);
+        let counted = stamps.filter(|(span, _)| span.in_total());
+        let written = counted.filter_map(|(_, stamp)| stamp.flatten());
+        let first = written.clone().map(|(begin, _)| begin).min()?;
+        let last = written.map(|(_, end)| end).max()?;
         times.total = ticks_to_duration(last - first, period);
         Some(times)
     }

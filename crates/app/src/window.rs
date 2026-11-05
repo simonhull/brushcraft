@@ -207,6 +207,7 @@ impl WindowApp {
             frames: self.options.frames(),
             script: self.options.script(),
             record,
+            show_bar: self.options.show_bar,
         }
     }
 

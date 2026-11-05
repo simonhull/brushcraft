@@ -67,6 +67,7 @@ fn setup(frames: Option<u64>) -> Setup {
         frames,
         script: None,
         record: None,
+        show_bar: false,
     }
 }
 
@@ -3886,6 +3887,52 @@ fn try_again_on_a_failed_copy_tries_the_copy() {
     tap(&mut owner, again);
     assert!(owner.dialogs.copying(), "the copy is on its way");
     assert_eq!(owner.save_stage(), None, "not a save of the project");
+    owner.close().expect("closed");
+}
+
+/// `--show-bar`: the UI draws under the stroke, and the stroke is the run's, on the bar or off it.
+#[test]
+fn a_bar_for_measuring_draws_in_every_frame_and_takes_nothing_from_a_stroke() {
+    let dir = TestDir::new();
+    let brush = HoldsADab::default();
+    let measuring = Setup {
+        show_bar: true,
+        ..big_setup()
+    };
+    let mut owner = Owner::new(project(&dir), brush, NoUploads, measuring, Instant::now());
+    let deadline = first_deadline(&mut owner);
+    assert!(frame(&mut owner, deadline).ui.is_some(), "from the first");
+    let on_the_bar = Pixel { x: 640.0, y: 750.0 };
+    owner.pen(pen_at(input::Phase::Down, on_the_bar));
+    assert_eq!(owner.pen_queue.len(), 1, "it goes on to the frame");
+    let during = frame(&mut owner, Instant::now() + INTERVAL).ui;
+    assert!(during.is_some(), "drawn under the pen");
+    assert!(!owner.dialogs.pen_is_down(), "and nothing waits for it");
+}
+
+/// The lap is around what it says: a bar's first frame lays it out, which takes time, and a record
+/// says how long.
+#[test]
+fn a_record_has_the_uis_share_of_a_frame() {
+    let dir = TestDir::new();
+    let measuring = Setup {
+        show_bar: true,
+        record: Some(RecordSetup {
+            path: None,
+            project: "test".to_owned(),
+            gpu_timing: false,
+            lod_timing: false,
+            opening: Instant::now(),
+        }),
+        ..big_setup()
+    };
+    let mut owner = Owner::new(project(&dir), NoBrush, NoUploads, measuring, Instant::now());
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    let lines = owner.record_lines();
+    let frame_line = lines.last().expect("the frame's line");
+    let took: f64 = record_field(frame_line, "ui_ms").parse().expect("a time");
+    assert!(took > 0.0, "{frame_line}");
     owner.close().expect("closed");
 }
 

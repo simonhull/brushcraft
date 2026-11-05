@@ -25,6 +25,7 @@ fn owner(dir: &TestDir) -> Owner<NoBrush, NoUploads> {
         frames: None,
         script: None,
         record: None,
+        show_bar: false,
     };
     let mut owner =
         Owner::new(project, NoBrush, NoUploads, setup, Instant::now()).with_picker(picker);

@@ -746,11 +746,13 @@ pub(crate) enum ScriptPath {
     Spiral,
     /// That stroke touching down lightly ([`Script::spiral_light`]).
     SpiralLight,
+    /// The first of the strokes alone ([`Script::near`]).
+    Near,
 }
 
 /// Why a text isn't a [`ScriptPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0:?} isn't a script path: benchmark, strokes, sweep, spiral or spiral-light")]
+#[error("{0:?} isn't a script path: benchmark, strokes, sweep, spiral, spiral-light or near")]
 pub(crate) struct BadPath(String);
 
 impl FromStr for ScriptPath {
@@ -763,6 +765,7 @@ impl FromStr for ScriptPath {
             "sweep" => Ok(Self::Sweep),
             "spiral" => Ok(Self::Spiral),
             "spiral-light" => Ok(Self::SpiralLight),
+            "near" => Ok(Self::Near),
             _ => Err(BadPath(text.to_owned())),
         }
     }
@@ -833,6 +836,7 @@ impl Script {
             ScriptPath::Sweep => Self::sweep(speed),
             ScriptPath::Spiral => Self::spiral(speed),
             ScriptPath::SpiralLight => Self::spiral_light(speed),
+            ScriptPath::Near => Self::near(speed),
         }
     }
 
@@ -893,6 +897,26 @@ impl Script {
             keyframes: SPIRAL.to_vec(),
             speed,
             strokes: vec![SPIRAL_LIGHT_STROKE],
+            pen: Vec::new(),
+        };
+        script.pen = script.every_pen_sample();
+        script
+    }
+
+    /// The strokes path up to the end of its first stroke, run at `speed`: as [`Script::strokes`]
+    /// so far, for measuring a stroke with no more of the path than it needs.
+    pub(crate) fn near(speed: Speed) -> Self {
+        let through_the_stroke = STROKES
+            .iter()
+            .position(|key| key.segment == Segment::StrokeNear);
+        let keyframes = STROKES
+            .iter()
+            .take(through_the_stroke.map_or(0, |at| at + 1));
+        let mut script = Self {
+            start: START,
+            keyframes: keyframes.copied().collect(),
+            speed,
+            strokes: PEN_STROKES.iter().take(1).copied().collect(),
             pen: Vec::new(),
         };
         script.pen = script.every_pen_sample();

@@ -326,6 +326,7 @@ fn the_frame_loop_picks_only_when_the_pointer_or_the_view_changed() {
         frames: None,
         script: None,
         record: None,
+        show_bar: false,
     };
     let mut owner =
         Owner::new(project, NoBrush, NoUploads, setup, Instant::now()).with_picker(picker);

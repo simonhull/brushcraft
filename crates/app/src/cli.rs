@@ -45,13 +45,16 @@ options:
                    the surface at a slant, one long stroke pressed from none to full, still):
                    how a stroke looks, with --screenshot; or spiral (one stroke 25 s long
                    across the whole sphere): what a stroke's length costs; or spiral-light,
-                   that stroke touching down lightly
+                   that stroke touching down lightly; or near (still, in close, the first
+                   of the strokes): what a stroke costs on its own
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads; in a window
                    with neither --script nor --frames, the same for a live session (the pen's
                    latency of strokes drawn by hand), written as the window closes
   --no-gpu-timing  don't time the GPU, even where it can be (with --script)
+  --show-bar       with --script, keep a bar up that answers nothing, at full strength under
+                   the pen, so the UI draws in every frame: for measuring what it costs
   --offscreen      no window: draw into a texture (needs --frames or --script)
   --restore        with --offscreen, bring back the project's unsaved work as a window does,
                    saying `restored: FILE`; without it an offscreen run never picks up a
@@ -108,6 +111,10 @@ pub(crate) struct Options {
     /// Whether an offscreen run brings back unsaved work: the kill test's. A measured run must
     /// never pick up a recovery file, so it doesn't unless asked.
     pub(crate) restore: bool,
+    /// Whether a scripted run keeps a bar up, for measuring the UI ([`Dialogs::show_test_bar`]).
+    ///
+    /// [`Dialogs::show_test_bar`]: crate::dialogs::Dialogs::show_test_bar
+    pub(crate) show_bar: bool,
 }
 
 /// The default finest level: the benchmark project's.
@@ -124,8 +131,8 @@ impl Options {
     ///
     /// On an unknown option, an option without its value or with one that doesn't parse, no
     /// project or more than one, `--offscreen` without `--frames` or `--script`, both of those,
-    /// `--record`, `--script-path` or `--script-speed` without `--script`, or `--screenshot` or
-    /// `--restore` without `--offscreen`.
+    /// `--record`, `--script-path`, `--script-speed` or `--show-bar` without `--script`, or
+    /// `--screenshot` or `--restore` without `--offscreen`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut project = None;
         let mut level = DEFAULT_LEVEL;
@@ -141,6 +148,7 @@ impl Options {
         let mut gpu_timing = true;
         let mut offscreen = false;
         let mut restore = false;
+        let mut show_bar = false;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             if let Some(value) = flag_value(&arg, "--level", &mut args)? {
@@ -178,6 +186,8 @@ impl Options {
                 offscreen = true;
             } else if arg == "--restore" {
                 restore = true;
+            } else if arg == "--show-bar" {
+                show_bar = true;
             } else if arg.to_str().is_some_and(|a| a.starts_with('-')) {
                 bail!("unknown option {}; {USAGE}", arg.display());
             } else if project.replace(PathBuf::from(arg)).is_some() {
@@ -196,10 +206,7 @@ impl Options {
             "--offscreen needs --frames or --script: with no window, nothing closes it"
         );
         let scripted = matches!(run, Run::Script(_));
-        ensure!(
-            scripted || (speed.is_none() && path.is_none()),
-            "--script-path and --script-speed go with --script"
-        );
+        check_script_only(scripted, speed.is_some() || path.is_some(), show_bar)?;
         ensure!(
             record.is_none() || matches!(run, Run::Script(_) | Run::Open),
             "--record goes with --script, or with a window's open run (a live session)"
@@ -222,6 +229,7 @@ impl Options {
             script_path: path.unwrap_or_default(),
             screenshot,
             restore,
+            show_bar,
         })
     }
 
@@ -266,6 +274,25 @@ impl Options {
             opening,
         })
     }
+}
+
+/// Refuses what goes with `--script` alone, on a run that isn't `scripted`: a `path_given` or
+/// speed, or `show_bar`.
+///
+/// # Errors
+///
+/// If either was given.
+fn check_script_only(scripted: bool, path_given: bool, show_bar: bool) -> Result<()> {
+    ensure!(
+        scripted || !path_given,
+        "--script-path and --script-speed go with --script"
+    );
+    ensure!(
+        scripted || !show_bar,
+        "--show-bar goes with --script: it is for measuring, and a bar nobody can answer would be \
+         in a person's way"
+    );
+    Ok(())
 }
 
 /// Checks what only an offscreen run takes: whether it is one, with `--screenshot` and `--restore`
@@ -428,6 +455,9 @@ mod tests {
             &["p.bcrf", "--frames", "3", "--script-speed", "2"],
             &["p.bcrf", "--script", "--script-speed", "0"],
             &["p.bcrf", "--script-path", "strokes"],
+            &["p.bcrf", "--show-bar"],
+            &["p.bcrf", "--frames", "3", "--show-bar"],
+            &["p.bcrf", "--offscreen", "--frames", "3", "--show-bar"],
             &["p.bcrf", "--script", "--script-path", "orbit"],
             &["p.bcrf", "--screenshot", "s.png"],
             &["p.bcrf", "--frames", "3", "--screenshot", "s.png"],
@@ -445,6 +475,17 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "{args:?} refused");
         }
+    }
+
+    #[test]
+    fn a_script_may_show_a_bar_to_measure() {
+        let shown = parse(&["p.bcrf", "--script", "--script-path=near", "--show-bar"]).unwrap();
+        assert!(shown.show_bar);
+        assert_eq!(shown.script_path, ScriptPath::Near);
+        assert!(
+            !parse(&["p.bcrf", "--script"]).unwrap().show_bar,
+            "not by itself"
+        );
     }
 
     #[test]

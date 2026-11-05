@@ -54,6 +54,50 @@ fn a_phase_is_the_sum_of_its_passes_and_the_gaps_its_copies_sit_in() {
     );
 }
 
+/// The frame's total measures what it measured before the UI had a stamp, so records stay
+/// comparable, and the UI's own stamp says what the UI cost.
+#[test]
+fn the_ui_has_a_stamp_of_its_own_outside_the_total() {
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Pass(GpuPhase::Tone, Pair::Own(2)),
+        Span::Pass(GpuPhase::Ui, Pair::Own(4)),
+    ];
+    // Start 100–110; tone 120–200; the UI 205–250.
+    let ticks = [100, 110, 120, 200, 205, 250];
+    let times = GpuTimes::from_ticks(1, &spans, own(&ticks), 1.0, None).unwrap();
+    assert_eq!(times.phase(GpuPhase::Ui), Some(ns(45)));
+    assert_eq!(times.total(), ns(100), "up to tone's end");
+    assert_eq!(times.phase(GpuPhase::Tone), Some(ns(80)), "as ever");
+    let without = GpuTimes::from_ticks(1, &spans[..2], own(&ticks[..4]), 1.0, None).unwrap();
+    assert_eq!(times.total(), without.total(), "with or without the UI");
+    assert_eq!(without.phase(GpuPhase::Ui), None, "no pass, no time");
+}
+
+/// The next frame's start is no earlier than where this one really ended.
+#[test]
+fn a_frame_ends_at_its_ui() {
+    let spans = [
+        Span::Pass(GpuPhase::Tone, Pair::Own(0)),
+        Span::Pass(GpuPhase::Ui, Pair::Own(2)),
+    ];
+    assert_eq!(last_tick(&spans, own(&[120, 200, 205, 250])), Some(250));
+}
+
+/// A UI stamp that wasn't written is the UI's alone to lose.
+#[test]
+fn an_unwritten_ui_stamp_leaves_the_frame_timed() {
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Pass(GpuPhase::Tone, Pair::Own(2)),
+        Span::Pass(GpuPhase::Ui, Pair::Own(4)),
+    ];
+    let times = GpuTimes::from_ticks(1, &spans, own(&[100, 110, 120, 200, 0, 0]), 1.0, None);
+    let times = times.unwrap();
+    assert_eq!(times.phase(GpuPhase::Ui), None);
+    assert_eq!(times.total(), ns(100));
+}
+
 #[test]
 fn ticks_scale_by_the_period_and_borrowed_stamps_read_the_level_choice_s_ticks() {
     let spans = [
@@ -406,7 +450,10 @@ fn an_overlapping_frame_s_unwritten_stamps_still_leave_their_phases_absent() {
 
 /// `spans`' phases from their raw stamps, unclamped, and the total: the rule before passes were
 /// clamped to the ones before them. Every stamp must be written.
-fn unclamped(spans: &[Span], ticks: Ticks<'_>) -> ([Option<Duration>; 8], Duration) {
+fn unclamped(
+    spans: &[Span],
+    ticks: Ticks<'_>,
+) -> ([Option<Duration>; GpuPhase::ALL.len()], Duration) {
     let raw: Vec<Option<(u64, u64)>> = spans
         .iter()
         .map(|span| span.pair().map(|pair| ticks.of(pair).expect("written")))

@@ -302,6 +302,15 @@ impl Routing {
     }
 }
 
+/// What the pen does to what shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PenEffect {
+    /// Bars fade and wait for it, as ever.
+    Fades,
+    /// Nothing: a run measuring the UI ([`Dialogs::show_test_bar`]).
+    None,
+}
+
 /// What shows when: the app's whole UI state, on top of [`Ui`].
 #[derive(Debug)]
 pub(crate) struct Dialogs {
@@ -325,6 +334,8 @@ pub(crate) struct Dialogs {
     prompt_waiting: bool,
     /// A note the failure bar took the place of: it asks again when the failure is answered.
     behind: Option<Prompt>,
+    /// What the pen does to what shows.
+    pen_effect: PenEffect,
     /// Input on its way to the bar.
     routing: Routing,
     /// How many hit tests were made.
@@ -372,10 +383,25 @@ impl Dialogs {
             prompt: Prompt::None,
             prompt_waiting: false,
             behind: None,
+            pen_effect: PenEffect::Fades,
             routing: Routing::default(),
             #[cfg(test)]
             hit_tests: std::cell::Cell::new(0),
         }
+    }
+
+    /// Keeps a close bar up from `now` on, the largest there is, for measuring what the UI costs a
+    /// scripted run (`--show-bar`), and nothing else: no person is meant to meet it.
+    ///
+    /// So the pass and the chip draw in every frame of a stroke, the pen touches nothing here: no
+    /// fades, and a chip arrives under it. The bar answers nothing and routes nothing, or a
+    /// scripted stroke could land on it, and the run would measure something else.
+    pub(crate) fn show_test_bar(&mut self, now: Instant) {
+        self.pen_effect = PenEffect::None;
+        let prompt = Prompt::AskClose {
+            name: "first-sculpt".to_owned(),
+        };
+        self.ui.set_bar(prompt.bar(), now);
     }
 
     /// The window is now `size`, if it has one.
@@ -620,12 +646,18 @@ impl Dialogs {
 
     /// The pen touched down: bars fade out and the chip dims. Touches the fades only.
     pub(crate) fn pen_down(&mut self, now: Instant) {
+        if self.pen_effect == PenEffect::None {
+            return;
+        }
         self.pen_is_down = true;
         self.ui.pen_down(now);
     }
 
     /// The pen lifted: everything comes back, and a bar that waited for it arrives.
     pub(crate) fn pen_up(&mut self, now: Instant) {
+        if self.pen_effect == PenEffect::None {
+            return;
+        }
         self.pen_is_down = false;
         if self.prompt_waiting {
             self.show_prompt(now);
@@ -849,6 +881,33 @@ mod tests {
     /// How long "Saved" stays.
     const fn hold() -> Duration {
         Theme::GLASS.saved_hold
+    }
+
+    #[test]
+    fn a_bar_for_measuring_stays_through_the_pen_and_answers_nothing() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.show_test_bar(now);
+        let seen = now + Theme::GLASS.fade;
+        let bar = dialogs.frame(seen).expect("it draws");
+        assert!(!dialogs.routes(), "input goes where it went");
+
+        dialogs.pen_down(seen);
+        dialogs.update(EDITED, seen);
+        let later = seen + Theme::GLASS.fade * 2;
+        let during = dialogs.frame(later).expect("it draws");
+        let opaque = |frame: &UiFrame| frame.fades.iter().map(|fade| fade.at(later)).sum::<f32>();
+        assert!(
+            (opaque(&during) - 2.0).abs() < 1e-6,
+            "both at full strength"
+        );
+        assert!(
+            !Arc::ptr_eq(&bar.list, &during.list),
+            "the chip came under the pen, to be measured"
+        );
+        assert_eq!(dialogs.status, Status::Unsaved);
+        dialogs.pen_up(later);
+        assert!(dialogs.frame(later).is_some(), "and the bar stays");
     }
 
     /// A disk gone full, the work whole and protected.

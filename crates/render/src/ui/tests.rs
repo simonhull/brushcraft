@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ::ui::{
     AtlasImage, Bar, Blend, Chip, Colour, Control, DrawList, Emphasis, Fade, GlyphQuad, Layer,
@@ -18,6 +18,7 @@ use crate::shade::tests::flip::flip;
 use crate::shade::tests::golden::{GOLDEN_MEAN, GOLDEN_P99, WRITE, golden_dir, linear_of};
 use crate::shade::tests::png::{self, Rgb};
 use crate::surface::{Offscreen, Size, Target};
+use crate::timing::GpuPhase;
 
 /// The brightest clay the MatCaps show, in display colour.
 const CLAY: Colour = Colour::rgb(0xD6, 0xD6, 0xD2);
@@ -181,6 +182,43 @@ fn an_empty_list_encodes_no_pass() {
         let some = frame_of(list, blank_atlas(), (1.0, 1.0));
         draw(gpu, &mut renderer, &mut target, GREY, Some(&some));
         assert_eq!(renderer.ui_counts().drawn, 1, "a pass");
+    });
+}
+
+/// The pass has its own stamp, and a frame with nothing to show takes none: a stamp claimed would
+/// read as a phase run, written or not.
+#[test]
+fn the_pass_is_timed_by_its_own_stamp_and_only_when_it_draws() {
+    GpuTest::run(|gpu| {
+        let offscreen = Offscreen::new(gpu, size(16, 16)).expect("target");
+        let (mut renderer, mut target) = drawing(gpu, offscreen);
+        assert!(
+            renderer.enable_timing(gpu).expect("timing"),
+            "lavapipe has it"
+        );
+        let mut timed = |ui: Option<&UiFrame>| {
+            draw(gpu, &mut renderer, &mut target, GREY, ui);
+            renderer.flush_timings(gpu).expect("flushed");
+            finish(gpu);
+            let times = renderer.take_timings();
+            *times.last().expect("the frame's times")
+        };
+        let list = DrawList {
+            rects: vec![flat(rect(0.0, 0.0, 4.0, 4.0), CLAY, Layer::Bar)],
+            glyphs: Vec::new(),
+        };
+        let some = frame_of(list, blank_atlas(), (1.0, 1.0));
+        let empty = frame_of(DrawList::default(), blank_atlas(), (1.0, 1.0));
+
+        assert_eq!(timed(None).phase(GpuPhase::Ui), None, "no UI");
+        assert_eq!(
+            timed(Some(&empty)).phase(GpuPhase::Ui),
+            None,
+            "nothing in it"
+        );
+        let shown = timed(Some(&some));
+        let took = shown.phase(GpuPhase::Ui).expect("its stamp");
+        assert!(took > Duration::ZERO, "{shown:?}");
     });
 }
 

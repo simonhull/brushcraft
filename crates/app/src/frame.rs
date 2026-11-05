@@ -837,6 +837,9 @@ pub(crate) struct OwnerPhases {
     pub(crate) feed: Duration,
     /// The uploads.
     pub(crate) uploads: Duration,
+    /// Bringing the UI up to date for the frame: off the record's `cpu_ms`, which means what it
+    /// meant before this was timed.
+    pub(crate) ui: Duration,
     /// Ticking and polling the project, after the last frame's hand-off.
     pub(crate) upkeep: Duration,
     /// The brush's work off the latency path (warming the surface under a hovering pen), after
@@ -899,6 +902,8 @@ pub(crate) struct Setup {
     pub(crate) script: Option<Script>,
     /// What a scripted run's record says of its setting; `None` for no record.
     pub(crate) record: Option<RecordSetup>,
+    /// Whether a bar stays up, to measure the UI's cost ([`Dialogs::show_test_bar`]).
+    pub(crate) show_bar: bool,
 }
 
 /// Whether the window was asked to close.
@@ -1343,7 +1348,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ) -> Self {
         let cursor = project.store().subscribe_stale();
         let saving = Saving::new(project.path(), now);
-        let dialogs = Dialogs::new(setup.size, 1.0, setup.blend, now);
+        let mut dialogs = Dialogs::new(setup.size, 1.0, setup.blend, now);
+        if setup.show_bar {
+            dialogs.show_test_bar(now);
+        }
         let mut scheduler = Scheduler::new(setup.interval, now)
             .with_morph(uploads.morph())
             .with_stroke_pacing(StrokePacing::of(setup.presentation));
@@ -2266,7 +2274,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
         // After the pen's work, and asked once: the chip and the overlay say the same.
         let unsaved = self.unsaved();
+        lap.next();
         let ui = self.ui_frame(unsaved, now);
+        phases.ui = lap.next();
         let overlay = self.overlay(size, phases, uploads.summary.as_deref(), unsaved);
         hand_off(FrameRequest {
             number: self.started,

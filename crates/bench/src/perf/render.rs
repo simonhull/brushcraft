@@ -32,6 +32,10 @@
 //! - **open to correct**: from the project beginning to open until the first frame of the open
 //!   segment shown with no tile over 1 px and nothing requested (spec: ≤ 1 s on desktop).
 //!
+//! Each run also runs the near stroke alone with a bar up (`--script-path near --show-bar`), a run
+//! of its own so that nothing the others measure draws any UI, whose record gives the UI's cost
+//! ([`strokes::ui_costs`]).
+//!
 //! Each run also runs the strokes script (`--script-path strokes`), whose record gives the pen's
 //! metrics for its five strokes ([`strokes`]: sample to present, frame start to present
 //! submitted, the brush, the most dabs carried and the frames to drain them after pen-up, frames
@@ -176,6 +180,10 @@ pub(crate) struct Frame {
     pub(crate) level_jump: Option<f64>,
     /// Tiles its dabs edited, summed over its brush steps.
     pub(crate) tiles_edited: Option<f64>,
+    /// Bringing the UI up to date on the owner thread, in ms.
+    pub(crate) ui_ms: Option<f64>,
+    /// The UI's pass on the GPU, in ms, if it drew and was timed.
+    pub(crate) gpu_ui_ms: Option<f64>,
 }
 
 impl Frame {
@@ -313,6 +321,8 @@ impl Recorded {
                 stroke_open: object.get("stroke_open").and_then(Json::as_bool),
                 level_jump: number(object, "level_jump"),
                 tiles_edited: number(object, "tiles_edited"),
+                ui_ms: number(object, "ui_ms"),
+                gpu_ui_ms: number(object, "gpu_ui_ms"),
             }),
             _ => {}
         }
@@ -642,6 +652,16 @@ fn sample_strokes(recorded: &Recorded, scale: Scale, samples: &mut Samples) -> R
     sample_named(named, scale, samples)
 }
 
+/// The UI's cost in one run of the near stroke with a bar showing, `recorded`
+/// ([`strokes::ui_costs`]), added to `samples` under `scale`'s names; returns those it had none of.
+///
+/// # Errors
+///
+/// If a name isn't a metric name, or a unit clashes.
+fn sample_ui(recorded: &Recorded, scale: Scale, samples: &mut Samples) -> Result<Vec<Gap>> {
+    sample_named(strokes::ui_costs(recorded), scale, samples)
+}
+
 /// A metric a run gave no sample of, by its name after the scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gap {
@@ -827,6 +847,15 @@ fn measure(
         let stroked = Recorded::parse(&strokes_text)
             .with_context(|| format!("{}", strokes_record.display()))?;
         gaps.extend(sample_strokes(&stroked, scale, &mut samples)?);
+        let bar_record = dir.join(format!("bar-{run}.jsonl"));
+        let mut bar_args = args("near", &bar_record);
+        bar_args.push("--show-bar".into());
+        runner.app(&bar_args, &dir.join("state"))?;
+        let bar_text = std::fs::read_to_string(&bar_record)
+            .with_context(|| format!("reading {}", bar_record.display()))?;
+        let with_bar =
+            Recorded::parse(&bar_text).with_context(|| format!("{}", bar_record.display()))?;
+        gaps.extend(sample_ui(&with_bar, scale, &mut samples)?);
         let mut said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
         said.push(metrics.clock_note());
         notes.push(format!("run {}: {}", run + 1, said.join(", ")));

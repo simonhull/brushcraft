@@ -42,6 +42,7 @@ fn setup() -> Setup {
         frames: None,
         script: None,
         record: None,
+        show_bar: false,
     }
 }
 

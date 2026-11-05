@@ -25,6 +25,23 @@ fn close(a: Pose, b: Pose) -> bool {
         && (a.distance - b.distance).abs() < 1e-9
 }
 
+/// The near path is the strokes path cut short: the same camera and the same pen, so what it
+/// measures is that stroke.
+#[test]
+fn the_near_path_is_the_strokes_path_up_to_the_end_of_its_first_stroke() {
+    let (near, strokes) = (Script::near(Speed::ONE), Script::strokes(Speed::ONE));
+    assert!(near.duration() < strokes.duration());
+    let last = near.at(near.duration()).segment;
+    assert_eq!(last, Segment::StrokeNear, "it ends there");
+    let steps = (0..650).map(|i| at(f64::from(i) * 0.01));
+    for time in steps.filter(|&time| time < near.duration()) {
+        assert_eq!(near.at(time), strokes.at(time), "{time:?}");
+    }
+    let (from, to) = (Duration::ZERO, near.duration());
+    assert!(!near.pen(from, to).is_empty(), "the stroke");
+    assert_eq!(near.pen(from, to), strokes.pen(from, to), "as it was");
+}
+
 #[test]
 fn the_path_is_the_same_at_every_call_and_in_every_copy() {
     let (a, b) = (path(), path());
