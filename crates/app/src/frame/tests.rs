@@ -4762,8 +4762,10 @@ fn the_kept_recovery_file_goes_on_the_first_stroke() {
     owner.close().expect("closed");
 }
 
+/// The save's half of the rule, by an edit made on the project itself: the app's edits come from
+/// strokes, and a stroke ends the file first, so this shows `Owner::saved` alone.
 #[test]
-fn the_kept_recovery_file_goes_on_the_next_save() {
+fn a_save_that_goes_through_removes_a_kept_recovery_file() {
     let dir = TestDir::new();
     let (mut owner, kept) = last_save_owner(&dir, true);
     edit_one_tile(owner.project());

@@ -387,6 +387,22 @@ mod tests {
         stdout
     }
 
+    /// Every level-4 tile's surface, as bits.
+    fn surface(project: &mut Project) -> Vec<Vec<u32>> {
+        let level = geom::Level::new(4).unwrap();
+        let places =
+            (0..24).flat_map(|face| (0..16).flat_map(move |x| (0..16).map(move |y| (face, x, y))));
+        let keys = places.filter_map(|(face, x, y)| {
+            geom::TileKey::displacement(geom::FaceId::new(face), level, x, y).ok()
+        });
+        let tiles = keys.filter_map(|key| {
+            let tile = project.store().evaluate(key).ok()?;
+            let bits = tile.iter().flat_map(|v| [v.x, v.y, v.z].map(f32::to_bits));
+            Some(bits.collect())
+        });
+        tiles.collect()
+    }
+
     #[test]
     fn work_survives_a_kill_and_comes_back() {
         let scratch = Scratch::new("kill");
@@ -422,10 +438,22 @@ mod tests {
         assert_eq!(after.path, left.path, "it went on as the project's");
         assert!(after.last_edit >= left.last_edit, "{after:?}");
 
-        let back = Project::restore(&after, config(&recovery)).unwrap();
+        let mut back = Project::restore(&after, config(&recovery)).unwrap();
         assert!(back.has_unsaved_edits(), "the stroke is back");
         assert_eq!(back.path(), Some(project.as_path()), "and saves as ever");
+        let restored = surface(&mut back);
         back.close(true).unwrap();
+        let mut plain = Project::open(&project, config(&recovery)).unwrap();
+        let saved = surface(&mut plain);
+        plain.close(false).unwrap();
+        assert!(!restored.is_empty(), "tiles to compare");
+        assert_eq!(restored.len(), saved.len(), "the same tiles");
+        let pairs = restored.iter().zip(&saved);
+        let differ = pairs.filter(|(one, other)| one != other).count();
+        assert!(
+            differ > 0,
+            "the stroke's surface is back, not only a marker"
+        );
     }
 
     #[test]
