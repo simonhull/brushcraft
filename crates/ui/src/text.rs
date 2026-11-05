@@ -5,11 +5,15 @@
 //! share one advance, in every weight, so status text is tabular as it stands.
 
 use std::collections::HashMap;
-use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{fmt, iter};
 
-use ttf_parser::{Face, GlyphId};
+use skrifa::charmap::Charmap;
+use skrifa::metrics::GlyphMetrics;
+use skrifa::outline::DrawSettings;
+use skrifa::prelude::{LocationRef, Size};
+use skrifa::{FontRef, GlyphId, MetadataProvider as _, OutlineGlyphCollection};
 
 use crate::raster::{Raster, coordinate};
 
@@ -164,6 +168,54 @@ struct Slot {
     atlas: (u32, u32),
 }
 
+/// A bundled face, in font units: everything is drawn unhinted and scaled here.
+struct Face {
+    /// Characters to glyphs.
+    charmap: Charmap<'static>,
+    /// Advances and bounds.
+    metrics: GlyphMetrics<'static>,
+    /// The outlines.
+    outlines: OutlineGlyphCollection<'static>,
+    /// Units an em.
+    units_per_em: f32,
+    /// Above the baseline.
+    ascent: f32,
+    /// Below the baseline: negative.
+    descent: f32,
+}
+
+impl Face {
+    /// The face in `bytes`.
+    ///
+    /// # Panics
+    ///
+    /// Never: the bytes are compiled in, and every test of this module parses them.
+    fn new(bytes: &'static [u8]) -> Self {
+        #[expect(
+            clippy::expect_used,
+            reason = "the bytes are compiled in, and every test of this module parses them"
+        )]
+        let font = FontRef::new(bytes).expect("a bundled font parses");
+        let metrics = font.metrics(Size::unscaled(), LocationRef::default());
+        Self {
+            charmap: font.charmap(),
+            metrics: font.glyph_metrics(Size::unscaled(), LocationRef::default()),
+            outlines: font.outline_glyphs(),
+            units_per_em: f32::from(metrics.units_per_em),
+            ascent: metrics.ascent,
+            descent: metrics.descent,
+        }
+    }
+}
+
+impl fmt::Debug for Face {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Face")
+            .field("units_per_em", &self.units_per_em)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The glyph cache's key: a glyph of a face at a size, by the bits of its size in pixels.
 type GlyphKey = (Weight, GlyphId, u32);
 
@@ -171,11 +223,11 @@ type GlyphKey = (Weight, GlyphId, u32);
 #[derive(Debug)]
 pub struct Text {
     /// The regular face.
-    regular: Face<'static>,
+    regular: Face,
     /// The medium face.
-    medium: Face<'static>,
+    medium: Face,
     /// The semibold face.
-    semi_bold: Face<'static>,
+    semi_bold: Face,
     /// Every glyph asked for: `None` is one with nothing to draw, or that didn't fit.
     glyphs: HashMap<GlyphKey, Option<Slot>>,
     /// The atlas, shared with frames in flight: adding a glyph copies it only if one still holds
@@ -192,9 +244,9 @@ impl Text {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            regular: face(REGULAR),
-            medium: face(MEDIUM),
-            semi_bold: face(SEMI_BOLD),
+            regular: Face::new(REGULAR),
+            medium: Face::new(MEDIUM),
+            semi_bold: Face::new(SEMI_BOLD),
             glyphs: HashMap::new(),
             atlas: Arc::new(AtlasImage::empty()),
             shelves: Vec::new(),
@@ -247,9 +299,8 @@ impl Text {
     #[must_use]
     pub fn baseline(&self, weight: Weight, px: f32, line_height: f32) -> f32 {
         let face = self.face(weight);
-        let scale = px / f32::from(face.units_per_em());
-        let ascent = f32::from(face.ascender()) * scale;
-        let descent = f32::from(face.descender()) * scale;
+        let scale = px / face.units_per_em;
+        let (ascent, descent) = (face.ascent * scale, face.descent * scale);
         ((line_height - (ascent - descent)) * 0.5 + ascent).round()
     }
 
@@ -266,7 +317,7 @@ impl Text {
     }
 
     /// The face of a weight.
-    const fn face(&self, weight: Weight) -> &Face<'static> {
+    const fn face(&self, weight: Weight) -> &Face {
         match weight {
             Weight::Regular => &self.regular,
             Weight::Medium => &self.medium,
@@ -277,9 +328,9 @@ impl Text {
     /// A character's advance, and its slot, rasterising it if it's new.
     fn place(&mut self, character: char, weight: Weight, px: f32) -> (f32, Option<Slot>) {
         let face = self.face(weight);
-        let glyph = face.glyph_index(character).unwrap_or(GlyphId(0));
-        let units = face.glyph_hor_advance(glyph).unwrap_or(0);
-        let advance = f32::from(units) * px / f32::from(face.units_per_em());
+        let glyph = face.charmap.map(character).unwrap_or(GlyphId::NOTDEF);
+        let units = face.metrics.advance_width(glyph).unwrap_or(0.0);
+        let advance = units * px / face.units_per_em;
         let key = (weight, glyph, px.to_bits());
         if let Some(&slot) = self.glyphs.get(&key) {
             return (advance, slot);
@@ -341,32 +392,21 @@ impl Default for Text {
     }
 }
 
-/// A bundled face, parsed.
-///
-/// # Panics
-///
-/// Never: the bytes are compiled in, and every test of this module parses them.
-fn face(bytes: &'static [u8]) -> Face<'static> {
-    #[expect(
-        clippy::expect_used,
-        reason = "the bytes are compiled in, and every test of this module parses them"
-    )]
-    Face::parse(bytes, 0).expect("a bundled font parses")
-}
-
 /// A glyph's coverage at `px`, or `None` if it has no ink, or could never fit in the atlas, or `px`
 /// makes no sense.
-fn rasterise(face: &Face<'_>, glyph: GlyphId, px: f32) -> Option<Bitmap> {
-    let scale = px / f32::from(face.units_per_em());
-    let bounds = face.glyph_bounding_box(glyph)?;
-    let left = (f32::from(bounds.x_min) * scale).floor();
-    let right = (f32::from(bounds.x_max) * scale).ceil();
-    let top = (-f32::from(bounds.y_max) * scale).floor();
-    let bottom = (-f32::from(bounds.y_min) * scale).ceil();
+fn rasterise(face: &Face, glyph: GlyphId, px: f32) -> Option<Bitmap> {
+    let scale = px / face.units_per_em;
+    let bounds = face.metrics.bounds(glyph)?;
+    let left = (bounds.x_min * scale).floor();
+    let right = (bounds.x_max * scale).ceil();
+    let top = (-bounds.y_max * scale).floor();
+    let bottom = (-bounds.y_min * scale).ceil();
     let width = whole_size(right - left)?;
     let height = whole_size(bottom - top)?;
     let mut raster = Raster::placed(width, height, scale, (-left, -top));
-    face.outline_glyph(glyph, &mut raster)?;
+    let outline = face.outlines.get(glyph)?;
+    let unhinted = DrawSettings::unhinted(Size::unscaled(), LocationRef::default());
+    outline.draw(unhinted, &mut raster).ok()?;
     let coverage = raster.finish();
     Some(Bitmap {
         left,
@@ -390,8 +430,6 @@ fn whole_size(size: f32) -> Option<usize> {
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
-    use ttf_parser::Face;
-
     use super::*;
 
     /// Every string the spec has the user read, at the sizes it shows them.
@@ -426,13 +464,13 @@ mod tests {
 
     #[test]
     fn a_line_is_as_wide_as_its_advances_and_its_glyphs_sit_on_the_baseline() {
-        let face = Face::parse(REGULAR, 0).unwrap();
+        let face = Face::new(REGULAR);
         let advance = |c: char| {
-            let glyph = face.glyph_index(c).unwrap();
-            f32::from(face.glyph_hor_advance(glyph).unwrap())
+            let glyph = face.charmap.map(c).unwrap();
+            face.metrics.advance_width(glyph).unwrap()
         };
         let units: f32 = "Save".chars().map(advance).sum();
-        let expected = units * 15.0 / f32::from(face.units_per_em());
+        let expected = units * 15.0 / face.units_per_em;
 
         let mut text = Text::new();
         let line = text.line("Save", Weight::Regular, 15.0);

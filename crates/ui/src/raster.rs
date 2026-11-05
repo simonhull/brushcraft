@@ -3,7 +3,7 @@
 //! Each edge adds, to every pixel it crosses, how much the coverage changes there, so a running sum
 //! along a row gives the coverage itself and the fill needs no sorting and no winding bookkeeping.
 
-use ttf_parser::OutlineBuilder;
+use skrifa::outline::OutlinePen;
 
 /// The most a flattened curve may stray from the true one, in pixels.
 ///
@@ -73,7 +73,7 @@ fn cubic(
 }
 
 /// A grid of pixels being filled from straight edges in pixel coordinates, y down, or from an
-/// outline through [`OutlineBuilder`].
+/// outline through [`OutlinePen`].
 #[derive(Debug, Clone)]
 pub(crate) struct Raster {
     /// Pixels across.
@@ -217,7 +217,7 @@ fn to_byte(sum: f32) -> u8 {
     byte
 }
 
-impl OutlineBuilder for Raster {
+impl OutlinePen for Raster {
     fn move_to(&mut self, x: f32, y: f32) {
         self.pen = self.pixel(x, y);
         self.start = self.pen;
@@ -227,8 +227,8 @@ impl OutlineBuilder for Raster {
         self.advance(self.pixel(x, y));
     }
 
-    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        let (from, control, to) = (self.pen, self.pixel(x1, y1), self.pixel(x, y));
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        let (from, control, to) = (self.pen, self.pixel(cx0, cy0), self.pixel(x, y));
         // Uniform steps leave an error of at most |p0 - 2 p1 + p2| / (4 n^2).
         let steps = pieces(second_difference(from, control, to) / 4.0);
         for step in 1..=steps {
@@ -237,9 +237,9 @@ impl OutlineBuilder for Raster {
         }
     }
 
-    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         let (from, to) = (self.pen, self.pixel(x, y));
-        let (one, two) = (self.pixel(x1, y1), self.pixel(x2, y2));
+        let (one, two) = (self.pixel(cx0, cy0), self.pixel(cx1, cy1));
         // Uniform steps leave an error of at most 3/4 of the larger second difference over n^2.
         let bend = second_difference(from, one, two).max(second_difference(one, two, to));
         let steps = pieces(0.75 * bend);
@@ -257,7 +257,7 @@ impl OutlineBuilder for Raster {
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
-    use ttf_parser::OutlineBuilder;
+    use skrifa::outline::OutlinePen;
 
     use super::*;
 

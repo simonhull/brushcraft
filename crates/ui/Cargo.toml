@@ -10,4 +10,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-ttf-parser.workspace = true
+skrifa.workspace = true

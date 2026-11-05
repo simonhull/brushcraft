@@ -31,10 +31,11 @@ pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 rayon = "1.12.0"
 rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "param", "std"] }
+# Font tables only: outlines, advances and metrics. Rasterising and layout are ours (crate `ui`).
+# No autohinter shaping: glyphs are drawn unhinted.
+skrifa = { version = "0.49.0", default-features = false, features = ["std"] }
 softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
 thiserror = "2.0.21"
-# Font tables only: outlines, advances and metrics. Rasterising and layout are ours (crate `ui`).
-ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
