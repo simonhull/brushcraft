@@ -301,65 +301,6 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     assert_eq!(names, Vec::<String>::new(), "no temporary file left");
 }
 
-/// A project saved at `dir`, a file beside it standing for its recovery file's twin, and an edit no
-/// save holds.
-fn twinned(dir: &TestDir) -> (Project, PathBuf) {
-    let mut project = Project::new((*mesh()).clone(), config(dir)).unwrap();
-    let mut map = CorrectionMap::new();
-    stroke(&mut project, &mut map, 100, 41);
-    assert_saved(project.save_as(&dir.path("p.bcrf")));
-    stroke(&mut project, &mut map, 100, 42);
-    let twin = dir.path("recovery").join("twin.bcrf");
-    fs::write(&twin, b"the same work").unwrap();
-    project.set_twins(vec![twin.clone()]);
-    (project, twin)
-}
-
-#[test]
-fn discarding_removes_the_twins() {
-    let dir = TestDir::new();
-    let (project, twin) = twinned(&dir);
-    project.discard().unwrap();
-    assert!(!twin.exists());
-}
-
-#[test]
-fn a_save_removes_the_twins() {
-    let dir = TestDir::new();
-    let (mut project, twin) = twinned(&dir);
-    assert_saved(project.save());
-    assert!(!twin.exists());
-    project.close(false).unwrap();
-}
-
-#[test]
-fn closing_leaves_the_twins() {
-    let dir = TestDir::new();
-    let (project, twin) = twinned(&dir);
-    project.close(true).unwrap();
-    assert!(twin.exists(), "kept");
-}
-
-#[test]
-fn closing_without_the_edits_leaves_the_twins_too() {
-    let dir = TestDir::new();
-    let (project, twin) = twinned(&dir);
-    project.close(false).unwrap();
-    assert!(twin.exists());
-}
-
-/// The new file isn't on the save point the twin is: saving it says nothing of that work.
-#[test]
-fn a_save_as_leaves_the_twins_for_good() {
-    let dir = TestDir::new();
-    let (mut project, twin) = twinned(&dir);
-    assert_saved(project.save_as(&dir.path("elsewhere.bcrf")));
-    assert!(twin.exists(), "another project now");
-    assert_saved(project.save());
-    assert!(twin.exists(), "and its saves cover nothing of it");
-    project.close(false).unwrap();
-}
-
 /// A save whose new recovery file can't be put in place (a crash before its rename, as far as
 /// the file goes) goes through all the same: crash protection pauses, and the next save puts it
 /// back.

@@ -4041,6 +4041,8 @@ fn edits_gone_between_saves_say_so_once_and_a_save_after_that_is_a_save() {
         "Part of a stroke is gone / Your other work is safe and still open."
     );
     assert_eq!(owner.dialogs.bar().expect("a bar").controls().len(), 1);
+    see_the_bar(&mut owner);
+    owner.upkeep(Instant::now()).expect("upkeep");
     owner.dialogs.clear_prompt(Instant::now());
     owner.saving.start(Instant::now(), 0);
     owner.end_save(Ok(clean_save()));
@@ -4152,6 +4154,55 @@ fn a_failure_behind_the_close_bar_shows_after_keep_sculpting() {
     assert!(!owner.dialogs.failure_shown(Instant::now()), "just now");
     see_the_bar(&mut owner);
     assert!(owner.dialogs.failure_shown(Instant::now()));
+}
+
+/// Tiles gone are kept until the bar has had the chance to be read: a save coming within its fade
+/// still counts them.
+#[test]
+fn a_gone_bar_not_yet_seen_leaves_the_next_save_to_say_so() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, ProjectError::Lost(vec![a_tile()])).expect("the run goes on");
+    assert!(owner.dialogs.failing(), "on its way");
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(clean_save()));
+    assert!(!owner.dialogs.says_saved(), "no Saved");
+    assert_eq!(owner.saving_succeeded(), Some(false));
+}
+
+#[test]
+fn a_gone_bar_seen_is_told_once() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, ProjectError::Lost(vec![a_tile()])).expect("the run goes on");
+    see_the_bar(&mut owner);
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(owner.lost.is_empty(), "seen");
+    owner.act(Action::Dismiss, Instant::now());
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(!owner.dialogs.failing(), "said once");
+}
+
+/// Word of protection stopping, held behind the close bar, is out of date once it is back.
+#[cfg(unix)]
+#[test]
+fn protection_back_drops_the_word_of_it_behind_the_close_bar() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    pause_protection(&mut owner);
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(owner.dialogs.says_stopped(), "waiting for the Up");
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    let later = Instant::now() + Duration::from_secs(3600);
+    owner.upkeep(later).expect("upkeep");
+    assert!(owner.project().protection().is_active(), "it came back");
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.act(Action::KeepSculpting, Instant::now());
+    assert!(!owner.dialogs.says_stopped(), "stale");
+    assert!(!owner.dialogs.bar_showing());
 }
 
 /// What a clean save reports.

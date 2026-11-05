@@ -324,8 +324,8 @@ impl ProjectToOpen {
     /// [`ProjectToOpen::open_restoring`], with `found` the listing of recovery files. A listing
     /// that failed, or a restore that does, is said on stderr and the project opens as ever: the
     /// user's project must open, and the recovery file is kept for another try. Files of this
-    /// project holding nothing go first, and a project restored answers for the twins of the one
-    /// it came from ([`Project::set_twins`]).
+    /// project holding nothing go first. No other file is ever deleted here or by what follows: the
+    /// project answers for its own alone, and any other comes back as a note at most.
     ///
     /// # Errors
     ///
@@ -362,8 +362,7 @@ impl ProjectToOpen {
                     let note = OpenNote::EarlierVersion { candidate };
                     return Ok((self.open()?, Some(note)));
                 }
-                Ok(mut project) => {
-                    project.set_twins(twins_of(candidate, &ours));
+                Ok(project) => {
                     let note = OpenNote::Restored {
                         path: candidate.path.clone(),
                         when: candidate.modified,
@@ -462,23 +461,6 @@ impl ProjectToOpen {
             }
         }
     }
-}
-
-/// The files of `candidates` that provably hold just what `chosen`, about to be restored, does: on
-/// its save point, with its very head.
-///
-/// Op ids are a session's own, as a project opens past every recovery head, so only a file left
-/// mid-roll-over shares one. Any other file on the save point is another session's, and holds work
-/// no other file does, however its head compares: it stays.
-fn twins_of(chosen: &RecoveryCandidate, candidates: &[RecoveryCandidate]) -> Vec<PathBuf> {
-    let twin = |other: &&RecoveryCandidate| {
-        other.status == CandidateStatus::Restorable
-            && other.base == chosen.base
-            && other.path != chosen.path
-            && other.last_edit == chosen.last_edit
-    };
-    let files = candidates.iter().filter(twin);
-    files.map(|file| file.path.clone()).collect()
 }
 
 /// Swaps `old`'s project for the one `reopen` asks for on the same `gpu`, as `setup` says.
@@ -1405,7 +1387,7 @@ mod tests {
         assert!(older.exists(), "it isn't held anywhere else");
     }
 
-    /// A file on an earlier save point isn't a twin, whatever its head.
+    /// A file on an earlier save point is another's, whatever its head.
     #[test]
     fn dont_save_leaves_work_on_an_earlier_save() {
         let dir = TestDir::new();
@@ -1418,9 +1400,9 @@ mod tests {
         assert!(earlier.exists(), "the user hasn't dropped this");
     }
 
-    /// Only Don't save and a save end a twin: closing leaves everything to the next open.
+    /// A close leaves every other file to the next open, as a save and Don't save do.
     #[test]
-    fn closing_leaves_a_twin() {
+    fn closing_leaves_a_copy_of_the_file() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
         let twin = twin_of(&left_work(&opening));
@@ -1442,16 +1424,23 @@ mod tests {
         assert!(file.exists(), "not ours to end");
     }
 
+    /// The app only ever deletes the recovery file of the project it has open: an equal head proves
+    /// nothing, and a note next time can be answered where a deletion can't.
     #[test]
-    fn a_save_of_the_restored_work_covers_its_twin() {
+    fn a_save_leaves_a_file_with_the_restored_files_head() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        let twin = twin_of(&left_work(&opening));
-        let (mut project, _) = opening.open_restoring().expect("opened");
-        let outcome = project.save().expect("saved");
-        assert!(outcome.kept.is_empty(), "{outcome:?}");
-        assert!(!twin.exists(), "the save holds what it held");
+        let file = left_work(&opening);
+        let twin = twin_of(&file);
+        let (mut project, note) = opening.open_restoring().expect("opened");
+        let Some(OpenNote::Restored { path, .. }) = note else {
+            panic!("restored: {note:?}");
+        };
+        drop(project.save().expect("saved"));
         project.close(false).expect("closed");
+        let other = if path == twin { file } else { twin };
+        assert!(!path.exists(), "the file it had open");
+        assert!(other.exists(), "and no other");
     }
 
     /// `file`'s twin, as a crash mid-roll-over leaves one.
@@ -1506,20 +1495,22 @@ mod tests {
         project.end_unrecorded_stroke().expect("ended");
     }
 
-    /// A crash mid roll-over leaves two files with one head (the store's own notes). Don't
-    /// save takes the one restored, and the twin brings the dropped work back.
+    /// A crash mid roll-over leaves two files with one head. Don't save takes the one restored, and
+    /// the other brings the note back: an extra note, where a deletion couldn't be undone.
     #[test]
-    fn dont_save_is_not_undone_by_a_twin() {
+    fn dont_save_leaves_a_file_with_the_restored_files_head() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        drop(twin_of(&left_work(&opening)));
+        let file = left_work(&opening);
+        let twin = twin_of(&file);
         let (project, note) = opening.clone().open_restoring().expect("opened");
-        assert!(note.is_some());
+        let Some(OpenNote::Restored { path, .. }) = note else {
+            panic!("restored: {note:?}");
+        };
         project.discard().expect("Don't save");
-        let (again, _) = opening.open_restoring().expect("opened");
-        let unsaved = again.has_unsaved_edits();
-        close(again);
-        assert!(!unsaved, "the dropped work came back");
+        let other = if path == twin { file } else { twin };
+        assert!(!path.exists(), "the file it had open");
+        assert_eq!(left(&opening), vec![other], "and no other");
     }
 
     /// A run's summary, its details aside.

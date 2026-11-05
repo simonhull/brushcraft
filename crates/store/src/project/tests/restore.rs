@@ -476,3 +476,183 @@ fn a_restorable_candidate_replaced_by_another_project_s_file_has_changed() {
     assert_candidate_changed(&dir, &candidate);
     assert!(candidate.path.exists(), "kept");
 }
+
+/// A stroke's op spans flushes, so a head doesn't date a file's content: an old file left by a
+/// roll-over mid-stroke has the new file's head, and less.
+///
+/// With write times the other way about (a copy, a touch, a clock set back) the lesser file is the
+/// one chosen. A save of it leaves the fuller one: it only ever deletes the file it has open.
+#[test]
+fn a_save_leaves_a_file_with_an_equal_head() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 100, 121);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    let top = tiles(&mesh, TOP, TOP);
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
+        .unwrap()
+        .unwrap();
+    project.store().close_epoch().unwrap();
+    project.finish_flushes().unwrap();
+    let file = project.recovery_path().unwrap().to_path_buf();
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let (id, _) = name.split_once('-').unwrap();
+    let old = file.with_file_name(format!("{id}-00000000000000aa.bcrf"));
+    fs::copy(&file, &old).unwrap();
+    project
+        .store()
+        .edit_tile(top[30], |tile| tile.set(2, 2, Vec3::new(0.0, 0.5, 0.0)))
+        .unwrap()
+        .unwrap();
+    project.store().close_epoch().unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    project.finish_flushes().unwrap();
+    drop(project);
+    // The old file's write time comes last, as a copy or a clock set back gives.
+    let later = SystemTime::now() + Duration::from_secs(60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let listed = found(&dir);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].path, old, "chosen by write time");
+    assert_eq!(listed[0].last_edit, listed[1].last_edit, "one head");
+    assert_eq!(listed[0].base, listed[1].base, "one save point");
+    let fuller = listed[1].path.clone();
+    let mut restored = Project::restore(&listed[0], config(&dir)).unwrap();
+    drop(restored.save().unwrap());
+    restored.close(false).unwrap();
+    assert!(fuller.exists(), "the rest of the stroke is in it alone");
+}
+
+#[test]
+fn discarding_leaves_a_file_with_an_equal_head() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 100, 121);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    let top = tiles(&mesh, TOP, TOP);
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
+        .unwrap()
+        .unwrap();
+    project.store().close_epoch().unwrap();
+    project.finish_flushes().unwrap();
+    let file = project.recovery_path().unwrap().to_path_buf();
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let (id, _) = name.split_once('-').unwrap();
+    let old = file.with_file_name(format!("{id}-00000000000000aa.bcrf"));
+    fs::copy(&file, &old).unwrap();
+    project
+        .store()
+        .edit_tile(top[30], |tile| tile.set(2, 2, Vec3::new(0.0, 0.5, 0.0)))
+        .unwrap()
+        .unwrap();
+    project.store().close_epoch().unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    project.finish_flushes().unwrap();
+    drop(project);
+    // The old file's write time comes last, as a copy or a clock set back gives.
+    let later = SystemTime::now() + Duration::from_secs(60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let listed = found(&dir);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].path, old, "chosen by write time");
+    assert_eq!(listed[0].last_edit, listed[1].last_edit, "one head");
+    assert_eq!(listed[0].base, listed[1].base, "one save point");
+    let fuller = listed[1].path.clone();
+    let restored = Project::restore(&listed[0], config(&dir)).unwrap();
+    restored.discard().unwrap();
+    assert!(fuller.exists(), "the rest of the stroke is in it alone");
+}
+
+/// `recovery_heads` passes over a file it can't read, so a session can reuse its op ids: one head,
+/// on one save point, and other work. Neither file goes for the other.
+#[cfg(unix)]
+#[test]
+fn a_save_leaves_a_head_passed_over_at_open() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut first = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut first, &mut map, 100, 121);
+    assert_saved(first.save_as(&path));
+    first.close(false).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let mut crashed = Project::open(&path, config(&dir)).unwrap();
+    crashed.begin_stroke().unwrap();
+    crashed
+        .store()
+        .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
+        .unwrap()
+        .unwrap();
+    crashed.store().close_epoch().unwrap();
+    crashed.end_unrecorded_stroke().unwrap();
+    crashed.finish_flushes().unwrap();
+    let other_session = crashed.recovery_path().unwrap().to_path_buf();
+    drop(crashed);
+    fs::set_permissions(&other_session, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut next = Project::open(&path, config(&dir)).unwrap();
+    next.begin_stroke().unwrap();
+    next.store()
+        .edit_tile(top[30], |tile| tile.set(2, 2, Vec3::new(0.0, 0.5, 0.0)))
+        .unwrap()
+        .unwrap();
+    next.store().close_epoch().unwrap();
+    next.end_unrecorded_stroke().unwrap();
+    next.finish_flushes().unwrap();
+    drop(next);
+    fs::set_permissions(&other_session, fs::Permissions::from_mode(0o600)).unwrap();
+    let listed = found(&dir);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].last_edit, listed[1].last_edit,
+        "two sessions' work under one head"
+    );
+    let (chosen, other) = (listed[0].clone(), listed[1].path.clone());
+    let mut restored = Project::restore(&chosen, config(&dir)).unwrap();
+    drop(restored.save().unwrap());
+    restored.close(false).unwrap();
+    assert!(other.exists(), "a save leaves it");
+}
+
+/// A tile a flush left late, which the writer's closing flush then writes: the kept file
+/// holds it, so a close has nothing to report.
+#[test]
+fn a_close_keeping_the_file_reports_no_tile_its_last_flush_wrote() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 141);
+    assert_saved(project.save_as(&path));
+    project.writer.as_ref().unwrap().fail_encodes(1);
+    stroke(&mut project, &mut map, 60, 142);
+    let closed = project.close(true);
+    let candidate = only(&dir);
+    let mut restored = Project::restore(&candidate, config(&dir)).unwrap();
+    assert_saved(restored.save());
+    restored.close(false).unwrap();
+    assert_project_file(&path, &map, "the kept file held every edit");
+    assert!(closed.is_ok(), "{closed:?}");
+}

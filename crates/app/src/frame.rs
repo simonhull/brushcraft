@@ -943,6 +943,15 @@ enum Shortfall {
     Lacking,
 }
 
+/// How far the bar has got with saying tiles are gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostSaid {
+    /// It hasn't begun.
+    NotYet,
+    /// It is saying so, and they are kept until that has been read.
+    OnTheBar,
+}
+
 /// What the frame loop knows of a recovery file not guarding the edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Exposed {
@@ -1233,8 +1242,10 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     told_drops: u64,
     /// The recovery file not guarding the edits, if so ([`Owner::heard`]).
     exposed: Option<Exposed>,
-    /// Tiles the store says are gone, until a bar or a save has said so.
+    /// Tiles the store says are gone, until a bar has been read saying so, or a save has.
     lost: BTreeSet<TileKey>,
+    /// How far the bar has got with saying so.
+    lost_said: LostSaid,
     /// In a scripted run, what fell short of the recovery file, which nobody can be told: its
     /// close fails on it, so a measured run can't pass.
     fell_short: Option<String>,
@@ -1472,6 +1483,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             told_drops: 0,
             exposed: None,
             lost: BTreeSet::new(),
+            lost_said: LostSaid::NotYet,
             fell_short: None,
             request: None,
             copying: None,
@@ -3237,9 +3249,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// `result` came of `doing`. A recovery file that can't keep up is no reason to stop
-    /// sculpting: it is the user's to hear of, and the edits are still in memory. So those errors
-    /// end here ([`recovery_trouble`]), and an old file left undeleted, which guards as ever, is
-    /// said in the log alone.
+    /// sculpting: it is the user's to hear of, and nothing it says stops the work going on. So
+    /// those errors end here ([`recovery_trouble`]), and an old file left undeleted, which
+    /// guards as ever, is said in the log alone.
     ///
     /// # Errors
     ///
@@ -3324,8 +3336,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         {
             self.exposed = None;
             saving::log("brushcraft: crash protection is back");
-            if self.dialogs.says_stopped() {
-                self.dialogs.dismiss(now);
+            if self.dialogs.protection_back(now) {
                 self.scheduler.want(Reason::Overlay);
             }
         }
@@ -3341,11 +3352,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.scheduler.want(Reason::Overlay);
             }
         }
-        if !self.lost.is_empty()
+        if self.lost_said == LostSaid::OnTheBar {
+            // Kept until it has been read: a save before that still says so.
+            if self.dialogs.failure_shown(now) {
+                self.lost.clear();
+                self.lost_said = LostSaid::NotYet;
+            }
+        } else if !self.lost.is_empty()
             && self.dialogs.can_tell_of_stopping()
             && !self.dialogs.pen_is_down()
         {
-            self.lost.clear();
+            self.lost_said = LostSaid::OnTheBar;
             let protection = if self.exposed.is_some() {
                 Protected::No
             } else {
@@ -3659,6 +3676,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.forget_kept_recovery();
         self.lost.extend(outcome.unprotected.iter().copied());
         if !self.lost.is_empty() {
+            self.lost_said = LostSaid::NotYet;
             let lost = TilesLost(std::mem::take(&mut self.lost).len());
             self.save_failed(&anyhow::Error::new(lost), now);
         } else if let Err(dropped) = self.brush.dropped_since(self.told_drops) {

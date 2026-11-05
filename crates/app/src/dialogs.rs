@@ -654,6 +654,19 @@ impl Dialogs {
         self.says_stopped() && !self.prompt_waiting
     }
 
+    /// Crash protection is back: word of its stopping is out of date, showing or waiting.
+    /// Whether that changed what draws.
+    pub(crate) fn protection_back(&mut self, now: Instant) -> bool {
+        if matches!(self.behind, Some(Prompt::Stopped(_))) {
+            self.behind = None;
+        }
+        let showing = self.says_stopped();
+        if showing {
+            self.dismiss(now);
+        }
+        showing
+    }
+
     /// A save was asked for: a bar saying what one is the answer to is out of date.
     pub(crate) fn save_asked(&mut self, now: Instant) {
         if self.failing() || self.says_stopped() {

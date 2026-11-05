@@ -455,8 +455,6 @@ pub struct Project {
     /// they are or the project closes, so no listing offers them while it runs (see
     /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
     held: Vec<(PathBuf, ProjectFile)>,
-    /// Other recovery files holding just what this project's holds ([`Project::set_twins`]).
-    twins: Vec<PathBuf>,
     /// The failed recovery file the store has moved off ([`Project::strand`]), still held (open
     /// and locked) while the store works on a scratch file instead. It stays the project's
     /// recovery file on disk ([`Project::recovery_path`]), at its last durable save point, until
@@ -724,7 +722,6 @@ impl Project {
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
-            twins: Vec::new(),
             stranded: None,
             stroke: None,
             recorded: None,
@@ -773,9 +770,6 @@ impl Project {
             self.store.forget_copied_ahead();
         }
         kept.extend(switched?);
-        let twins = std::mem::take(&mut self.twins);
-        let unremoved = twins.iter().filter_map(|file| retire(file).err());
-        kept.extend(unremoved);
         Ok(self.outcome(kept))
     }
 
@@ -861,8 +855,6 @@ impl Project {
         // The new project file lacks them whatever happens next, as `save` reports them.
         self.unreported.extend(saved.lost());
         kept.extend(self.switch(saved, &project, &path)?);
-        // Another project from here on: its saves say nothing of those files' work.
-        self.twins.clear();
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
@@ -936,10 +928,17 @@ impl Project {
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
         let finished = self.finish_flushes();
         if let Some(mut writer) = self.writer.take() {
+            // A last flush tries again what those before left out, so only what it leaves out is
+            // late for good.
+            let flushed = writer.finish(&mut self.store, Instant::now());
+            if flushed.is_ok() {
+                self.left_out.clear();
+            }
             hear_skipped(&mut writer, &mut self.unreported, &mut self.left_out);
             // Its flushes are done, or failed for good: closing releases its subscription.
             let closed = writer.close(&mut self.store, Instant::now());
             finished?;
+            flushed?;
             closed?;
         } else {
             finished?;
@@ -956,25 +955,15 @@ impl Project {
         self.report()
     }
 
-    /// Names `files`, recovery files holding just what this project's restored one does: on its
-    /// save point, with its very head, which only a file left mid-roll-over shares, as op ids are a
-    /// session's own. Any other file may hold work nothing else does, however its head compares.
-    ///
-    /// They go with its work: [`Project::discard`] removes them, or the next [`Project::save`], and
-    /// nothing else does, so a close leaves them for the next open to judge. Otherwise dropping the
-    /// work would bring it back from the twin.
-    pub fn set_twins(&mut self, files: Vec<PathBuf>) {
-        self.twins = files;
-    }
-
     /// Closes the project, dropping what no save holds: the user's choice, which a full disk
     /// mustn't overrule. So unlike [`Project::close`], which finishes the recovery writer's flushes
     /// first and keeps the recovery file if it can't, this stops the writer where it is, with no
-    /// flush or roll-over, and removes the recovery file, any old one still held and its twins
-    /// ([`Project::set_twins`]), whatever state they are in. A file already gone is what was
-    /// wanted.
+    /// flush or roll-over, and removes its own recovery file and any old one of its own still held,
+    /// whatever state they are in. A file already gone is what was wanted. No other recovery file
+    /// goes, whatever its head: that proves nothing of what it holds, and a note at the next open
+    /// can be answered where a deletion can't.
     ///
-    /// Otherwise the file would be found at the next open, and bring back work the user dropped.
+    /// Otherwise its file would be found at the next open, and bring back work the user dropped.
     ///
     /// # Errors
     ///
@@ -989,9 +978,7 @@ impl Project {
         self.left_out.clear();
         let held = std::mem::take(&mut self.held);
         let held = held.into_iter().map(|(path, _file)| path);
-        let twins = std::mem::take(&mut self.twins);
         let files = self.recovery_path.take().into_iter().chain(held);
-        let files = files.chain(twins);
         let mut first_failure = Ok(());
         for path in files {
             let removed = retire(&path);
@@ -1237,8 +1224,8 @@ impl Project {
     }
 
     /// The outcome of a save that went through, with `kept`, the old recovery files it couldn't
-    /// delete: the protection it leaves, and the tiles found unprotected since the last report,
-    /// which are forgotten.
+    /// delete: the protection it leaves, and the tiles found lost since the last report, which are
+    /// forgotten.
     fn outcome(&mut self, kept: Vec<KeptRecovery>) -> SaveOutcome {
         // Their slots were valid: the save wrote them, or they are among those it lost.
         self.left_out.clear();
@@ -1249,7 +1236,7 @@ impl Project {
         }
     }
 
-    /// Reports the tiles found unprotected since the last report, if any, and forgets them.
+    /// Reports the tiles found lost or left out since the last report, if any, and forgets them.
     ///
     /// # Errors
     ///

@@ -305,7 +305,7 @@ pub struct RecoveryWriter {
     /// The store's working-file generation when the flush in flight started: a rebase since
     /// means the flush's records and save point would go to the wrong file.
     generation: u64,
-    /// Tiles left out of a flush because their slots were broken, not yet reported (see
+    /// Tiles left out of a flush, late or lost, not yet reported (see
     /// [`RecoveryWriter::take_skipped`]).
     skipped: Vec<TileKey>,
     /// Those of them gone from memory too ([`RecoveryWriter::take_lost`]).
