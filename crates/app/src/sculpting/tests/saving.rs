@@ -851,6 +851,7 @@ fn a_stroke_while_finishing_stays_out_of_the_save_and_the_window_stays() {
     let now = Instant::now();
     assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
     assert!(owner.key(UiKey::Enter, now), "Save");
+    owner.save_step();
     queue(
         &mut owner,
         stroke_after_ctrl_s(((150.0, 80.0), (170.0, 120.0)), 6),

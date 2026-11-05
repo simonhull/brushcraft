@@ -215,6 +215,12 @@ impl Saving {
         self.outcome = None;
     }
 
+    /// The save under way, still waiting for the pen, is given up: nothing has been done, so
+    /// there is nothing to say of it.
+    pub(crate) const fn let_go(&mut self) {
+        self.stage = None;
+    }
+
     /// The save under way has moved on to `stage`.
     pub(crate) const fn reach(&mut self, stage: Stage) {
         self.stage = Some(stage);
@@ -368,6 +374,19 @@ mod tests {
     /// A project called `sphere`.
     fn saving() -> Saving {
         Saving::new(Some(Path::new("/some/where/sphere.bcrf")), Instant::now())
+    }
+
+    #[test]
+    fn a_save_let_go_of_before_it_began_says_nothing() {
+        let mut saving = saving();
+        saving.start(Instant::now(), 0);
+        saving.let_go();
+        assert_eq!(saving.stage(), None, "none under way");
+        assert_eq!(saving.last_succeeded(), None, "and no outcome");
+        assert_eq!(
+            saving.title_change(true, 0, false).as_deref(),
+            Some("*sphere - BrushCraft")
+        );
     }
 
     #[test]

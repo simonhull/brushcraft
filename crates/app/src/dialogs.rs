@@ -374,6 +374,11 @@ impl Dialogs {
         matches!(self.prompt, Prompt::AskClose { .. })
     }
 
+    /// Whether a prompt can't be seen, or answered, for the pen is down.
+    pub(crate) const fn prompt_held_back(&self) -> bool {
+        self.pen_is_down && !matches!(self.prompt, Prompt::None)
+    }
+
     /// Whether the bar says a save the window exits after is under way.
     pub(crate) const fn finishing(&self) -> bool {
         matches!(self.prompt, Prompt::Finishing { .. })

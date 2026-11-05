@@ -1081,6 +1081,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// When a brush stroke's last sample was queued: the stroke counts as moving for
     /// [`STROKE_QUIET`] after it.
     stroke_sample_at: Option<Instant>,
+    /// When the last sample of any stroke was received: what a bar the pen holds back goes by
+    /// ([`Owner::pen_quiet_at`]).
+    pen_sample_at: Option<Instant>,
     /// When the project's upkeep (the recovery writer's tick and poll) last ran: it is never
     /// skipped once [`UPKEEP_INTERVAL`] has passed, pen or not.
     upkept_at: Instant,
@@ -1313,6 +1316,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             brushed_at: BTreeMap::new(),
             after_brush: None,
             stroke_sample_at: None,
+            pen_sample_at: None,
             upkept_at: now,
             fitting: Fitting::default(),
             pivot_at: None,
@@ -1439,7 +1443,34 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.ui_hover(None);
                 false
             }
-            Phase::Drag | Phase::Up => false,
+            Phase::Drag => {
+                // A pen taken as lifted ([`Owner::lift_quiet_pen`]) was only resting.
+                if !self.dialogs.pen_is_down() {
+                    self.dialogs.pen_down(now);
+                }
+                false
+            }
+            Phase::Up => false,
+        }
+    }
+
+    /// When a pen holding a prompt back counts as lifted: [`STROKE_QUIET`] after its last sample.
+    /// `None` with no prompt held back.
+    fn pen_quiet_at(&self) -> Option<Instant> {
+        let last = self
+            .pen_sample_at
+            .filter(|_| self.dialogs.prompt_held_back());
+        last.map(|last| last + STROKE_QUIET)
+    }
+
+    /// Takes the pen as lifted if it has gone quiet with a prompt held back, by `now`. An `Up` can
+    /// be lost, with no sample to end the stroke, and the bar is the only way out of a close: the
+    /// user's waiting for it must end. A pen that was only resting puts it away again at its next
+    /// sample ([`Owner::ui_took_pen`]).
+    fn lift_quiet_pen(&mut self, now: Instant) {
+        if self.pen_quiet_at().is_some_and(|quiet| quiet <= now) {
+            self.dialogs.pen_up(now);
+            self.scheduler.want(Reason::Overlay);
         }
     }
 
@@ -1496,6 +1527,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if !asked {
             return CloseAnswer::Now;
         }
+        self.lift_quiet_pen(now);
         self.scheduler.want(Reason::Overlay);
         CloseAnswer::Asked
     }
@@ -1533,11 +1565,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Action::DontSave if self.dialogs.asking_close() => {
                 self.request = Some(WindowRequest::ExitDiscarding);
             }
-            // Whatever an earlier answer in the same pass asked of the window, this one stands.
+            // Whatever an earlier answer in the same pass asked of the window, this one stands. A
+            // save still waiting for the pen goes too: it has done nothing, and its pen may never
+            // lift, which would hold every later close at this bar, far from Don't save.
             Action::Cancel => {
                 self.after_save = AfterSave::Stay;
                 self.request = None;
                 self.dialogs.clear_prompt(now);
+                if self.saving.stage() == Some(Stage::PenDown) {
+                    self.saving.let_go();
+                    self.save_over();
+                }
             }
             Action::KeepSculpting => {
                 self.request = None;
@@ -1597,6 +1635,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
         if sample.phase.in_stroke() {
+            self.pen_sample_at = Some(sample.received);
             // A `Down` with a barrel button held navigates whatever the brush says (`pen::route`).
             let maybe_brush = |down: &PenSample| {
                 down.phase == input::Phase::Down && down.buttons == input::Buttons::default()
@@ -1819,10 +1858,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// In a scripted run the script's pen samples taken by `now` are queued first, as a pen's
     /// arrive between frames, and a wait ends early for its next sample ([`Owner::pen_due`]).
     ///
-    /// An idle wait ends early too for what the UI changes by itself, which then wants a frame.
+    /// An idle wait ends early too for what the UI changes by itself, which then wants a frame, and
+    /// for a pen going quiet with a prompt held back ([`Owner::lift_quiet_pen`]).
     pub(crate) fn next(&mut self, now: Instant) -> Next {
         self.queue_script_pen(now.saturating_duration_since(self.clock), true);
+        self.lift_quiet_pen(now);
         let change = self.dialogs.next_change();
+        let change = match (change, self.pen_quiet_at()) {
+            (Some(one), Some(other)) => Some(one.min(other)),
+            (one, other) => one.or(other),
+        };
         if change.is_some_and(|change| change <= now) {
             self.scheduler.want(Reason::Overlay);
         }

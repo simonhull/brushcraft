@@ -26,7 +26,7 @@ use crate::dialogs::Action;
 use crate::navigate::Button;
 use crate::pen::PenFrame;
 use crate::render_thread::draw_frame;
-use crate::saving::SaveStep;
+use crate::saving::{SaveStep, Stage};
 use crate::sculpting::Sculpting;
 use crate::test_dir::TestDir;
 use crate::uploads::GpuResidency;
@@ -2699,6 +2699,8 @@ struct Lands {
     strokes: usize,
     /// How many times it has dropped dabs.
     drops: u64,
+    /// Where it sends strokes, if not to itself: as off the surface.
+    routes_to: Option<Route>,
 }
 
 impl Brush for Lands {
@@ -2727,7 +2729,7 @@ impl Brush for Lands {
     }
 
     fn route(&mut self, _context: BrushContext<'_>, _down: &PenSample) -> Route {
-        Route::Brush
+        self.routes_to.unwrap_or(Route::Brush)
     }
 
     fn begin_closing(&mut self, _context: BrushContext<'_>) -> Result<()> {
@@ -2952,6 +2954,17 @@ fn a_barrel_stroke_off_the_bar_navigates_and_leaves_it() {
     assert!((frame.fades[0].to - 1.0).abs() < 1e-6, "back on the Up");
 }
 
+/// Nor is the tip off the surface: the brush sends it to navigation, and the question stands.
+#[test]
+fn a_tip_stroke_off_the_surface_leaves_the_bar() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    owner.brush.routes_to = Some(Route::Navigate);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.asking_close(), "still asking");
+}
+
 #[test]
 fn navigating_while_finishing_keeps_the_exit() {
     let dir = TestDir::new();
@@ -3020,6 +3033,7 @@ fn cancel_keeps_the_window_and_the_save_finishes() {
     let save = owner.dialogs.control(Action::Save);
     tap(&mut owner, save);
     see_the_bar(&mut owner);
+    owner.save_step();
     let cancel = owner.dialogs.control(Action::Cancel);
     tap(&mut owner, cancel);
     assert!(!owner.dialogs.bar_showing(), "the bar goes");
@@ -3036,6 +3050,7 @@ fn a_down_while_finishing_is_a_cancel_and_the_stroke_waits_for_the_save() {
     let save = owner.dialogs.control(Action::Save);
     tap(&mut owner, save);
     see_the_bar(&mut owner);
+    owner.save_step();
     owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
     assert_eq!(
         owner.pen_queue.len(),
@@ -3092,7 +3107,9 @@ fn a_close_with_the_pen_down_shows_the_bar_on_the_up() {
     use input::Phase;
     let dir = TestDir::new();
     let mut owner = closing_owner(&dir, 2);
-    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    // Dated ahead: a pen reporting all the while, however long the test takes.
+    let reporting = Instant::now() + Duration::from_secs(60);
+    owner.pen(pen_received(Phase::Down, reporting));
     run(&mut owner, 100);
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
 
@@ -3100,7 +3117,7 @@ fn a_close_with_the_pen_down_shows_the_bar_on_the_up() {
         frame.is_none_or(|frame| frame.fades[0].at(Instant::now()).abs() < 1e-6)
     };
     assert!(faint(ui_of(&mut owner)), "nothing shows under the pen");
-    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_received(Phase::Drag, reporting));
     assert!(faint(ui_of(&mut owner)), "on any frame");
     std::thread::sleep(Theme::GLASS.fade);
     assert!(faint(ui_of(&mut owner)), "however long the stroke");
@@ -3122,7 +3139,8 @@ fn a_close_with_a_saves_pen_down_shows_finishing_on_the_up() {
     use input::Phase;
     let dir = TestDir::new();
     let mut owner = closing_owner(&dir, 2);
-    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    let reporting = Instant::now() + Duration::from_secs(60);
+    owner.pen(pen_received(Phase::Down, reporting));
     run(&mut owner, 100);
     owner.brush.pen = true;
     owner.request_save(Instant::now());
@@ -3433,4 +3451,184 @@ fn a_stroke_after_dont_save_in_one_batch_keeps_the_window() {
         None,
         "bar gone, and the discard with it"
     );
+}
+
+/// A pen sample in `phase` on the model, received at `at`.
+fn pen_received(phase: input::Phase, at: Instant) -> PenSample {
+    PenSample {
+        received: at,
+        ..pen_at(phase, ON_THE_MODEL)
+    }
+}
+
+/// Whether the bar is on its way up, or up.
+fn bar_rising<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> bool {
+    ui_of(owner).is_some_and(|ui| ui.fades[0].to > 0.5)
+}
+
+/// A pen whose `Up` was lost, and no sample since: the bar comes all the same, or nothing could
+/// ever answer it. Asked for after the quiet, it comes at once.
+#[test]
+fn a_close_long_after_the_pens_last_sample_shows_the_bar() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    std::thread::sleep(STROKE_QUIET);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(!owner.dialogs.pen_is_down(), "taken as lifted");
+    assert!(bar_rising(&mut owner), "the bar comes");
+    assert!(
+        owner.key(UiKey::Escape, Instant::now()),
+        "and can be answered"
+    );
+}
+
+/// Asked for during the quiet, the bar comes as it ends, the idle loop waking for it.
+#[test]
+fn a_close_as_the_pen_goes_quiet_shows_the_bar_when_it_has() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    // Dated ahead, so nothing here depends on how long the test takes.
+    let last = Instant::now() + Duration::from_secs(60);
+    owner.pen(pen_received(Phase::Down, last));
+    run(&mut owner, 100);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    run(&mut owner, 100);
+    assert!(owner.dialogs.pen_is_down(), "not quiet yet");
+    assert!(!bar_rising(&mut owner), "so no bar");
+    run(&mut owner, 100);
+
+    let due = last + STROKE_QUIET;
+    owner
+        .upkeep(due.checked_sub(Duration::from_millis(1)).expect("later"))
+        .expect("upkeep");
+    let Next::Idle { upkeep: wake } = owner.next(Instant::now()) else {
+        panic!("settled");
+    };
+    assert_eq!(wake, due, "the wait ends for it");
+    wants_a_frame_at(&mut owner, due, "the bar's frame");
+    assert!(!owner.dialogs.pen_is_down(), "quiet: taken as lifted");
+    assert!(bar_rising(&mut owner), "the bar comes");
+}
+
+/// Asserts `owner` wants a frame at `now`.
+fn wants_a_frame_at<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, now: Instant, what: &str) {
+    let next = owner.next(now);
+    assert!(
+        matches!(next, Next::Frame { .. } | Next::Wait { .. }),
+        "{what}: {next:?}"
+    );
+}
+
+/// A pen still reporting holds the bar back, a bar never appearing under a stroke.
+#[test]
+fn a_pen_still_reporting_holds_the_bar_back() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    let later = Instant::now() + Duration::from_secs(60);
+    owner.pen(pen_received(Phase::Drag, later));
+    owner.next(later);
+    assert!(owner.dialogs.pen_is_down(), "this sample is the latest");
+    owner.next(later + STROKE_QUIET);
+    assert!(!owner.dialogs.pen_is_down(), "quiet since it");
+}
+
+/// A pen that was only resting, and draws on: the bar goes again until the Up.
+#[test]
+fn a_pen_moving_again_puts_the_bar_back_down() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    std::thread::sleep(STROKE_QUIET);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(bar_rising(&mut owner), "the bar came");
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    assert!(owner.dialogs.pen_is_down(), "the stroke goes on");
+    assert!(!bar_rising(&mut owner), "so the bar goes");
+    owner.pen(pen_at(Phase::Up, ON_THE_MODEL));
+    assert!(bar_rising(&mut owner), "back on the Up");
+    assert!(owner.dialogs.asking_close(), "still asking");
+}
+
+/// Under a navigation stroke too, the bar already up: it fades, and mustn't stay gone.
+#[test]
+fn a_navigation_stroke_gone_quiet_gives_the_bar_back() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let last = Instant::now() + Duration::from_secs(60);
+    let barrel = |phase| PenSample {
+        buttons: input::Buttons::PRIMARY,
+        ..pen_received(phase, last)
+    };
+    owner.pen(barrel(Phase::Hover));
+    owner.pen(barrel(Phase::Down));
+    run(&mut owner, 100);
+    assert!(!bar_rising(&mut owner), "it faded under the stroke");
+    owner.next(last + STROKE_QUIET);
+    assert!(bar_rising(&mut owner), "and comes back");
+}
+
+/// With no pen down nothing is latched, and the check costs the idle loop nothing.
+#[test]
+fn a_bar_with_no_pen_down_wakes_nobody() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let far = Instant::now() + Duration::from_secs(1);
+    owner.upkeep(far).expect("upkeep");
+    let next = owner.next(Instant::now());
+    assert!(matches!(next, Next::Idle { .. }), "{next:?}");
+}
+
+/// The same with a save holding at its pen: Finishing shows, and Cancel gets out.
+#[test]
+fn a_lost_up_under_finishing_has_a_way_out() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.brush.pen = true;
+    owner.request_save(Instant::now());
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    std::thread::sleep(STROKE_QUIET);
+    for _ in 0..10 {
+        owner.save_step();
+        run(&mut owner, 1);
+    }
+    assert_eq!(owner.save_stage(), Some(Stage::PenDown), "it can't go on");
+    assert!(bar_rising(&mut owner), "but the bar shows");
+    assert!(owner.key(UiKey::Escape, Instant::now()), "Cancel");
+    assert_eq!(owner.save_stage(), None, "a save that hadn't begun goes");
+}
+
+/// A save stuck at its pen can't be waited for: Cancel lets go of it, so a close reaches the
+/// question, and Don't save.
+#[test]
+fn cancel_lets_go_of_a_save_still_waiting_for_the_pen() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.brush.pen = true;
+    owner.request_save(Instant::now());
+    assert!(owner.brush.saving.is_some(), "strokes wait for it");
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    see_the_bar(&mut owner);
+    assert!(owner.key(UiKey::Escape, Instant::now()), "Cancel");
+    assert_eq!(owner.save_stage(), None, "nothing had been done");
+    assert!(owner.brush.saving.is_none(), "strokes go on");
+    assert_eq!(owner.landing(), 2, "and nothing landed");
+
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close(), "the question, not the wait");
+    see_the_bar(&mut owner);
+    let dont = owner.dialogs.control(Action::DontSave);
+    tap(&mut owner, dont);
+    assert_eq!(owner.take_request(), Some(WindowRequest::ExitDiscarding));
 }
