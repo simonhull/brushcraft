@@ -161,7 +161,7 @@ impl WindowApp {
         let timing = self.options.times_gpu();
         let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks, timing)?;
         let opening = Instant::now();
-        let project = project.open()?;
+        let (project, note) = project.open_as(&self.options)?;
         let setup = Setup {
             size: frame_size(window.surface_size()),
             interval: refresh_interval(window.as_ref()),
@@ -175,6 +175,9 @@ impl WindowApp {
         let mut owner = start(project, gpu, setup)?;
         owner.set_scale(window.scale_factor());
         owner.set_pen_status(pen.status());
+        if let Some(note) = &note {
+            owner.note(note, Instant::now());
+        }
         Ok(Running {
             pen,
             owner,

@@ -12,12 +12,19 @@
 //! here too, and its control acts only if the stroke ends with an `Up` inside it
 //! ([`Dialogs::release`], [`Dialogs::release_mouse`]). With no bar the owner's one look at
 //! [`Dialogs::routes`] is all the pen pays.
+//!
+//! **Notes** say what opening found ([`Dialogs::note`]). They answer to the same rule as the close
+//! bar: a stroke routed to the brush puts one away, and anything else, navigation included, leaves
+//! it. The one that only tells also goes by itself after [`Theme::note_hold`].
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
+use jiff::Zoned;
 use render::surface::Size;
+use store::RecoveryCandidate;
 use ui::{Bar, Blend, Chip, Control, Emphasis, Mark, Theme, Ui, UiFrame};
 
+use crate::OpenNote;
 use crate::camera::Pixel;
 use crate::navigate::Button;
 
@@ -39,16 +46,10 @@ pub(crate) enum Action {
     #[cfg_attr(not(test), expect(dead_code, reason = "the failure bar will offer it"))]
     Dismiss,
     /// Open the project from its last save.
-    #[expect(dead_code, reason = "the restore note will offer it")]
     UseLastSave,
     /// Open found work as a copy.
-    #[expect(dead_code, reason = "the earlier-version note will offer it")]
     OpenCopy,
     /// Leave found work where it is.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the earlier-version note will offer it")
-    )]
     Ignore,
 }
 
@@ -143,6 +144,23 @@ enum Prompt {
         /// soonest.
         said_at: Instant,
     },
+    /// "Your unsaved work is back": opening restored it.
+    Restored {
+        /// When the work dates from, as [`said_when`] says it; `None` if the system clock can't
+        /// say.
+        said: Option<String>,
+        /// When the note goes by itself.
+        until: Instant,
+    },
+    /// "Unsaved work found from an earlier version": found, not restored, and the user's to
+    /// decide, however long that takes.
+    EarlierVersion {
+        /// When the work dates from, as [`said_when`] says it; `None` if the system clock can't
+        /// say.
+        said: Option<String>,
+        /// What was found.
+        candidate: RecoveryCandidate,
+    },
 }
 
 impl Prompt {
@@ -177,8 +195,59 @@ impl Prompt {
                 let cancel = quiet("Cancel", Action::Cancel);
                 Some(Bar::new(title, vec![cancel]).with_progress(progress(*left, *from)))
             }
+            Self::Restored { said, .. } => {
+                let controls = vec![quiet("Use last save instead", Action::UseLastSave)];
+                Some(detailed(
+                    Bar::new("Your unsaved work is back", controls),
+                    said.as_deref(),
+                ))
+            }
+            Self::EarlierVersion { said, .. } => {
+                let copy = Control {
+                    label: "Open as a copy".to_owned(),
+                    action: Action::OpenCopy,
+                    emphasis: Emphasis::Filled,
+                };
+                let controls = vec![quiet("Ignore", Action::Ignore), copy];
+                Some(detailed(
+                    Bar::new("Unsaved work found from an earlier version", controls),
+                    said.as_deref(),
+                ))
+            }
         }
     }
+}
+
+/// `bar`, with `detail` under its title if there is one.
+fn detailed(bar: Bar<Action>, detail: Option<&str>) -> Bar<Action> {
+    match detail {
+        Some(detail) => bar.with_detail(detail),
+        None => bar,
+    }
+}
+
+/// When something written at `then` dates from, seen from `now`, in `now`'s time zone: "From today
+/// at 16:42", "From yesterday at 16:42", or the date, its year only if that isn't this one.
+pub(crate) fn said_when(then: &Zoned, now: &Zoned) -> String {
+    let then = then.with_time_zone(now.time_zone().clone());
+    let (day, today) = (then.date(), now.date());
+    let clock = then.strftime("%H:%M");
+    if day == today {
+        format!("From today at {clock}")
+    } else if today.yesterday().is_ok_and(|yesterday| yesterday == day) {
+        format!("From yesterday at {clock}")
+    } else if day.year() == today.year() {
+        format!("From {} at {clock}", then.strftime("%-d %b"))
+    } else {
+        format!("From {} at {clock}", then.strftime("%-d %b %Y"))
+    }
+}
+
+/// [`said_when`] of `when`, by the system's clock and time zone; `None` for a time past what they
+/// can say.
+fn said_now(when: SystemTime) -> Option<String> {
+    let then = Zoned::try_from(when).ok()?;
+    Some(said_when(&then, &Zoned::now()))
 }
 
 /// How far along a wait is with `left` of `from` still to go, 0 to 1.
@@ -308,6 +377,9 @@ impl Dialogs {
     /// always. A chip where there was none waits for the pen to lift; one already showing changes
     /// at once.
     pub(crate) fn update(&mut self, facts: Facts, now: Instant) {
+        if self.note_until().is_some_and(|until| until <= now) {
+            self.clear_prompt(now);
+        }
         let status = self.next_status(facts, now);
         let arriving = self.status == Status::Quiet && status != Status::Quiet;
         self.waiting = arriving && self.pen_is_down;
@@ -363,6 +435,40 @@ impl Dialogs {
         self.show_prompt(now);
     }
 
+    /// Says what opening found.
+    pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
+        self.prompt = match note {
+            OpenNote::Restored { when, .. } => Prompt::Restored {
+                said: said_now(*when),
+                until: now + Theme::GLASS.note_hold,
+            },
+            OpenNote::EarlierVersion { candidate } => Prompt::EarlierVersion {
+                said: said_now(candidate.modified),
+                candidate: candidate.clone(),
+            },
+        };
+        self.show_prompt(now);
+    }
+
+    /// When the note goes by itself, if one showing does.
+    const fn note_until(&self) -> Option<Instant> {
+        match self.prompt {
+            Prompt::Restored { until, .. } => Some(until),
+            Prompt::None
+            | Prompt::AskClose { .. }
+            | Prompt::Finishing { .. }
+            | Prompt::EarlierVersion { .. } => None,
+        }
+    }
+
+    /// Whether the bar says what opening found.
+    pub(crate) const fn noting(&self) -> bool {
+        matches!(
+            self.prompt,
+            Prompt::Restored { .. } | Prompt::EarlierVersion { .. }
+        )
+    }
+
     /// Takes the bar away.
     pub(crate) fn clear_prompt(&mut self, now: Instant) {
         self.prompt = Prompt::None;
@@ -415,9 +521,13 @@ impl Dialogs {
         self.ui.needs_frame(now) || (self.waiting && !self.pen_is_down)
     }
 
-    /// When something next changes by itself: the chip's "Saved" leaving.
+    /// When something next changes by itself: the chip's "Saved" leaving, or a note.
     pub(crate) fn next_change(&self) -> Option<Instant> {
-        self.saved_at.map(|at| at + Theme::GLASS.saved_hold)
+        let saved = self.saved_at.map(|at| at + Theme::GLASS.saved_hold);
+        match (saved, self.note_until()) {
+            (Some(one), Some(other)) => Some(one.min(other)),
+            (one, other) => one.or(other),
+        }
     }
 
     /// The pen touched down: bars fade out and the chip dims. Touches the fades only.
@@ -953,6 +1063,108 @@ mod tests {
         assert!(!bar_rising(&mut dialogs, seen), "it stays gone");
     }
 
+    /// The moment `at` (`YYYY-MM-DDTHH:MM`), `hours` ahead of UTC.
+    fn zoned(at: &str, hours: i8) -> Zoned {
+        let moment: jiff::civil::DateTime = at.parse().expect("a date and time");
+        let zone = jiff::tz::TimeZone::fixed(jiff::tz::offset(hours));
+        moment.to_zoned(zone).expect("a moment")
+    }
+
+    #[test]
+    fn said_when_says_today_yesterday_or_the_date() {
+        let now = zoned("2026-11-05T09:30", 0);
+        let said = |then: &str| said_when(&zoned(then, 0), &now);
+        assert_eq!(said("2026-11-05T00:00"), "From today at 00:00");
+        assert_eq!(said("2026-11-04T16:42"), "From yesterday at 16:42");
+        assert_eq!(said("2026-11-03T16:42"), "From 3 Nov at 16:42");
+        assert_eq!(said("2025-11-04T16:42"), "From 4 Nov 2025 at 16:42");
+
+        let new_year = zoned("2027-01-01T08:05", 0);
+        let across = |then: &str| said_when(&zoned(then, 0), &new_year);
+        assert_eq!(across("2026-12-31T23:59"), "From yesterday at 23:59");
+        assert_eq!(across("2026-12-30T23:59"), "From 30 Dec 2026 at 23:59");
+    }
+
+    #[test]
+    fn said_when_goes_by_the_zone_of_now() {
+        // Late yesterday where it was written, the next morning here.
+        let then = zoned("2026-11-04T23:30", 0);
+        let now = zoned("2026-11-05T10:00", 9);
+        assert_eq!(said_when(&then, &now), "From today at 08:30");
+    }
+
+    /// The note of a restored recovery file written at `when`.
+    fn restored(when: SystemTime) -> OpenNote {
+        OpenNote::Restored {
+            path: "recovery.bcrf".into(),
+            when,
+        }
+    }
+
+    #[test]
+    fn the_restored_note_says_so_and_offers_the_last_save() {
+        let now = Instant::now();
+        let when = SystemTime::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&restored(when), now);
+        let last_save = Control {
+            label: "Use last save instead".to_owned(),
+            action: Action::UseLastSave,
+            emphasis: Emphasis::Quiet,
+        };
+        let said = said_now(when).expect("a time the clock can say");
+        let bar = Bar::new("Your unsaved work is back", vec![last_save]).with_detail(said);
+        assert_eq!(dialogs.bar(), Some(bar));
+    }
+
+    #[test]
+    fn the_note_leaves_after_ten_seconds_and_says_when_to_come_back() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&restored(SystemTime::now()), now);
+        let almost = now + Duration::from_millis(9_999);
+        let until = now + Duration::from_secs(10);
+        assert_eq!(dialogs.next_change(), Some(until), "the idle loop wakes");
+        dialogs.update(CLEAN, almost);
+        assert!(dialogs.noting(), "still there");
+        dialogs.update(CLEAN, until);
+        assert!(!dialogs.noting(), "gone");
+        assert!(!dialogs.routes(), "and nothing goes through it");
+        assert_eq!(dialogs.next_change(), None, "nothing more to come");
+        assert!(dialogs.needs_frame(until), "fading out");
+    }
+
+    #[test]
+    fn a_note_and_a_saved_chip_say_the_sooner_of_the_two() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.saved(now);
+        assert_eq!(dialogs.next_change(), Some(now + hold()), "the chip first");
+    }
+
+    #[test]
+    fn the_close_bar_taking_over_stops_the_notes_clock() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.ask_close("first-sculpt", now);
+        let later = now + Duration::from_secs(11);
+        dialogs.update(EDITED, later);
+        assert!(dialogs.asking_close(), "the question stays");
+    }
+
+    #[test]
+    fn a_note_under_the_pen_waits_for_the_up() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.pen_down(now);
+        dialogs.note(&restored(SystemTime::now()), now);
+        assert!(!bar_rising(&mut dialogs, now), "nothing shows");
+        dialogs.pen_up(now);
+        assert!(bar_rising(&mut dialogs, now), "here it comes");
+    }
+
     #[test]
     fn every_bar_fits_the_smallest_window_at_any_scale() {
         let now = Instant::now();
@@ -970,14 +1182,23 @@ mod tests {
             let mut dialogs = Dialogs::new(size, scale, Blend::Display, now);
             let seen = now + Theme::GLASS.fade;
             dialogs.ask_close("a project with a name as long as anyone will give it", now);
-            for action in [Action::DontSave, Action::KeepSculpting, Action::Save] {
-                let mut points = dialogs.grid();
-                let found = points.find(|&at| {
-                    let (x, y) = ui_point(at);
-                    dialogs.ui.hit(x, y, seen) == Some(action)
-                });
-                assert!(found.is_some(), "{action:?} at {scale}");
-            }
+            let close = [Action::DontSave, Action::KeepSculpting, Action::Save];
+            assert_controls_found(&dialogs, &close, seen, scale);
+
+            dialogs.note(&restored(SystemTime::now()), now);
+            assert_controls_found(&dialogs, &[Action::UseLastSave], seen, scale);
+        }
+    }
+
+    /// Checks `actions` can all be hit at `seen`.
+    fn assert_controls_found(dialogs: &Dialogs, actions: &[Action], seen: Instant, scale: f64) {
+        for &action in actions {
+            let mut points = dialogs.grid();
+            let found = points.find(|&at| {
+                let (x, y) = ui_point(at);
+                dialogs.ui.hit(x, y, seen) == Some(action)
+            });
+            assert!(found.is_some(), "{action:?} at {scale}");
         }
     }
 }

@@ -46,15 +46,18 @@ mod uploads;
 mod window;
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use render::gpu::{Gpu, GpuError};
 use render::surface::{Offscreen, Presentation, Target};
-use store::{Project, ProjectConfig, StoreConfig, default_recovery_dir};
+use store::{
+    CandidateStatus, Project, ProjectConfig, ProjectError, RecoveryCandidate, StoreConfig,
+    default_recovery_dir, find_recoveries,
+};
 use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
@@ -182,6 +185,39 @@ pub(crate) fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} ({:?})", info.name, info.backend)
 }
 
+/// What opening found beyond the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenNote {
+    /// Its recovery file was restored: it is `path`, written at `when`.
+    Restored {
+        /// The recovery file, which goes on as the project's.
+        path: PathBuf,
+        /// When it was last written.
+        when: SystemTime,
+    },
+    /// A recovery file onto an earlier save was found, and not restored.
+    EarlierVersion {
+        /// What was found.
+        candidate: RecoveryCandidate,
+    },
+}
+
+/// Whether `one` and `other` are one file, however they are spelled: through a symbolic link, with
+/// `..` in them, or as two hard links. Paths that can't be followed are no file, so not the same.
+fn same_file(one: &Path, other: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let identity = |path| std::fs::metadata(path).map(|file| (file.dev(), file.ino()));
+        matches!((identity(one), identity(other)), (Ok(a), Ok(b)) if a == b)
+    }
+    #[cfg(not(unix))]
+    {
+        let real = std::fs::canonicalize;
+        matches!((real(one), real(other)), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
 /// A project checked and ready to open, opened only once the GPU (and the window) are.
 ///
 /// Opening a project makes a recovery file, so a launch that fails before the project opens
@@ -221,6 +257,81 @@ impl ProjectToOpen {
     pub(crate) fn open(self) -> Result<Project> {
         Project::open(&self.path, self.config)
             .with_context(|| format!("opening {}", self.path.display()))
+    }
+
+    /// Opens it as the run in `options` should: bringing back what a crash left, or not.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectToOpen::open`].
+    pub(crate) fn open_as(self, options: &Options) -> Result<(Project, Option<OpenNote>)> {
+        if options.restores() {
+            self.open_restoring()
+        } else {
+            Ok((self.open()?, None))
+        }
+    }
+
+    /// Opens it with what the last run left: its restorable recovery file if it has one, and
+    /// otherwise as ever, with a note if there's work on an earlier save.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectToOpen::open`]. Recovery never fails an open.
+    pub(crate) fn open_restoring(self) -> Result<(Project, Option<OpenNote>)> {
+        let found = find_recoveries(&self.config.recovery_dir);
+        self.open_with(found)
+    }
+
+    /// [`ProjectToOpen::open_restoring`], with `found` the listing of recovery files. A listing
+    /// that failed, or a restore that does, is said on stderr and the project opens as ever: the
+    /// user's project must open, and the recovery file is kept for another try.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectToOpen::open`].
+    fn open_with(
+        self,
+        found: Result<Vec<RecoveryCandidate>, ProjectError>,
+    ) -> Result<(Project, Option<OpenNote>)> {
+        let found = found.unwrap_or_else(|error| {
+            let why = anyhow::Error::new(error);
+            saving::log(&format!("brushcraft: looking for recovery files: {why:#}"));
+            Vec::new()
+        });
+        let ours = found.into_iter().filter(|found| self.holds_work_of(found));
+        let ours: Vec<RecoveryCandidate> = ours.collect();
+        let has = |status: CandidateStatus| {
+            let mut candidates = ours.iter();
+            candidates.find(|candidate| candidate.status == status)
+        };
+        if let Some(candidate) = has(CandidateStatus::Restorable) {
+            match Project::restore(candidate, self.config.clone()) {
+                Ok(project) => {
+                    let note = OpenNote::Restored {
+                        path: candidate.path.clone(),
+                        when: candidate.modified,
+                    };
+                    return Ok((project, Some(note)));
+                }
+                Err(error) => {
+                    let (path, why) = (candidate.path.display(), anyhow::Error::new(error));
+                    saving::log(&format!("brushcraft: restoring {path}: {why:#}"));
+                }
+            }
+        }
+        let earlier = has(CandidateStatus::RestorableOnEarlierSave).cloned();
+        let note = earlier.map(|candidate| OpenNote::EarlierVersion { candidate });
+        Ok((self.open()?, note))
+    }
+
+    /// Whether `candidate` has work of this project: it has edits, and the file it extends is the
+    /// one being opened, whichever way either path spells it. A copy of the project is another
+    /// file, and its project id and save points say nothing of that, so they aren't asked. A
+    /// candidate with no edits would bring back nothing to tell the user of.
+    fn holds_work_of(&self, candidate: &RecoveryCandidate) -> bool {
+        let extends = candidate.base_path.as_deref();
+        candidate.last_edit.is_some() && extends.is_some_and(|base| same_file(base, &self.path))
     }
 }
 
@@ -297,7 +408,10 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
     let timing = options.times_gpu();
     let mut render = RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none(), timing)?;
     let opening = Instant::now();
-    let project = project.open()?;
+    let (project, note) = project.open_as(options)?;
+    if let Some(OpenNote::Restored { path, .. }) = &note {
+        writeln!(std::io::stdout(), "restored: {}", path.display())?;
+    }
     let presentation = render.presentation();
     let setup = Setup {
         size: Some(options.size),
@@ -310,6 +424,9 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
         record: options.record_setup(render.timing(), opening),
     };
     let mut owner = start(project, Arc::clone(&gpu), setup)?;
+    if let Some(note) = &note {
+        owner.note(note, Instant::now());
+    }
     let ran = drive_offscreen(&mut owner, &mut render);
     let stopped = render.stop().and_then(|stopped| {
         if ran.is_ok()
@@ -447,10 +564,337 @@ fn run() -> Result<()> {
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
+    use std::ffi::OsString;
+
     use anyhow::{Result, anyhow};
+    use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
     use render::surface::Presentation;
 
-    use super::{End, Summary, settled};
+    use super::*;
+    use crate::test_dir::TestDir;
+
+    /// The finest level the test projects keep.
+    const FINEST: u8 = 3;
+
+    /// Opening a project at `path`, its recovery files in `dir`'s `recovery`.
+    fn to_open(dir: &TestDir, path: &Path) -> ProjectToOpen {
+        ProjectToOpen {
+            path: path.to_owned(),
+            config: ProjectConfig {
+                store: StoreConfig::new(512 << 20, SITE),
+                recovery_dir: dir.path().join("recovery"),
+            },
+        }
+    }
+
+    /// A saved project called `name` in `dir`, with no edits.
+    fn saved(dir: &TestDir, name: &str) -> ProjectToOpen {
+        let opening = to_open(dir, &dir.path().join(name));
+        let mesh = cube_sphere(1).expect("a cube sphere");
+        let mut project = Project::new(mesh, opening.config.clone()).expect("a new project");
+        drop(project.save_as(&opening.path).expect("saved"));
+        project.close(false).expect("closed");
+        opening
+    }
+
+    /// Makes one edit of `project`, as a stroke does.
+    fn edit(project: &mut Project) {
+        let level = Level::new(FINEST).expect("a level");
+        let key = TileKey::displacement(FaceId::new(0), level, 0, 0).expect("a tile");
+        project.begin_stroke().expect("begun");
+        let edited = project
+            .store()
+            .edit_tile(key, |tile| tile.set(1, 1, Vec3::new(0.0, 0.0, 0.01)));
+        edited.expect("the tile").expect("edited");
+        project.store().close_epoch().expect("closed");
+        project.end_unrecorded_stroke().expect("ended");
+    }
+
+    /// Opens `project` plainly, edits it and ends with its recovery file left, as a crash does:
+    /// that file's path.
+    fn left_work(project: &ProjectToOpen) -> PathBuf {
+        let mut opened = project.clone().open().expect("opened");
+        edit(&mut opened);
+        let path = opened.recovery_path().expect("protected").to_owned();
+        opened.close(true).expect("closed, the file kept");
+        path
+    }
+
+    /// `project`'s recovery files as the app lists them.
+    fn listed(project: &ProjectToOpen) -> Vec<RecoveryCandidate> {
+        find_recoveries(&project.config.recovery_dir).expect("listed")
+    }
+
+    /// The recovery files left by `project`, in order.
+    fn left(project: &ProjectToOpen) -> Vec<PathBuf> {
+        let files = listed(project).into_iter().map(|found| found.path);
+        let mut paths: Vec<PathBuf> = files.collect();
+        paths.sort();
+        paths
+    }
+
+    /// Closes `project`, keeping its recovery file if it has edits, as a run's end does.
+    fn close(project: Project) {
+        let keep = project.has_unsaved_edits();
+        project.close(keep).expect("closed");
+    }
+
+    #[test]
+    fn a_restorable_recovery_file_is_restored() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert!(project.has_unsaved_edits(), "the work is back");
+        assert_eq!(project.path(), Some(opening.path.as_path()), "saves here");
+        assert_eq!(project.recovery_path(), Some(file.as_path()), "goes on");
+        let Some(OpenNote::Restored { path, .. }) = note else {
+            panic!("the note says so: {note:?}");
+        };
+        assert_eq!(path, file);
+        close(project);
+        assert_eq!(left(&opening), vec![file], "kept while it's unsaved");
+    }
+
+    #[test]
+    fn the_newest_of_two_is_the_one_restored() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let older = left_work(&opening);
+        let newer = left_work(&opening);
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert_eq!(project.recovery_path(), Some(newer.as_path()));
+        assert!(matches!(note, Some(OpenNote::Restored { path, .. }) if path == newer));
+        close(project);
+        assert!(left(&opening).contains(&older), "the other is left");
+    }
+
+    #[test]
+    fn a_recovery_file_of_another_project_is_left_alone() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let other = saved(&dir, "second-sculpt.bcrf");
+        let theirs = left_work(&other);
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert_eq!(note, None, "nothing of this project");
+        assert!(!project.has_unsaved_edits());
+        close(project);
+        assert_eq!(left(&opening), vec![theirs], "as it was");
+    }
+
+    #[test]
+    fn a_copy_of_the_project_is_another_project() {
+        // The same project id and save points as the file the work extends: only the path says.
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let copied = to_open(&dir, &dir.path().join("copy.bcrf"));
+        std::fs::copy(&opening.path, &copied.path).expect("copied");
+        let file = left_work(&opening);
+        let (project, note) = copied.clone().open_restoring().expect("opened");
+        assert_eq!(note, None, "that work is on the original");
+        assert_eq!(project.path(), Some(copied.path.as_path()));
+        assert!(!project.has_unsaved_edits());
+        close(project);
+        assert_eq!(left(&opening), vec![file], "and still there for it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_is_found_whichever_way_the_project_is_spelled() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let linked = dir.path().join("linked.bcrf");
+        std::os::unix::fs::symlink(&opening.path, &linked).expect("a symbolic link");
+        let hard = dir.path().join("hard.bcrf");
+        std::fs::hard_link(&opening.path, &hard).expect("a hard link");
+        let inner = dir.path().join("inner");
+        std::fs::create_dir_all(&inner).expect("a directory");
+        let dotted = inner.join("..").join("first-sculpt.bcrf");
+
+        for path in [linked.clone(), hard, dotted] {
+            // Made under the real name, opened under this one.
+            let file = left_work(&opening);
+            let (project, note) = to_open(&dir, &path).open_restoring().expect("opened");
+            assert!(project.has_unsaved_edits(), "by {}", path.display());
+            assert!(matches!(note, Some(OpenNote::Restored { .. })));
+            project.close(false).expect("closed, the file with it");
+            assert!(!file.exists(), "that was the one");
+        }
+
+        // Made under a link, opened under the real name.
+        left_work(&to_open(&dir, &linked));
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert!(matches!(note, Some(OpenNote::Restored { .. })), "{note:?}");
+        project.close(false).expect("closed");
+    }
+
+    #[test]
+    fn no_recovery_file_opens_as_ever() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert_eq!(note, None);
+        assert!(!project.has_unsaved_edits());
+        project.close(false).expect("closed");
+    }
+
+    #[test]
+    fn a_recovery_file_with_no_edits_brings_nothing_back() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let empty = opening.clone().open().expect("opened");
+        let file = empty.recovery_path().expect("protected").to_owned();
+        empty.close(true).expect("closed, as a crash leaves it");
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert_eq!(note, None, "\"Your unsaved work is back\" would be untrue");
+        assert_ne!(project.recovery_path(), Some(file.as_path()));
+        project.close(false).expect("closed");
+    }
+
+    /// Leaves work on `opening`'s current save, then saves the project past it: that file.
+    fn left_on_an_earlier_save(opening: &ProjectToOpen) -> PathBuf {
+        let file = left_work(opening);
+        let mut later = opening.clone().open().expect("opened");
+        edit(&mut later);
+        drop(later.save().expect("saved"));
+        later.close(false).expect("closed");
+        file
+    }
+
+    #[test]
+    fn a_recovery_file_on_an_earlier_save_opens_the_project_with_a_note() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_on_an_earlier_save(&opening);
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert!(!project.has_unsaved_edits(), "not restored by itself");
+        assert_eq!(project.path(), Some(opening.path.as_path()));
+        let Some(OpenNote::EarlierVersion { candidate }) = note else {
+            panic!("the note asks: {note:?}");
+        };
+        assert_eq!(candidate.path, file);
+        project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file], "kept for the user's answer");
+    }
+
+    #[test]
+    fn a_restorable_file_goes_before_one_on_an_earlier_save() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        left_on_an_earlier_save(&opening);
+        let latest = left_work(&opening);
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert!(matches!(note, Some(OpenNote::Restored { path, .. }) if path == latest));
+        close(project);
+    }
+
+    #[test]
+    fn one_that_cannot_be_restored_is_left_alone_with_no_note() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let real = listed(&opening).pop().expect("listed");
+        let statuses = [
+            CandidateStatus::ProjectMissing,
+            CandidateStatus::SavePointMissing,
+            CandidateStatus::ProjectInUse,
+            CandidateStatus::Damaged,
+            CandidateStatus::NeverSaved,
+        ];
+        for status in statuses {
+            let candidate = RecoveryCandidate {
+                status,
+                ..real.clone()
+            };
+            let found = Ok(vec![candidate]);
+            let (project, note) = opening.clone().open_with(found).expect("opened");
+            assert_eq!(note, None, "{status:?}");
+            assert!(!project.has_unsaved_edits(), "{status:?}");
+            project.close(false).expect("closed");
+            assert_eq!(left(&opening), vec![file.clone()], "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_replaced_at_its_path_keeps_the_file_and_shows_nothing() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        std::fs::remove_file(&opening.path).expect("removed");
+        saved(&dir, "first-sculpt.bcrf");
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert_eq!(note, None);
+        assert!(!project.has_unsaved_edits());
+        project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file]);
+    }
+
+    #[test]
+    fn a_failing_look_for_recovery_files_opens_the_project_all_the_same() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let failed = Err(ProjectError::Io(std::io::Error::other("no listing")));
+        let (project, note) = opening.clone().open_with(failed).expect("opened");
+        assert_eq!(note, None);
+        project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file], "kept for the next open");
+    }
+
+    #[test]
+    fn a_failing_restore_opens_the_project_all_the_same_and_keeps_the_file() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let real = listed(&opening).pop().expect("listed");
+        // A listing gone stale: the save point it names isn't the file's.
+        let stale = RecoveryCandidate { base: None, ..real };
+        let (project, note) = opening.clone().open_with(Ok(vec![stale])).expect("opened");
+        assert_eq!(note, None, "nothing was restored");
+        assert!(!project.has_unsaved_edits(), "opened as ever");
+        assert_ne!(project.recovery_path(), Some(file.as_path()));
+        project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file], "kept");
+    }
+
+    /// The options of `args` on `project`.
+    fn options(project: &ProjectToOpen, args: &[&str]) -> Options {
+        let args = args.iter().map(OsString::from);
+        let path = OsString::from(project.path.as_os_str());
+        Options::parse(std::iter::once(path).chain(args)).expect("parsed")
+    }
+
+    #[test]
+    fn scripted_and_offscreen_runs_never_restore_unless_asked() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let measured: [&[&str]; 4] = [
+            &["--frames", "3"],
+            &["--script"],
+            &["--offscreen", "--frames", "3"],
+            &["--offscreen", "--script"],
+        ];
+        for args in measured {
+            let run = options(&opening, args);
+            let (project, note) = opening.clone().open_as(&run).expect("opened");
+            assert_eq!(note, None, "{args:?}");
+            assert!(!project.has_unsaved_edits(), "{args:?}");
+            project.close(false).expect("closed");
+            assert_eq!(left(&opening), vec![file.clone()], "{args:?}");
+        }
+        let asked: [&[&str]; 3] = [
+            &[],
+            &["--offscreen", "--frames", "3", "--restore"],
+            &["--offscreen", "--script", "--restore"],
+        ];
+        for args in asked {
+            let run = options(&opening, args);
+            let (project, note) = opening.clone().open_as(&run).expect("opened");
+            assert!(matches!(note, Some(OpenNote::Restored { .. })), "{args:?}");
+            close(project);
+        }
+    }
 
     /// A run's summary, its details aside.
     fn summary() -> Summary {

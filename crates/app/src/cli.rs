@@ -53,6 +53,9 @@ options:
                    latency of strokes drawn by hand), written as the window closes
   --no-gpu-timing  don't time the GPU, even where it can be (with --script)
   --offscreen      no window: draw into a texture (needs --frames or --script)
+  --restore        with --offscreen, bring back the project's unsaved work as a window does,
+                   saying `restored: FILE`; without it an offscreen run never picks up a
+                   recovery file
   --screenshot FILE
                    with --offscreen, write the last frame drawn to FILE as a PNG when the
                    run ends";
@@ -102,6 +105,9 @@ pub(crate) struct Options {
     /// Where an offscreen run writes its last frame as a PNG ([`crate::screenshot`]), if
     /// anywhere.
     pub(crate) screenshot: Option<PathBuf>,
+    /// Whether an offscreen run brings back unsaved work: the kill test's. A measured run must
+    /// never pick up a recovery file, so it doesn't unless asked.
+    pub(crate) restore: bool,
 }
 
 /// The default finest level: the benchmark project's.
@@ -118,8 +124,8 @@ impl Options {
     ///
     /// On an unknown option, an option without its value or with one that doesn't parse, no
     /// project or more than one, `--offscreen` without `--frames` or `--script`, both of those,
-    /// `--record`, `--script-path` or `--script-speed` without `--script`, or `--screenshot`
-    /// without `--offscreen`.
+    /// `--record`, `--script-path` or `--script-speed` without `--script`, or `--screenshot` or
+    /// `--restore` without `--offscreen`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut project = None;
         let mut level = DEFAULT_LEVEL;
@@ -134,6 +140,7 @@ impl Options {
         let mut screenshot = None;
         let mut gpu_timing = true;
         let mut offscreen = false;
+        let mut restore = false;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             if let Some(value) = flag_value(&arg, "--level", &mut args)? {
@@ -169,6 +176,8 @@ impl Options {
                 gpu_timing = false;
             } else if arg == "--offscreen" {
                 offscreen = true;
+            } else if arg == "--restore" {
+                restore = true;
             } else if arg.to_str().is_some_and(|a| a.starts_with('-')) {
                 bail!("unknown option {}; {USAGE}", arg.display());
             } else if project.replace(PathBuf::from(arg)).is_some() {
@@ -195,10 +204,7 @@ impl Options {
             record.is_none() || matches!(run, Run::Script(_) | Run::Open),
             "--record goes with --script, or with a window's open run (a live session)"
         );
-        ensure!(
-            offscreen || screenshot.is_none(),
-            "--screenshot goes with --offscreen: a window's frames are the compositor's to capture"
-        );
+        check_offscreen_only(offscreen, screenshot.is_some(), restore)?;
         let mode = Mode { run, offscreen };
         let default_size = Size::new(DEFAULT_SIZE.0, DEFAULT_SIZE.1)
             .ok_or_else(|| anyhow!("the default size is not empty"))?;
@@ -215,7 +221,15 @@ impl Options {
             gpu_timing,
             script_path: path.unwrap_or_default(),
             screenshot,
+            restore,
         })
+    }
+
+    /// Whether the run brings back unsaved work as it opens: a window's open run, and an offscreen
+    /// run with `--restore`. Never a scripted window, or an offscreen run not asked to: measured
+    /// runs must not pick up a recovery file.
+    pub(crate) fn restores(&self) -> bool {
+        self.restore || (self.mode.run == Run::Open && !self.mode.offscreen)
     }
 
     /// A `--frames` run's frame count.
@@ -252,6 +266,25 @@ impl Options {
             opening,
         })
     }
+}
+
+/// Checks what only an offscreen run takes: whether it is one, with `--screenshot` and `--restore`
+/// given or not.
+///
+/// # Errors
+///
+/// If either is given to a run that isn't.
+fn check_offscreen_only(offscreen: bool, screenshot: bool, restore: bool) -> Result<()> {
+    ensure!(
+        offscreen || !screenshot,
+        "--screenshot goes with --offscreen: a window's frames are the compositor's to capture"
+    );
+    ensure!(
+        offscreen || !restore,
+        "--restore goes with --offscreen: a window's open run restores by itself, and a scripted \
+         one never does"
+    );
+    Ok(())
 }
 
 /// The value of `flag` if `arg` is it, as `flag VALUE` (taking the next argument) or
@@ -480,6 +513,29 @@ mod tests {
     }
 
     /// The mode `run`, offscreen or not.
+    #[test]
+    fn only_an_offscreen_run_asks_to_restore_and_a_windows_open_run_does_by_itself() {
+        let restores = |args: &[&str]| parse(args).unwrap().restores();
+        assert!(restores(&["p.bcrf"]), "a window's open run");
+        assert!(!restores(&["p.bcrf", "--frames", "3"]), "a scripted window");
+        assert!(!restores(&["p.bcrf", "--script"]), "a measured one");
+        assert!(!restores(&["p.bcrf", "--offscreen", "--script"]));
+        assert!(restores(&[
+            "p.bcrf",
+            "--offscreen",
+            "--script",
+            "--restore"
+        ]));
+        assert!(restores(&[
+            "p.bcrf",
+            "--offscreen",
+            "--frames=3",
+            "--restore"
+        ]));
+        parse(&["p.bcrf", "--restore"]).unwrap_err();
+        parse(&["p.bcrf", "--frames", "3", "--restore"]).unwrap_err();
+    }
+
     const fn mode(run: Run, offscreen: bool) -> Mode {
         Mode { run, offscreen }
     }

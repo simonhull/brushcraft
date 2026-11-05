@@ -3784,3 +3784,174 @@ fn finishing_needs_no_frames_or_size() {
     }
     assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
 }
+
+/// [`bar_owner`] with the note of a restored project up, seen, and nothing else.
+fn noted_owner(dir: &TestDir, claims: bool) -> Owner<PenLog, NoUploads> {
+    let mut owner = bar_owner(dir, claims);
+    let note = OpenNote::Restored {
+        path: "recovery.bcrf".into(),
+        when: std::time::SystemTime::now(),
+    };
+    owner.note(&note, seen_now());
+    run(&mut owner, 10_000);
+    owner.brush.frames.clear();
+    owner
+}
+
+/// A moment long enough ago for a bar shown then to be seen now.
+fn seen_now() -> Instant {
+    let ago = Theme::GLASS.fade + Theme::GLASS.swap_lockout;
+    Instant::now()
+        .checked_sub(ago * 2)
+        .expect("the clock is past it")
+}
+
+#[test]
+fn the_first_stroke_routed_to_the_brush_puts_the_note_away() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = noted_owner(&dir, true);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    assert!(
+        owner.dialogs.noting(),
+        "routed in the frame, not as it came"
+    );
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(!owner.dialogs.noting(), "gone");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_navigation_stroke_leaves_the_note() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = noted_owner(&dir, false);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(
+        owner.pen_router.stroke(),
+        Some(Route::Navigate),
+        "it orbits"
+    );
+    assert!(owner.dialogs.noting(), "looking at the model is no answer");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_stroke_on_the_notes_glass_leaves_it() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = noted_owner(&dir, true);
+    let glass = owner.dialogs.bare_glass();
+    owner.pen(pen_at(Phase::Down, glass));
+    owner.pen(pen_at(Phase::Up, glass));
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(owner.dialogs.noting(), "the bar took it");
+    assert!(brush_saw(&owner).is_empty(), "and the brush saw none of it");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_note_going_by_itself_wakes_the_idle_loop() {
+    let dir = TestDir::new();
+    let mut owner = noted_owner(&dir, true);
+    let until = Instant::now() + Theme::GLASS.note_hold;
+    let Next::Idle { upkeep } = owner.next(Instant::now()) else {
+        panic!("nothing to do yet");
+    };
+    assert!(upkeep <= until, "woken in time for it");
+    assert!(matches!(owner.next(until), Next::Frame { .. }), "its frame");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn ignore_puts_the_note_away() {
+    let dir = TestDir::new();
+    let mut owner = noted_owner(&dir, true);
+    owner.act(Action::Ignore, Instant::now());
+    assert!(!owner.dialogs.noting());
+    owner.close().expect("closed");
+}
+
+/// A saved project in `dir` and a recovery file of unsaved work left on it, as a crash leaves it:
+/// the project's path, and how to open it.
+fn left_work(dir: &TestDir) -> (PathBuf, ProjectConfig) {
+    let config = ProjectConfig {
+        store: StoreConfig::new(512 << 20, 1),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let path = dir.path().join("first-sculpt.bcrf");
+    let mesh = cube_sphere(1).expect("a cube sphere");
+    let mut saved = Project::new(mesh, config.clone()).expect("a new project");
+    drop(saved.save_as(&path).expect("saved"));
+    saved.close(false).expect("closed");
+    let mut project = Project::open(&path, config.clone()).expect("opened");
+    edit_one_tile(&mut project);
+    project.close(true).expect("closed, as a crash leaves it");
+    (path, config)
+}
+
+/// Edits a tile of `project`, as a stroke does.
+fn edit_one_tile(project: &mut Project) {
+    let level = Level::new(FINEST).expect("a level");
+    let key = TileKey::displacement(FaceId::new(0), level, 0, 0).expect("a tile");
+    project.begin_stroke().expect("begun");
+    let edited = project
+        .store()
+        .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)));
+    edited.expect("the tile").expect("edited");
+    project.store().close_epoch().expect("closed");
+    project.end_unrecorded_stroke().expect("ended");
+}
+
+/// A project of `dir` with unsaved work, restored and ready to run.
+fn restored_owner(dir: &TestDir) -> Owner<NoBrush, NoUploads> {
+    let (_, config) = left_work(dir);
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let candidate = found.first().expect("the file");
+    let project = Project::restore(candidate, config).expect("restored");
+    Owner::new(project, NoBrush, NoUploads, big_setup(), Instant::now())
+}
+
+#[test]
+fn a_restored_project_is_unsaved_so_the_chip_shows_and_the_close_bar_asks() {
+    let dir = TestDir::new();
+    let mut owner = restored_owner(&dir);
+    run(&mut owner, 10_000);
+    assert!(
+        owner
+            .title_change()
+            .is_some_and(|title| title.starts_with('*')),
+        "the title's marker"
+    );
+    let unsaved = Facts {
+        unsaved: true,
+        saving: false,
+        landing: 0,
+    };
+    assert_eq!(
+        owner.facts(owner.unsaved()),
+        unsaved,
+        "what the chip goes by"
+    );
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close());
+    owner.close().expect("closed");
+}
+
+#[test]
+fn dont_save_on_a_restored_project_removes_its_recovery_file() {
+    let dir = TestDir::new();
+    let mut owner = restored_owner(&dir);
+    let file = owner
+        .project()
+        .recovery_path()
+        .expect("protected")
+        .to_owned();
+    assert!(file.exists());
+    owner.discard().expect("discarded");
+    assert!(!file.exists(), "what the user dropped doesn't come back");
+}

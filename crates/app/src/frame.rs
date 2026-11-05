@@ -130,9 +130,9 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::said_too;
 use crate::saving::{SAVE_SLICE, SaveStep, Saving, Stage};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
+use crate::{OpenNote, said_too};
 
 /// What the brush is handed each time the frame loop calls it.
 ///
@@ -1485,14 +1485,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// A stroke went to the brush: going back to work answers the bar. On the close bar that's
-    /// Keep sculpting, and while finishing, Cancel, the stroke waiting for the save as any does.
-    /// Navigating is no answer: the user may be looking at the model before deciding.
+    /// Keep sculpting, while finishing, Cancel, the stroke waiting for the save as any does, and a
+    /// note goes, what it found staying where it is. Navigating is no answer: the user may be
+    /// looking at the model before deciding.
     fn back_to_work(&mut self) {
         let now = Instant::now();
         if self.dialogs.asking_close() {
             self.act(Action::KeepSculpting, now);
         } else if self.dialogs.finishing() {
             self.act(Action::Cancel, now);
+        } else if self.dialogs.noting() {
+            self.dialogs.clear_prompt(now);
+            self.scheduler.want(Reason::Overlay);
         }
     }
 
@@ -1540,6 +1544,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.lift_quiet_pen(now);
         self.scheduler.want(Reason::Overlay);
         CloseAnswer::Asked
+    }
+
+    /// Says at `now` what opening found.
+    pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
+        self.dialogs.note(note, now);
+        self.scheduler.want(Reason::Overlay);
     }
 
     /// What the window must do next, if anything.
@@ -1601,12 +1611,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.request = None;
                 self.dialogs.clear_prompt(now);
             }
-            Action::Dismiss => self.dialogs.clear_prompt(now),
-            Action::DontSave
-            | Action::TryAgain
-            | Action::UseLastSave
-            | Action::OpenCopy
-            | Action::Ignore => {}
+            Action::Dismiss | Action::Ignore => self.dialogs.clear_prompt(now),
+            Action::DontSave | Action::TryAgain | Action::UseLastSave | Action::OpenCopy => {}
         }
         self.scheduler.want(Reason::Overlay);
     }

@@ -218,6 +218,8 @@ pub struct Theme {
     pub swap_lockout: Duration,
     /// How long "Saved" stays before it fades.
     pub saved_hold: Duration,
+    /// How long a note that asks nothing stays before it fades.
+    pub note_hold: Duration,
     /// The least time between steps of a progress line, so its list isn't rebuilt every frame.
     pub progress_step: Duration,
     /// Glass alpha where the pass can only blend in linear light, which lightens glass.
@@ -269,6 +271,7 @@ impl Theme {
         chip_pen_down: 0.25,
         swap_lockout: Duration::from_millis(120),
         saved_hold: Duration::from_secs(2),
+        note_hold: Duration::from_secs(10),
         progress_step: Duration::from_millis(100),
         glass_alpha_linear: 0.9,
         window_min: (640, 400),
