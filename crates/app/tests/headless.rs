@@ -7,10 +7,13 @@
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, Output, Stdio};
+    use std::time::{Duration, Instant};
 
     use geom::cube_sphere;
-    use store::{Project, ProjectConfig, StoreConfig};
+    use store::{
+        CandidateStatus, Project, ProjectConfig, RecoveryCandidate, StoreConfig, find_recoveries,
+    };
 
     /// A fresh, empty directory for one test, removed on drop.
     struct Scratch(PathBuf);
@@ -307,6 +310,134 @@ mod tests {
         check_record(&timed, true);
         let untimed = scripted_record("script-untimed", false);
         check_record(&untimed, false);
+    }
+
+    /// How long a killed run is given to get as far as it must.
+    const KILL_WAIT: Duration = Duration::from_secs(120);
+
+    /// A child that can't outlive its test: killed on drop, whatever the test did.
+    struct Killing(Child);
+
+    impl Drop for Killing {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    /// The arguments every run of the kill test takes, after what ends the run.
+    const SMALL_RUN: [&str; 6] = ["--adapter", "software", "--level", "4", "--size", "320x200"];
+
+    /// Starts the strokes path on `project` in the background, its state in `state`, its record
+    /// streaming to `record`.
+    fn start_strokes(project: &Path, state: &Path, record: &Path) -> Killing {
+        let child = Command::new(env!("CARGO_BIN_EXE_brushcraft"))
+            .arg(project)
+            .args(["--offscreen", "--script", "--script-path", "strokes"])
+            .args(["--no-gpu-timing", "--record"])
+            .arg(record)
+            .args(SMALL_RUN)
+            .env("XDG_STATE_HOME", state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Killing(child)
+    }
+
+    /// Waits for `run`'s record to reach the segment `segment`, at most [`KILL_WAIT`].
+    ///
+    /// The record, not [`find_recoveries`], says how far a run has got: a running instance holds
+    /// its recovery file, and a listing passes over what's held.
+    fn wait_for_segment(run: &mut Killing, record: &Path, segment: &str) {
+        let marker = format!("\"segment\":\"{segment}\"");
+        let start = Instant::now();
+        loop {
+            let text = std::fs::read_to_string(record).unwrap_or_default();
+            // The record's first lines name every segment; a frame's says where the run is.
+            let mut frames = text
+                .lines()
+                .filter(|line| line.contains("\"result\":\"frame\""));
+            if frames.any(|line| line.contains(&marker)) {
+                return;
+            }
+            let ended = run.0.try_wait().unwrap();
+            assert_eq!(ended, None, "the run ended before {segment}");
+            assert!(start.elapsed() < KILL_WAIT, "no {segment} in time");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The one recovery file in `recovery`.
+    fn the_recovery_file(recovery: &Path) -> RecoveryCandidate {
+        let mut found = find_recoveries(recovery).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found.pop().unwrap()
+    }
+
+    /// Checks `output` is of a run that went well.
+    fn assert_succeeded(output: &Output) -> String {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "exit {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        stdout
+    }
+
+    #[test]
+    fn work_survives_a_kill_and_comes_back() {
+        let scratch = Scratch::new("kill");
+        let project = scratch.0.join("small.bcrf");
+        let state = scratch.0.join("state");
+        let record = scratch.0.join("record.jsonl");
+        let recovery = state.join("brushcraft").join("recovery");
+        save_project(&project, &scratch.0.join("setup"));
+
+        let mut run = start_strokes(&project, &state, &record);
+        // The first stroke is over by the second's start, and a stroke's end is durable.
+        wait_for_segment(&mut run, &record, "stroke_far");
+        run.0.kill().unwrap();
+        run.0.wait().unwrap();
+
+        let left = the_recovery_file(&recovery);
+        assert_eq!(left.status, CandidateStatus::Restorable, "{left:?}");
+        assert!(left.last_edit.is_some(), "the stroke landed: {left:?}");
+
+        // A measured run mustn't pick it up.
+        let frames: [&str; 3] = ["--offscreen", "--frames", "10"];
+        let measured = brushcraft(&project, &state, &[&frames[..], &SMALL_RUN[..]].concat());
+        let said = assert_succeeded(&measured);
+        assert!(!said.contains("restored:"), "{said}");
+        assert_eq!(the_recovery_file(&recovery), left, "as it was");
+
+        let asked: [&str; 4] = ["--offscreen", "--frames", "10", "--restore"];
+        let restoring = brushcraft(&project, &state, &[&asked[..], &SMALL_RUN[..]].concat());
+        let told = assert_succeeded(&restoring);
+        let path = left.path.display();
+        assert!(told.contains(&format!("restored: {path}\n")), "{told}");
+        let after = the_recovery_file(&recovery);
+        assert_eq!(after.path, left.path, "it went on as the project's");
+        assert!(after.last_edit >= left.last_edit, "{after:?}");
+
+        let back = Project::restore(&after, config(&recovery)).unwrap();
+        assert!(back.has_unsaved_edits(), "the stroke is back");
+        assert_eq!(back.path(), Some(project.as_path()), "and saves as ever");
+        back.close(true).unwrap();
+    }
+
+    #[test]
+    fn a_project_with_no_recovery_file_restores_nothing() {
+        let scratch = Scratch::new("no-recovery");
+        let project = scratch.0.join("small.bcrf");
+        let state = scratch.0.join("state");
+        save_project(&project, &scratch.0.join("setup"));
+        let asked: [&str; 4] = ["--offscreen", "--frames", "3", "--restore"];
+        let output = brushcraft(&project, &state, &[&asked[..], &SMALL_RUN[..]].concat());
+        let said = assert_succeeded(&output);
+        assert!(!said.contains("restored:"), "{said}");
     }
 
     #[test]
