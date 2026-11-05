@@ -3667,3 +3667,34 @@ fn the_save_key_doesnt_answer_a_bar_it_cant_see() {
     assert!(owner.save_stage().is_some(), "a save");
     assert!(owner.dialogs.asking_close(), "and the question stands");
 }
+
+/// The second click lands where Cancel just came: it must stop on the bar, and undo nothing.
+#[test]
+fn a_double_click_on_save_stays_a_save() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 50);
+    let at = owner.dialogs.control(Action::Save);
+    owner.input(Input::Press { button: LEFT, at });
+    owner.input(Input::Release { button: LEFT });
+    owner.input(Input::Press { button: LEFT, at });
+    assert!(owner.input.is_empty(), "the bar took it");
+    owner.input(Input::Release { button: LEFT });
+    assert!(
+        owner.dialogs.finishing(),
+        "the second click undid the first"
+    );
+    assert_eq!(owner.after_save, AfterSave::Exit);
+}
+
+/// A pen's double tap the same: its second Down isn't a stroke, or it would answer the bar.
+#[test]
+fn a_double_tap_on_save_stays_a_save() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 50);
+    let save = owner.dialogs.control(Action::Save);
+    tap(&mut owner, save);
+    tap(&mut owner, save);
+    run(&mut owner, 2);
+    assert!(owner.dialogs.finishing(), "the second tap undid the first");
+    assert_eq!(owner.brush.strokes, 0, "and no stroke began");
+}

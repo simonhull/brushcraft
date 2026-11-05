@@ -213,6 +213,9 @@ pub struct Theme {
     pub fade: Duration,
     /// A chip's opacity while the pen is down.
     pub chip_pen_down: f32,
+    /// How long a bar's new controls can't be hit, so a double click's second press can't land on
+    /// what its first brought up.
+    pub swap_lockout: Duration,
     /// How long "Saved" stays before it fades.
     pub saved_hold: Duration,
     /// The least time between steps of a progress line, so its list isn't rebuilt every frame.
@@ -264,6 +267,7 @@ impl Theme {
         status_weight: Weight::Regular,
         fade: Duration::from_millis(120),
         chip_pen_down: 0.25,
+        swap_lockout: Duration::from_millis(120),
         saved_hold: Duration::from_secs(2),
         progress_step: Duration::from_millis(100),
         glass_alpha_linear: 0.9,

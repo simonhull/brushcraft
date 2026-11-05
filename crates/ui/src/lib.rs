@@ -53,6 +53,8 @@ pub struct Ui<A> {
     pointer: Option<(f32, f32)>,
     /// The index of the control showing hover.
     hovered: Option<usize>,
+    /// When the bar's controls can be hit: a while after they change, the theme's `swap_lockout`.
+    hits_from: Instant,
     /// The bars' opacity.
     bar_fade: Fade,
     /// The chip's opacity.
@@ -77,6 +79,7 @@ impl<A: Copy + PartialEq> Ui<A> {
             pen_is_down: false,
             pointer: None,
             hovered: None,
+            hits_from: now,
             bar_fade: Fade::at_rest(0.0, now),
             chip_fade: Fade::at_rest(0.0, now),
             list: Arc::default(),
@@ -117,6 +120,10 @@ impl<A: Copy + PartialEq> Ui<A> {
             return;
         }
         if let Some(widget) = bar {
+            let swapped = self.bar.as_ref();
+            if swapped.is_some_and(|shown| shown.widget.controls() != widget.controls()) {
+                self.hits_from = now + self.theme.swap_lockout;
+            }
             let layout = BarLayout::new(&widget, self.view, &self.theme, &mut self.text);
             self.bar = Some(Shown {
                 widget,
@@ -164,11 +171,12 @@ impl<A: Copy + PartialEq> Ui<A> {
         self.refresh_hover();
     }
 
-    /// The action under the point at `now`; `None` with no bar, the pen down, or a bar still too
-    /// faint to have been seen, so a quick tap can't land on what isn't there yet.
+    /// The action under the point at `now`; `None` with no bar, the pen down, a bar still too faint
+    /// to have been seen, so a quick tap can't land on what isn't there yet, or controls just
+    /// swapped for others, so a double click can't land on what its first click brought up.
     #[must_use]
     pub fn hit(&self, x: f32, y: f32, now: Instant) -> Option<A> {
-        let shown = self.visible_bar(now)?;
+        let shown = self.visible_bar(now).filter(|_| now >= self.hits_from)?;
         let at = shown.layout.control_at(x, y)?;
         shown
             .widget
@@ -177,7 +185,8 @@ impl<A: Copy + PartialEq> Ui<A> {
             .map(|control| control.action)
     }
 
-    /// Whether the point is on the bar's glass at all at `now`, by the same test as [`Ui::hit`].
+    /// Whether the point is on the bar's glass at all at `now`, by the same test as [`Ui::hit`],
+    /// but for controls just swapped: a press there still belongs to the bar.
     #[must_use]
     pub fn on_bar(&self, x: f32, y: f32, now: Instant) -> bool {
         self.visible_bar(now)
@@ -545,6 +554,38 @@ mod tests {
         ui.set_bar(None, seen);
         assert_eq!(ui.hit(x, y, seen), None, "gone as far as the pen goes");
         assert!(!ui.on_bar(x, y, seen), "and its glass");
+    }
+
+    /// A double click's second press mustn't land on what the first brought up.
+    #[test]
+    fn controls_swapped_under_the_pointer_cant_be_hit_at_once_but_stop_a_press() {
+        let now = Instant::now();
+        let lockout = Theme::GLASS.swap_lockout;
+        let mut ui = new_ui(now);
+        ui.set_bar(Some(close_bar()), now);
+        let seen = after_a_fade(now);
+        let other = Bar::new("Finishing", vec![quiet("Cancel out of all of this now", 7)]);
+        ui.set_bar(Some(other), seen);
+        let (x, y) = centre(control_rects(&ui)[0]);
+        assert_eq!(ui.hit(x, y, seen), None, "the same instant");
+        assert!(ui.on_bar(x, y, seen), "it is still the bar's");
+        let almost = seen + lockout.mul_f32(0.9);
+        assert_eq!(ui.hit(x, y, almost), None, "not quite yet");
+        assert_eq!(ui.hit(x, y, seen + lockout), Some(7), "and then it can");
+    }
+
+    #[test]
+    fn a_progress_step_keeps_the_controls_hittable() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        let with_progress = |progress| {
+            Bar::new("Finishing your stroke", vec![quiet("Cancel", 1)]).with_progress(progress)
+        };
+        ui.set_bar(Some(with_progress(0.25)), now);
+        let seen = after_a_fade(now);
+        ui.set_bar(Some(with_progress(0.5)), seen);
+        let (x, y) = centre(control_rects(&ui)[0]);
+        assert_eq!(ui.hit(x, y, seen), Some(1), "the same control");
     }
 
     #[test]
