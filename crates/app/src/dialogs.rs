@@ -351,8 +351,11 @@ pub(crate) struct Dialogs {
     prompt: Prompt,
     /// The bar isn't saying what `prompt` does, for the pen is down.
     prompt_waiting: bool,
-    /// A note the failure bar took the place of: it asks again when the failure is answered.
+    /// What the failure bar took the place of, a note, or a bar a close came over before anyone
+    /// could see it: it says its piece when what is in front is answered.
     behind: Option<Prompt>,
+    /// When a bar put the latest failure in front of the user, if one has.
+    failure_shown: Option<Instant>,
     /// What the pen does to what shows.
     pen_effect: PenEffect,
     /// Input on its way to the bar.
@@ -402,6 +405,7 @@ impl Dialogs {
             prompt: Prompt::None,
             prompt_waiting: false,
             behind: None,
+            failure_shown: None,
             pen_effect: PenEffect::Fades,
             routing: Routing::default(),
             #[cfg(test)]
@@ -481,14 +485,25 @@ impl Dialogs {
         self.prompt_waiting = self.pen_is_down;
         if !self.prompt_waiting {
             self.ui.set_bar(self.prompt.bar(), now);
+            if matches!(self.prompt, Prompt::Failed(_)) {
+                self.failure_shown.get_or_insert(now);
+            }
         }
     }
 
-    /// Asks whether to save `name`, the project, before the window closes.
+    /// Asks whether to save `name`, the project, before the window closes. What hasn't been seen,
+    /// the pen holding it back or its fade just begun, waits behind the question.
     pub(crate) fn ask_close(&mut self, name: &str, now: Instant) {
-        self.prompt = Prompt::AskClose {
-            name: name.to_owned(),
-        };
+        let was = std::mem::replace(
+            &mut self.prompt,
+            Prompt::AskClose {
+                name: name.to_owned(),
+            },
+        );
+        let unseen = self.prompt_waiting || !self.failure_shown(now);
+        if unseen && matches!(was, Prompt::Failed(_) | Prompt::Stopped(_)) {
+            self.behind = Some(was);
+        }
         self.show_prompt(now);
     }
 
@@ -576,7 +591,33 @@ impl Dialogs {
     /// Says a save failed, in place of whatever the bar said; a note comes back once that is
     /// answered, as what it offers still stands.
     pub(crate) fn failed(&mut self, failure: SaveFailure, now: Instant) {
+        self.saved_at = None;
+        self.failure_shown = None;
         self.say_over_a_note(Prompt::Failed(failure), now);
+    }
+
+    /// Whether the failure last said has been in front of the user by `now`, its fade over.
+    pub(crate) fn failure_shown(&self, now: Instant) -> bool {
+        let seen = |at: Instant| now.saturating_duration_since(at) >= Theme::GLASS.fade;
+        self.failure_shown.is_some_and(seen)
+    }
+
+    /// The recovery file has stopped guarding the work: a failure saying it's safe says otherwise
+    /// from now on. Whether that changed what draws.
+    pub(crate) fn failure_exposed(&mut self, now: Instant) -> bool {
+        if let Some(Prompt::Failed(failure)) = &mut self.behind {
+            *failure = failure.exposed();
+        }
+        let Prompt::Failed(failure) = self.prompt else {
+            return false;
+        };
+        let exposed = failure.exposed();
+        if exposed == failure {
+            return false;
+        }
+        self.prompt = Prompt::Failed(exposed);
+        self.show_prompt(now);
+        true
     }
 
     /// Puts `prompt` on the bar, a note it replaces coming back after it.

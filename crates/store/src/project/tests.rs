@@ -301,62 +301,62 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     assert_eq!(names, Vec::<String>::new(), "no temporary file left");
 }
 
-/// A project saved at `dir`, a file beside it standing for a recovery file it stands in front of,
-/// and an edit no save holds.
-fn superseding(dir: &TestDir) -> (Project, PathBuf) {
+/// A project saved at `dir`, a file beside it standing for its recovery file's twin, and an edit no
+/// save holds.
+fn twinned(dir: &TestDir) -> (Project, PathBuf) {
     let mut project = Project::new((*mesh()).clone(), config(dir)).unwrap();
     let mut map = CorrectionMap::new();
     stroke(&mut project, &mut map, 100, 41);
     assert_saved(project.save_as(&dir.path("p.bcrf")));
     stroke(&mut project, &mut map, 100, 42);
-    let older = dir.path("recovery").join("older.bcrf");
-    fs::write(&older, b"older work").unwrap();
-    project.supersede(vec![older.clone()]);
-    (project, older)
+    let twin = dir.path("recovery").join("twin.bcrf");
+    fs::write(&twin, b"the same work").unwrap();
+    project.set_twins(vec![twin.clone()]);
+    (project, twin)
 }
 
 #[test]
-fn discarding_removes_the_files_superseded() {
+fn discarding_removes_the_twins() {
     let dir = TestDir::new();
-    let (project, older) = superseding(&dir);
+    let (project, twin) = twinned(&dir);
     project.discard().unwrap();
-    assert!(!older.exists());
+    assert!(!twin.exists());
 }
 
 #[test]
-fn a_save_removes_the_files_superseded() {
+fn a_save_removes_the_twins() {
     let dir = TestDir::new();
-    let (mut project, older) = superseding(&dir);
+    let (mut project, twin) = twinned(&dir);
     assert_saved(project.save());
-    assert!(!older.exists());
+    assert!(!twin.exists());
     project.close(false).unwrap();
 }
 
 #[test]
-fn closing_leaves_the_files_superseded() {
+fn closing_leaves_the_twins() {
     let dir = TestDir::new();
-    let (project, older) = superseding(&dir);
+    let (project, twin) = twinned(&dir);
     project.close(true).unwrap();
-    assert!(older.exists(), "kept");
+    assert!(twin.exists(), "kept");
 }
 
 #[test]
-fn closing_without_the_edits_leaves_the_files_superseded_too() {
+fn closing_without_the_edits_leaves_the_twins_too() {
     let dir = TestDir::new();
-    let (project, older) = superseding(&dir);
+    let (project, twin) = twinned(&dir);
     project.close(false).unwrap();
-    assert!(older.exists());
+    assert!(twin.exists());
 }
 
-/// The new file isn't on the save point the older one is: saving it says nothing of that work.
+/// The new file isn't on the save point the twin is: saving it says nothing of that work.
 #[test]
-fn a_save_as_leaves_the_files_superseded_for_good() {
+fn a_save_as_leaves_the_twins_for_good() {
     let dir = TestDir::new();
-    let (mut project, older) = superseding(&dir);
+    let (mut project, twin) = twinned(&dir);
     assert_saved(project.save_as(&dir.path("elsewhere.bcrf")));
-    assert!(older.exists(), "another project now");
+    assert!(twin.exists(), "another project now");
     assert_saved(project.save());
-    assert!(older.exists(), "and its saves cover nothing of it");
+    assert!(twin.exists(), "and its saves cover nothing of it");
     project.close(false).unwrap();
 }
 
@@ -1547,7 +1547,7 @@ fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
     while project.recovery_path().unwrap() == old {
         match project.poll() {
             Ok(()) => {}
-            Err(ProjectError::Unprotected(tiles)) => reported.extend(tiles),
+            Err(ProjectError::Lost(tiles)) => reported.extend(tiles),
             Err(e) => panic!("{e:?}"),
         }
         assert!(
@@ -1673,7 +1673,7 @@ fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
     );
     let next = project.poll();
     assert!(
-        matches!(&next, Err(ProjectError::Unprotected(tiles)) if *tiles == [lost]),
+        matches!(&next, Err(ProjectError::Lost(tiles)) if *tiles == [lost]),
         "the lost tile, reported next: {next:?}"
     );
     fs::remove_dir(&old).unwrap();
@@ -1756,4 +1756,48 @@ fn a_placed_file_never_replaces_another() {
     place_new(&tmp, &path).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"new", "placed");
     assert!(!tmp.exists(), "under its new name only");
+}
+
+/// A copy that failed to encode once, its slot valid, in the flush a save finishes. The save
+/// writes the tile itself, so the file holds it, yet the outcome calls it "in no file".
+#[test]
+fn a_transient_encode_failure_is_not_a_lost_tile() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 141);
+    assert_saved(project.save_as(&path));
+    project.writer.as_ref().unwrap().fail_encodes(1);
+    stroke(&mut project, &mut map, 60, 142);
+    let outcome = project.save().unwrap();
+    let said = outcome.unprotected.len();
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit is in the file");
+    assert_eq!(said, 0, "the outcome calls edits the file holds lost");
+}
+
+/// Late, not lost: reported as such between saves, and the edit is still there to save.
+#[test]
+fn a_tile_left_out_of_a_flush_is_reported_as_late() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 141);
+    assert_saved(project.save_as(&path));
+    project.writer.as_ref().unwrap().fail_encodes(1);
+    stroke(&mut project, &mut map, 60, 142);
+    let finished = project.finish_flushes();
+    finished.unwrap();
+    let report = project.poll();
+    assert!(
+        matches!(report, Err(ProjectError::Unprotected(_))),
+        "{report:?}"
+    );
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit is in the file");
 }

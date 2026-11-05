@@ -2703,6 +2703,8 @@ struct Lands {
     drops: u64,
     /// Where it sends strokes, if not to itself: as off the surface.
     routes_to: Option<Route>,
+    /// What its strokes' ends said of the recovery file.
+    reports: Vec<ProjectError>,
 }
 
 impl Brush for Lands {
@@ -2767,6 +2769,10 @@ impl Brush for Lands {
 
     fn drops(&self) -> u64 {
         self.drops
+    }
+
+    fn take_recovery_reports(&mut self) -> Vec<ProjectError> {
+        std::mem::take(&mut self.reports)
     }
 
     fn dropped_since(&self, before: u64) -> Result<(), DabsDropped> {
@@ -3360,8 +3366,9 @@ fn dabs_dropped_under_the_bar_keep_the_window_and_the_title_says_so() {
     assert_eq!(owner.take_request(), None, "the window stays");
     assert_eq!(
         bar_says(&owner),
-        "Couldn't save: a stroke didn't finish / Your other work is safe and still open."
+        "A stroke didn't finish / The rest of your work was saved."
     );
+    assert_eq!(owner.dialogs.bar().expect("a bar").controls().len(), 1);
     let title = owner.title_change().expect("it says so");
     assert!(title.contains("no room for the dabs"), "{title}");
 
@@ -3872,7 +3879,9 @@ fn flush_failed() -> ProjectError {
 ///
 /// As [`Owner::heard`].
 fn hears<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, error: ProjectError) -> Result<()> {
-    owner.heard(Err(error), "ticking the project", Instant::now())
+    let heard = owner.heard(Err(error), "ticking the project");
+    owner.tell_of_stopping(Instant::now());
+    heard
 }
 
 #[test]
@@ -4015,13 +4024,150 @@ fn the_stopped_bar_waits_for_the_close_bar() {
     assert!(owner.dialogs.says_stopped());
 }
 
-/// What a save reports of tiles it went through without.
-fn lost_a_tile() -> SaveOutcome {
+/// A tile for the store to call gone.
+fn a_tile() -> TileKey {
     let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST).expect("a level"), 0, 0);
+    key.expect("a tile")
+}
+
+/// Upkeep hears of a tile gone, the bar free: it says so, in words of its own.
+#[test]
+fn edits_gone_between_saves_say_so_once_and_a_save_after_that_is_a_save() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, ProjectError::Lost(vec![a_tile()])).expect("the run goes on");
+    assert_eq!(
+        bar_says(&owner),
+        "Part of a stroke is gone / Your other work is safe and still open."
+    );
+    assert_eq!(owner.dialogs.bar().expect("a bar").controls().len(), 1);
+    owner.dialogs.clear_prompt(Instant::now());
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(clean_save()));
+    assert!(owner.dialogs.says_saved(), "told, and the rest is saved");
+}
+
+/// Under the pen no bar can say it, so the save that comes next does: it can't end in Saved.
+#[test]
+fn edits_gone_with_no_bar_free_are_said_by_the_next_save() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    hears(&mut owner, ProjectError::Lost(vec![a_tile()])).expect("the run goes on");
+    assert!(!owner.dialogs.failing(), "nothing under the pen");
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(clean_save()));
+    assert!(!owner.dialogs.says_saved(), "no Saved");
+    assert_eq!(owner.saving_succeeded(), Some(false));
+    assert!(owner.dialogs.failing());
+    assert_eq!(
+        owner.dialogs.bar().expect("a bar").title(),
+        "Couldn't save: part of a stroke is gone"
+    );
+}
+
+/// A stroke's end is a route of its own, and the save it landed for hears it first.
+#[test]
+fn a_tile_gone_at_a_strokes_end_reaches_the_save() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.brush.reports.push(ProjectError::Lost(vec![a_tile()]));
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(clean_save()));
+    assert_eq!(owner.saving_succeeded(), Some(false));
+    assert!(!owner.dialogs.says_saved());
+}
+
+/// And with no save coming, upkeep hears it.
+#[test]
+fn a_recovery_report_of_a_strokes_end_reaches_the_owner() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner
+        .brush
+        .reports
+        .push(ProjectError::Unprotected(Vec::new()));
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(owner.exposed.is_some());
+    assert!(owner.dialogs.says_stopped());
+}
+
+/// Nobody told before the run ends, its close says what went.
+#[test]
+fn a_close_with_tiles_gone_untold_fails_the_run() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    hears(&mut owner, ProjectError::Lost(vec![a_tile()])).expect("the run goes on");
+    let said = owner.close().expect_err("the run failed").to_string();
+    assert!(said.contains("in no file"), "{said}");
+}
+
+/// A plain Ctrl+S that worked with dabs dropped earlier and untold mustn't say only Saved.
+#[test]
+fn a_ctrl_s_with_an_earlier_drop_untold_says_so_not_saved() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.brush.drops = 1;
+    owner.request_save(Instant::now());
+    finish_saving(&mut owner);
+    assert_eq!(
+        bar_says(&owner),
+        "A stroke didn't finish / The rest of your work was saved."
+    );
+    assert!(!owner.dialogs.says_saved());
+    assert!(!owner.unsaved());
+}
+
+/// Once said, a later save is a save.
+#[test]
+fn a_drop_said_by_a_save_isnt_said_again() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.brush.drops = 1;
+    owner.request_save(Instant::now());
+    finish_saving(&mut owner);
+    owner.dialogs.clear_prompt(Instant::now());
+    owner.saving.start(Instant::now(), 1);
+    owner.end_save(Ok(clean_save()));
+    assert!(owner.dialogs.says_saved());
+}
+
+/// A failure the close bar came over before anyone saw it comes after the question.
+#[test]
+fn a_failure_behind_the_close_bar_shows_after_keep_sculpting() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.end_save(Err(disk_full()));
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.act(Action::KeepSculpting, Instant::now());
+    assert!(owner.dialogs.failure_seen(), "it has its turn");
+    assert!(!owner.dialogs.failure_shown(Instant::now()), "just now");
+    see_the_bar(&mut owner);
+    assert!(owner.dialogs.failure_shown(Instant::now()));
+}
+
+/// What a clean save reports.
+fn clean_save() -> SaveOutcome {
     SaveOutcome {
         protection: Protection::Active,
-        unprotected: vec![key.expect("a tile")],
+        unprotected: Vec::new(),
         kept: Vec::new(),
+    }
+}
+
+/// What a save reports of tiles it went through without.
+fn lost_a_tile() -> SaveOutcome {
+    SaveOutcome {
+        unprotected: vec![a_tile()],
+        ..clean_save()
     }
 }
 
@@ -5211,6 +5357,88 @@ fn a_frame_loop_taking_over_goes_on_where_the_last_left_off() {
     assert_eq!(new.record_lines().len(), lines + 1, "the record goes on");
     assert_eq!(*new.camera(), camera, "and that frame didn't move the view");
     new.close().expect("closed");
+}
+
+/// Save on the close bar went through, dabs dropped before it unsaid. The bar says it
+/// couldn't save, and the chip says Saved beside it.
+#[test]
+fn no_saved_chip_beside_a_failure_bar() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    owner.brush.drops = 1;
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    finish_saving(&mut owner);
+    assert!(owner.dialogs.failing(), "{}", bar_says(&owner));
+    assert!(!owner.project().has_unsaved_edits(), "it did save");
+    assert!(!owner.dialogs.says_saved(), "Saved, under Couldn't save");
+}
+
+/// a failure under the pen, a close over it: the close bar takes its place, and Keep
+/// sculpting leaves nothing that ever showed it. It mustn't count as told.
+#[test]
+fn a_failure_the_close_bar_replaced_unseen_is_not_told() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.end_save(Err(disk_full()));
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    see_the_bar(&mut owner);
+    owner.act(Action::KeepSculpting, Instant::now());
+    assert_eq!(
+        owner.ask_close(Instant::now()),
+        CloseAnswer::Asked,
+        "left on a failure no bar ever said"
+    );
+}
+
+/// the failure bar is up saying safe, and protection pauses. The close knows; the words on
+/// screen don't change, and word of the stop waits behind them.
+#[cfg(unix)]
+#[test]
+fn the_failure_bar_stops_saying_safe_once_protection_pauses() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    assert!(bar_says(&owner).contains("safe"));
+    pause_protection(&mut owner);
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(!owner.project().protection().is_active(), "paused");
+    let said = bar_says(&owner);
+    assert!(!said.contains("safe"), "{said}");
+}
+
+/// a save with the close leaving: the run's failure is out of date once a save works.
+#[test]
+fn a_save_after_leaving_on_a_failure_ends_the_failure() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    owner.request_close().expect("closing");
+    owner.request_save(Instant::now());
+    finish_saving(&mut owner);
+    assert_eq!(owner.saving.last_succeeded(), Some(true));
+    owner.close().expect("the save worked");
+}
+
+/// a scripted run in which protection paused for a time ends with exit success.
+#[test]
+fn a_scripted_run_that_lost_protection_is_no_success() {
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        NoBrush,
+        NoUploads,
+        setup(Some(1)),
+        Instant::now(),
+    );
+    hears(&mut owner, ProjectError::Unprotected(Vec::new())).expect("the run goes on");
+    assert!(owner.exposed.is_some());
+    owner
+        .close()
+        .expect_err("a run whose recovery fell short must not read as clean");
 }
 
 #[test]

@@ -1416,3 +1416,55 @@ fn a_new_projects_brush_takes_on_what_the_keys_set() {
         "the next key goes on from there"
     );
 }
+
+/// Crash protection never stops a save, but a stroke ending in the save's landing, with a
+/// retry of paused protection due, fails it all the same: the project file was fine.
+#[cfg(unix)]
+#[test]
+fn paused_protection_at_a_stroke_end_fails_no_save() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    drop(project.save_as(&dir.path().join("p.bcrf")).expect("saved"));
+    let mut owner = owner_of(
+        project,
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    let recovery = dir.path().join("recovery");
+    let set = |mode| {
+        let mode = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&recovery, mode).expect("set");
+    };
+    set(0o500);
+    let outcome = owner.project().save().expect("a save goes through");
+    assert!(!outcome.protection.is_active(), "paused");
+    queue(&mut owner, to_and_fro(2));
+    queue(
+        &mut owner,
+        taken_up_to_now(vec![sample(Phase::Up, ACROSS.0, 0.8)]),
+    );
+    run(&mut owner, 1);
+    assert!(owner.brush().last().dabs_catching_up > 2, "dabs to land");
+    owner.request_save(Instant::now());
+    let mut waits = 0;
+    while owner.save_stage() == Some(crate::saving::Stage::PenDown) {
+        owner.save_step();
+        run(&mut owner, 1);
+        waits += 1;
+        assert!(waits < 1_000, "the pen lifts");
+    }
+    assert!(owner.landing() > 0, "the stroke ends in the landing");
+    std::thread::sleep(Duration::from_millis(1200));
+    let mut steps = 0;
+    while owner.save_stage().is_some() {
+        owner.save_step();
+        steps += 1;
+        assert!(steps < 100_000, "the save ends");
+    }
+    let said = owner.save_line();
+    set(0o700);
+    assert_eq!(owner.saving_succeeded(), Some(true), "{said}");
+}

@@ -45,12 +45,15 @@
 //! **A save that went through without some tiles' latest edits** ([`SaveOutcome::unprotected`]) is
 //! a failed save too: it shows no "Saved", the window stays, and the bar says the edits are gone,
 //! as they are ([`TilesLost`]). It offers no Try again: nothing is left to save, and nothing brings
-//! them back. Old recovery files it couldn't delete fail nothing.
+//! them back. So does one that dabs dropped before it left a stroke short, in its own words. Old
+//! recovery files it couldn't delete fail nothing.
 //!
 //! **A recovery file that can't keep up** stops no one sculpting
 //! ([`crate::frame::Owner::upkeep`]): the log says why, and a bar tells the user once, offering a
 //! save. Word of a pause goes by itself if protection comes back; a flush that failed or left tiles
-//! out can't say when it is over, so that lasts until a save.
+//! out can't say when it is over, so that lasts until a save. Tiles the store says are gone, by
+//! whichever route, are kept until a bar has said so, or the next save does. A scripted run has
+//! nobody to tell: its close fails instead.
 //!
 //! # Closing meanwhile
 //!
@@ -160,12 +163,11 @@ enum Doing {
 #[error("{0}")]
 pub(crate) struct DabsDropped(pub(crate) String);
 
-/// A save went through without the latest edits of this many tiles
-/// ([`SaveOutcome::unprotected`]): for the user, a failed save.
+/// A save went through without the latest edits of this many tiles, as its outcome said or the
+/// store had: for the user, a failed save.
 ///
-/// Those edits are gone. A tile lands here because its slot held no valid tile, so the store drops
-/// the slot and reads the tile's last record from then on: memory no longer holds them, and with
-/// the rest saved there is nothing for another save to do.
+/// Those edits are gone ([`SaveOutcome::unprotected`]): memory no longer holds them, and with the
+/// rest saved there is nothing for another save to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("the latest edits of {0} tiles are in no file")]
 pub(crate) struct TilesLost(pub(crate) usize);
@@ -260,6 +262,15 @@ pub(crate) enum Work {
     SavedLessEdits,
 }
 
+/// Whether the recovery file is guarding the edits, as the frame loop knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protected {
+    /// It is.
+    Yes,
+    /// It isn't.
+    No,
+}
+
 /// Whether a crash would spare what a failed save left unsaved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cover {
@@ -328,10 +339,33 @@ impl SaveFailure {
         }
     }
 
+    /// A save that went through with dabs dropped before it: all but that stroke is saved.
+    pub(crate) const fn stroke_lost_but_saved() -> Self {
+        Self {
+            trouble: SaveTrouble::StrokeLost,
+            work: Work::SavedLessEdits,
+            cover: Cover::Protected,
+        }
+    }
+
+    /// Edits gone between saves, with `protection` running or not: no save has failed, and the
+    /// rest is as it was.
+    pub(crate) const fn edits_gone(protection: Protected) -> Self {
+        Self {
+            trouble: SaveTrouble::EditsLost,
+            work: Work::LessAStroke,
+            cover: match protection {
+                Protected::Yes => Cover::Protected,
+                Protected::No => Cover::Exposed,
+            },
+        }
+    }
+
     /// Whether another try can come to anything. With edits gone and the rest saved there is
     /// nothing left for a save to do: it would find no edits, and say nothing.
     pub(crate) const fn can_be_tried_again(self) -> bool {
         !matches!(self.work, Work::SavedLessEdits)
+            && !matches!(self.trouble, SaveTrouble::EditsLost)
     }
 
     /// Whether the recovery file holds what this left unsaved, as far as the failure says.
@@ -346,6 +380,12 @@ impl SaveFailure {
 
     /// What the bar's title says.
     pub(crate) fn title(self) -> String {
+        if matches!(self.work, Work::SavedLessEdits) && self.trouble == SaveTrouble::StrokeLost {
+            return "A stroke didn't finish".to_owned();
+        }
+        if matches!(self.work, Work::LessAStroke) && self.trouble == SaveTrouble::EditsLost {
+            return "Part of a stroke is gone".to_owned();
+        }
         format!("Couldn't save: {}", self.trouble.said())
     }
 
@@ -463,6 +503,7 @@ impl Saving {
         self.drops_at = drops;
         self.failed_closing = None;
         self.told = None;
+        self.left_on = None;
         self.tiles_left = None;
         self.outcome = None;
     }
@@ -520,6 +561,11 @@ impl Saving {
     /// The failed save the user may leave on, if none has overtaken it.
     pub(crate) const fn told(&self) -> Option<SaveFailure> {
         self.told
+    }
+
+    /// The failure the user was told of can't say "safe" any more.
+    pub(crate) fn told_exposed(&mut self) {
+        self.told = self.told.map(SaveFailure::exposed);
     }
 
     /// A new stroke overtook what the user was told: there is new work, and a save may work now.
@@ -840,6 +886,29 @@ mod tests {
             "Your work is still open, but a crash could lose it."
         );
         assert!(!exposed.covered());
+    }
+
+    /// Between saves nothing failed to save, and nothing can be tried.
+    #[test]
+    fn edits_gone_between_saves_say_so_in_their_own_words() {
+        let failure = SaveFailure::edits_gone(Protected::Yes);
+        assert_eq!(failure.title(), "Part of a stroke is gone");
+        assert_eq!(failure.detail(), "Your other work is safe and still open.");
+        assert!(!failure.can_be_tried_again());
+        let exposed = SaveFailure::edits_gone(Protected::No);
+        assert_eq!(
+            exposed.detail(),
+            "Your other work is still open, but a crash could lose it."
+        );
+    }
+
+    /// The save worked: "Couldn't save" would be false, and there is nothing to try.
+    #[test]
+    fn a_stroke_lost_before_a_save_that_worked_says_so_in_its_own_words() {
+        let failure = SaveFailure::stroke_lost_but_saved();
+        assert_eq!(failure.title(), "A stroke didn't finish");
+        assert_eq!(failure.detail(), "The rest of your work was saved.");
+        assert!(!failure.can_be_tried_again());
     }
 
     /// Found work isn't open, whatever the open project's state: "still open" would be false.

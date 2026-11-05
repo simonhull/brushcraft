@@ -186,10 +186,15 @@ pub enum ProjectError {
     /// to open.
     #[error("the project file has no save point")]
     NeverSaved,
-    /// The latest edits of these tiles aren't in the recovery file: their slots were broken, or
-    /// moving to a new recovery file couldn't read them. The rest of the edits are protected.
-    /// The call that reports them otherwise did what it was asked. A save reports them in its
-    /// outcome instead ([`SaveOutcome::unprotected`]), never as an error.
+    /// The latest edits of these tiles are gone, from memory and from every file: their slots
+    /// were broken, or moving to a new recovery file couldn't read them. The rest of the edits
+    /// are protected. The call that reports them otherwise did what it was asked. A save reports
+    /// them in its outcome instead ([`SaveOutcome::unprotected`]), never as an error.
+    #[error("the latest edits of {} tiles are gone", .0.len())]
+    Lost(Vec<geom::TileKey>),
+    /// The latest edits of these tiles aren't in the recovery file yet: a flush left them out for
+    /// a failure that may pass. Memory holds them, the next flush tries again, and a save writes
+    /// them, so a save reports none of them.
     #[error("the edits of {} tiles are not in the recovery file", .0.len())]
     Unprotected(Vec<geom::TileKey>),
     /// [`Project::restore`] was given a recovery file that can't be layered on its project:
@@ -236,6 +241,18 @@ pub enum ProjectError {
     /// stroke ended then, and its record is kept once. Nothing was recorded again.
     #[error("the stroke of op {0:?} has its record already")]
     AlreadyRecorded(OpId),
+}
+
+/// Takes what `writer` left out: the tiles gone into `lost`, those only late into `left_out`.
+fn hear_skipped(
+    writer: &mut RecoveryWriter,
+    lost: &mut BTreeSet<geom::TileKey>,
+    left_out: &mut BTreeSet<geom::TileKey>,
+) {
+    let gone = writer.take_lost();
+    let late = writer.take_skipped().into_iter();
+    left_out.extend(late.filter(|tile| !gone.contains(tile)));
+    lost.extend(gone);
 }
 
 /// An old recovery file a save couldn't delete: it holds nothing the project needs any more
@@ -290,9 +307,10 @@ pub struct SaveOutcome {
     /// Whether crash protection runs after the save: [`Protection::Paused`] if no new recovery
     /// file could be made on the save point, and none was put back in place before it.
     pub protection: Protection,
-    /// Tiles whose latest edits are in no file, in key order: found unprotected before the save
-    /// (left out of a flush, or lost to a roll-over), or lost to it, its save point holding
-    /// their last saved state.
+    /// Tiles whose latest edits are gone, from memory and from every file, in key order: found
+    /// before the save (a broken slot a flush left out, or lost to a roll-over), or lost to it,
+    /// its save point holding their last saved state. A further save can't bring them back. A tile
+    /// merely left out of a flush isn't one: its slot is valid, and the save writes it.
     pub unprotected: Vec<geom::TileKey>,
     /// Old recovery files that couldn't be deleted. The project holds them until it closes, so
     /// no listing offers them meanwhile.
@@ -416,10 +434,13 @@ pub struct Project {
     recovery_path: Option<PathBuf>,
     /// The directory recovery files go in.
     recovery_dir: PathBuf,
-    /// Tiles whose latest edits were found unprotected (left out of a flush, or lost to a
+    /// Tiles whose latest edits were found gone (broken slots a flush left out, or lost to a
     /// roll-over or a save), waiting to be reported: by the next call that has no other error
     /// to return ([`Project::report`]). So a report never stops a call from doing its work.
     unreported: BTreeSet<geom::TileKey>,
+    /// Tiles a flush left out with their slots valid, waiting to be reported the same way, unless
+    /// a save writes them first.
+    left_out: BTreeSet<geom::TileKey>,
     /// Why crash protection is paused, if it is: the error of the last try to put a recovery
     /// file in place. `None` while protection runs.
     paused: Option<Arc<ProjectError>>,
@@ -434,8 +455,8 @@ pub struct Project {
     /// they are or the project closes, so no listing offers them while it runs (see
     /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
     held: Vec<(PathBuf, ProjectFile)>,
-    /// Recovery files older than the one restored ([`Project::supersede`]).
-    superseded: Vec<PathBuf>,
+    /// Other recovery files holding just what this project's holds ([`Project::set_twins`]).
+    twins: Vec<PathBuf>,
     /// The failed recovery file the store has moved off ([`Project::strand`]), still held (open
     /// and locked) while the store works on a scratch file instead. It stays the project's
     /// recovery file on disk ([`Project::recovery_path`]), at its last durable save point, until
@@ -698,11 +719,12 @@ impl Project {
             recovery_path: Some(recovery_path),
             recovery_dir: config.recovery_dir,
             unreported: BTreeSet::new(),
+            left_out: BTreeSet::new(),
             paused: None,
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
-            superseded: Vec::new(),
+            twins: Vec::new(),
             stranded: None,
             stroke: None,
             recorded: None,
@@ -751,8 +773,8 @@ impl Project {
             self.store.forget_copied_ahead();
         }
         kept.extend(switched?);
-        let superseded = std::mem::take(&mut self.superseded);
-        let unremoved = superseded.iter().filter_map(|file| retire(file).err());
+        let twins = std::mem::take(&mut self.twins);
+        let unremoved = twins.iter().filter_map(|file| retire(file).err());
         kept.extend(unremoved);
         Ok(self.outcome(kept))
     }
@@ -840,7 +862,7 @@ impl Project {
         self.unreported.extend(saved.lost());
         kept.extend(self.switch(saved, &project, &path)?);
         // Another project from here on: its saves say nothing of those files' work.
-        self.superseded.clear();
+        self.twins.clear();
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
@@ -909,12 +931,12 @@ impl Project {
     /// point (a project paused since a save has none, and keeps nothing).
     /// [`ProjectError::OldRecoveryKept`] if a roll-over on the way couldn't delete the file it
     /// replaced. [`ProjectError::Io`] or [`ProjectError::Store`] if the recovery file can't be
-    /// deleted. [`ProjectError::Unprotected`] once closed, if a kept recovery file lacks the
-    /// latest edits of some tiles.
+    /// deleted. [`ProjectError::Lost`] or [`ProjectError::Unprotected`] once closed, if a kept
+    /// recovery file lacks the latest edits of some tiles.
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
         let finished = self.finish_flushes();
         if let Some(mut writer) = self.writer.take() {
-            self.unreported.extend(writer.take_skipped());
+            hear_skipped(&mut writer, &mut self.unreported, &mut self.left_out);
             // Its flushes are done, or failed for good: closing releases its subscription.
             let closed = writer.close(&mut self.store, Instant::now());
             finished?;
@@ -929,25 +951,28 @@ impl Project {
             }
             // Nothing is kept to lack them.
             self.unreported.clear();
+            self.left_out.clear();
         }
         self.report()
     }
 
-    /// Names `files`, recovery files this project's restored one stands in front of: the same
-    /// project on the same save point, with older edits. They go with its work:
-    /// [`Project::discard`] removes them, or the next [`Project::save`], and nothing else does,
-    /// so a close leaves them for the next open to judge. Otherwise dropping the work would
-    /// bring the older file back.
-    pub fn supersede(&mut self, files: Vec<PathBuf>) {
-        self.superseded = files;
+    /// Names `files`, recovery files holding just what this project's restored one does: on its
+    /// save point, with its very head, which only a file left mid-roll-over shares, as op ids are a
+    /// session's own. Any other file may hold work nothing else does, however its head compares.
+    ///
+    /// They go with its work: [`Project::discard`] removes them, or the next [`Project::save`], and
+    /// nothing else does, so a close leaves them for the next open to judge. Otherwise dropping the
+    /// work would bring it back from the twin.
+    pub fn set_twins(&mut self, files: Vec<PathBuf>) {
+        self.twins = files;
     }
 
     /// Closes the project, dropping what no save holds: the user's choice, which a full disk
     /// mustn't overrule. So unlike [`Project::close`], which finishes the recovery writer's flushes
     /// first and keeps the recovery file if it can't, this stops the writer where it is, with no
-    /// flush or roll-over, and removes the recovery file, any old one still held and those it
-    /// supersedes ([`Project::supersede`]), whatever state they are in. A file already gone is what
-    /// was wanted.
+    /// flush or roll-over, and removes the recovery file, any old one still held and its twins
+    /// ([`Project::set_twins`]), whatever state they are in. A file already gone is what was
+    /// wanted.
     ///
     /// Otherwise the file would be found at the next open, and bring back work the user dropped.
     ///
@@ -961,11 +986,12 @@ impl Project {
         }
         // Nothing is kept to lack them.
         self.unreported.clear();
+        self.left_out.clear();
         let held = std::mem::take(&mut self.held);
         let held = held.into_iter().map(|(path, _file)| path);
-        let superseded = std::mem::take(&mut self.superseded);
+        let twins = std::mem::take(&mut self.twins);
         let files = self.recovery_path.take().into_iter().chain(held);
-        let files = files.chain(superseded);
+        let files = files.chain(twins);
         let mut first_failure = Ok(());
         for path in files {
             let removed = retire(&path);
@@ -1086,7 +1112,8 @@ impl Project {
     /// [`ProjectError::ProtectionPaused`] if moving to a new recovery file fails (it is tried
     /// again after [`ROLL_OVER_RETRY`], then waits doubling up to a minute while it keeps
     /// failing); [`ProjectError::OldRecoveryKept`] if it moved, but couldn't delete the old
-    /// file; [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file,
+    /// file; [`ProjectError::Lost`] for tiles whose edits are gone, and
+    /// [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file yet, each
     /// once nothing else is to be reported.
     pub fn end_stroke(&mut self, record: &StrokeRecord) -> Result<(), ProjectError> {
         let op = record.op();
@@ -1213,6 +1240,8 @@ impl Project {
     /// delete: the protection it leaves, and the tiles found unprotected since the last report,
     /// which are forgotten.
     fn outcome(&mut self, kept: Vec<KeptRecovery>) -> SaveOutcome {
+        // Their slots were valid: the save wrote them, or they are among those it lost.
+        self.left_out.clear();
         SaveOutcome {
             protection: self.protection(),
             unprotected: std::mem::take(&mut self.unreported).into_iter().collect(),
@@ -1224,12 +1253,17 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// [`ProjectError::Unprotected`] with those tiles, in key order.
+    /// [`ProjectError::Lost`] with the tiles gone, in key order; with none, and tiles left out,
+    /// [`ProjectError::Unprotected`] with those.
     fn report(&mut self) -> Result<(), ProjectError> {
-        if self.unreported.is_empty() {
+        if !self.unreported.is_empty() {
+            let tiles = std::mem::take(&mut self.unreported);
+            return Err(ProjectError::Lost(tiles.into_iter().collect()));
+        }
+        if self.left_out.is_empty() {
             return Ok(());
         }
-        let tiles = std::mem::take(&mut self.unreported);
+        let tiles = std::mem::take(&mut self.left_out);
         Err(ProjectError::Unprotected(tiles.into_iter().collect()))
     }
 
@@ -1254,7 +1288,7 @@ impl Project {
     ) -> Result<(), ProjectError> {
         if let Some(writer) = self.writer.as_mut() {
             let outcome = call(writer, &mut self.store);
-            self.unreported.extend(writer.take_skipped());
+            hear_skipped(writer, &mut self.unreported, &mut self.left_out);
             if !writer.is_failed() {
                 return Ok(outcome?);
             }

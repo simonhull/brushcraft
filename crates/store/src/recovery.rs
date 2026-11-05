@@ -308,6 +308,8 @@ pub struct RecoveryWriter {
     /// Tiles left out of a flush because their slots were broken, not yet reported (see
     /// [`RecoveryWriter::take_skipped`]).
     skipped: Vec<TileKey>,
+    /// Those of them gone from memory too ([`RecoveryWriter::take_lost`]).
+    lost: Vec<TileKey>,
     /// Test hooks shared with the writer thread.
     #[cfg(test)]
     hooks: Arc<Hooks>,
@@ -350,6 +352,7 @@ impl RecoveryWriter {
             flushes: 0,
             generation: store.generation(),
             skipped: Vec::new(),
+            lost: Vec::new(),
             #[cfg(test)]
             hooks,
         })
@@ -494,6 +497,12 @@ impl RecoveryWriter {
         std::mem::take(&mut self.skipped)
     }
 
+    /// Takes the tiles left out so far whose latest edits are gone, from memory too: broken slots,
+    /// as [`RecoveryWriter::take_skipped`] says. Those it lists besides are only late.
+    pub fn take_lost(&mut self) -> Vec<TileKey> {
+        std::mem::take(&mut self.lost)
+    }
+
     /// Whether a trigger now would have anything to flush: edits not yet in the working file,
     /// tiles in it since its last save point (written back to make room), or a failed flush to
     /// confirm.
@@ -542,6 +551,9 @@ impl RecoveryWriter {
                 store.flush_strokes()?;
                 Ok(snapshots)
             });
+        // A dirty slot with no op is a broken one: lost, not late.
+        self.lost
+            .extend(self.skipped.get(before..).unwrap_or_default());
         let started = match snapshot {
             Ok(snapshots) if !snapshots.is_empty() => {
                 #[cfg(test)]
@@ -609,6 +621,7 @@ impl RecoveryWriter {
                     store.drop_from_stream(self.consumer, key);
                 }
                 self.skipped.extend(broken.iter().copied());
+                self.lost.extend(lost.iter().copied());
                 store.forget_bounds_at_cut(&broken, &lost)?;
                 store.append_streamed(self.consumer, &tiles)?;
                 self.request_tile_sync(store)

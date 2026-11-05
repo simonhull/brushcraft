@@ -324,8 +324,8 @@ impl ProjectToOpen {
     /// [`ProjectToOpen::open_restoring`], with `found` the listing of recovery files. A listing
     /// that failed, or a restore that does, is said on stderr and the project opens as ever: the
     /// user's project must open, and the recovery file is kept for another try. Files of this
-    /// project holding nothing go first, and a project restored answers for the older files behind
-    /// the one it came from ([`Project::supersede`]).
+    /// project holding nothing go first, and a project restored answers for the twins of the one
+    /// it came from ([`Project::set_twins`]).
     ///
     /// # Errors
     ///
@@ -363,7 +363,7 @@ impl ProjectToOpen {
                     return Ok((self.open()?, Some(note)));
                 }
                 Ok(mut project) => {
-                    project.supersede(older_than(candidate, &ours));
+                    project.set_twins(twins_of(candidate, &ours));
                     let note = OpenNote::Restored {
                         path: candidate.path.clone(),
                         when: candidate.modified,
@@ -464,19 +464,20 @@ impl ProjectToOpen {
     }
 }
 
-/// The files of `candidates` that `chosen`, about to be restored, stands in front of.
+/// The files of `candidates` that provably hold just what `chosen`, about to be restored, does: on
+/// its save point, with its very head.
 ///
-/// Those are other files on its save point with older edits. Op ids order edits only within a site,
-/// so a file of another site is never called older.
-fn older_than(chosen: &RecoveryCandidate, candidates: &[RecoveryCandidate]) -> Vec<PathBuf> {
-    let older = |other: &&RecoveryCandidate| {
-        let edits = other.last_edit.zip(chosen.last_edit);
+/// Op ids are a session's own, as a project opens past every recovery head, so only a file left
+/// mid-roll-over shares one. Any other file on the save point is another session's, and holds work
+/// no other file does, however its head compares: it stays.
+fn twins_of(chosen: &RecoveryCandidate, candidates: &[RecoveryCandidate]) -> Vec<PathBuf> {
+    let twin = |other: &&RecoveryCandidate| {
         other.status == CandidateStatus::Restorable
             && other.base == chosen.base
             && other.path != chosen.path
-            && edits.is_some_and(|(its, ours)| its.site() == ours.site() && its.seq() < ours.seq())
+            && other.last_edit == chosen.last_edit
     };
-    let files = candidates.iter().filter(older);
+    let files = candidates.iter().filter(twin);
     files.map(|file| file.path.clone()).collect()
 }
 
@@ -1389,42 +1390,22 @@ mod tests {
         close(opened.expect("opened").0);
     }
 
-    /// Don't save on the restored file mustn't bring the older one back on the next open.
+    /// A file with another head is another session's: the note it comes back with can be answered,
+    /// and a deletion couldn't.
     #[test]
-    fn dont_save_is_not_undone_by_an_older_file() {
+    fn dont_save_leaves_a_file_of_another_session() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
         let older = left_work(&opening);
         let newer = left_work(&opening);
-        let (project, note) = opening.clone().open_restoring().expect("opened");
+        let (project, note) = opening.open_restoring().expect("opened");
         assert!(matches!(&note, Some(OpenNote::Restored { path, .. }) if *path == newer));
         project.discard().expect("Don't save");
-        assert!(!older.exists(), "it goes with the work it stands behind");
-        let (again, found) = opening.open_restoring().expect("opened");
-        let unsaved = again.has_unsaved_edits();
-        close(again);
-        assert!(!unsaved, "{} came back: {found:?}", older.display());
+        assert!(!newer.exists(), "what the user dropped");
+        assert!(older.exists(), "it isn't held anywhere else");
     }
 
-    /// The other way about: the file chosen is the older, as a listing out of order would give, and
-    /// the file with newer work must outlive Don't save.
-    #[test]
-    fn dont_save_never_takes_a_file_with_newer_work() {
-        let dir = TestDir::new();
-        let opening = saved(&dir, "first-sculpt.bcrf");
-        let first = left_work(&opening);
-        let second = left_work(&opening);
-        let mut found = listed(&opening);
-        found.reverse();
-        let chosen = found[0].path.clone();
-        let (project, _) = opening.open_with(Ok(found)).expect("opened");
-        project.discard().expect("Don't save");
-        assert!(!chosen.exists(), "the file restored goes");
-        let other = if chosen == first { &second } else { &first };
-        assert!(other.exists(), "newer work stays");
-    }
-
-    /// A file on an earlier save point isn't behind the one restored: it is other work.
+    /// A file on an earlier save point isn't a twin, whatever its head.
     #[test]
     fn dont_save_leaves_work_on_an_earlier_save() {
         let dir = TestDir::new();
@@ -1437,16 +1418,15 @@ mod tests {
         assert!(earlier.exists(), "the user hasn't dropped this");
     }
 
-    /// Only Don't save and a save end an older file: closing leaves everything to the next open.
+    /// Only Don't save and a save end a twin: closing leaves everything to the next open.
     #[test]
-    fn closing_leaves_an_older_file() {
+    fn closing_leaves_a_twin() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        let older = left_work(&opening);
-        drop(left_work(&opening));
+        let twin = twin_of(&left_work(&opening));
         let (project, _) = opening.open_restoring().expect("opened");
         close(project);
-        assert!(older.exists(), "nothing was decided");
+        assert!(twin.exists(), "nothing was decided");
     }
 
     /// A project opened without restoring has decided nothing of the files it finds.
@@ -1463,16 +1443,83 @@ mod tests {
     }
 
     #[test]
-    fn a_save_of_the_restored_work_covers_an_older_file() {
+    fn a_save_of_the_restored_work_covers_its_twin() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        let older = left_work(&opening);
-        drop(left_work(&opening));
+        let twin = twin_of(&left_work(&opening));
         let (mut project, _) = opening.open_restoring().expect("opened");
         let outcome = project.save().expect("saved");
         assert!(outcome.kept.is_empty(), "{outcome:?}");
-        assert!(!older.exists(), "it would come back as found work");
+        assert!(!twin.exists(), "the save holds what it held");
         project.close(false).expect("closed");
+    }
+
+    /// `file`'s twin, as a crash mid-roll-over leaves one.
+    fn twin_of(file: &Path) -> PathBuf {
+        let name = file
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        let (id, _) = name.split_once('-').expect("id and suffix");
+        let twin = file.with_file_name(format!("{id}-00000000000000aa.bcrf"));
+        std::fs::copy(file, &twin).expect("copied");
+        twin
+    }
+
+    /// Two sibling sessions on one save point: the older file's work is in no other file.
+    ///
+    /// A restore that failed for the moment (or a listing that did) opens as ever, so this is how
+    /// the second session comes about. A save of the newer work must not take the older.
+    #[test]
+    fn a_save_keeps_older_work_it_does_not_hold() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let mut first = opening.clone().open().expect("opened");
+        edit_by(&mut first, 0.25);
+        let before = surface(&mut first);
+        let older = first.recovery_path().expect("protected").to_owned();
+        first.close(true).expect("closed, the file kept");
+        let mut second = opening
+            .clone()
+            .open()
+            .expect("a restore that failed opens as ever");
+        project_edit_elsewhere(&mut second);
+        second.close(true).expect("closed, the file kept");
+
+        let (mut project, _) = opening.open_restoring().expect("opened");
+        drop(project.save().expect("saved"));
+        let in_the_save = surface(&mut project);
+        project.close(false).expect("closed");
+        assert_ne!(in_the_save, before, "the save doesn't hold the older work");
+        assert!(older.exists(), "and it is in no file now");
+    }
+
+    /// An edit of another vertex than `edit_by`'s.
+    fn project_edit_elsewhere(project: &mut Project) {
+        project.begin_stroke().expect("begun");
+        let edited = project.store().edit_tile(edited_tile(), |tile| {
+            tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5))
+        });
+        edited.expect("the tile").expect("edited");
+        project.store().close_epoch().expect("closed");
+        project.end_unrecorded_stroke().expect("ended");
+    }
+
+    /// A crash mid roll-over leaves two files with one head (the store's own notes). Don't
+    /// save takes the one restored, and the twin brings the dropped work back.
+    #[test]
+    fn dont_save_is_not_undone_by_a_twin() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        drop(twin_of(&left_work(&opening)));
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert!(note.is_some());
+        project.discard().expect("Don't save");
+        let (again, _) = opening.open_restoring().expect("opened");
+        let unsaved = again.has_unsaved_edits();
+        close(again);
+        assert!(!unsaved, "the dropped work came back");
     }
 
     /// A run's summary, its details aside.

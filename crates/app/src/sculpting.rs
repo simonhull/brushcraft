@@ -148,7 +148,7 @@ use stroke::{
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
     Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
-    Landing, STROKE_QUIET, SampleTimes,
+    Landing, STROKE_QUIET, SampleTimes, recovery_report,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 use crate::saving::DabsDropped;
@@ -720,6 +720,8 @@ pub(crate) struct Sculpting {
     errors: u64,
     /// How many errors have dropped dabs, and the latest of them: a save since can't hold them.
     drops: (u64, Option<String>),
+    /// What stroke ends said of the recovery file ([`Brush::take_recovery_reports`]).
+    recovery_reports: Vec<ProjectError>,
     /// The last frame that applied dabs, for the overlay.
     last: BrushReport,
     /// The overlay's lines, and what they were made from.
@@ -768,6 +770,7 @@ impl Sculpting {
             error: None,
             errors: 0,
             drops: (0, None),
+            recovery_reports: Vec::new(),
             last: BrushReport::default(),
             status: (Vec::new(), None),
             stroke_start: None,
@@ -1465,13 +1468,24 @@ impl Sculpting {
                 self.fail("recording the stroke", &error);
                 self.end_unrecorded(project);
             }
-            Err(error) => self.fail("ending the stroke", &error),
+            Err(error) => self.ended_with(error),
         }
     }
 
     /// Ends the open op with no record.
     fn end_unrecorded(&mut self, project: &mut Project) {
         if let Err(error) = project.end_unrecorded_stroke() {
+            self.ended_with(error);
+        }
+    }
+
+    /// A stroke's end said `error`. Of the recovery file, it is the frame loop's to hear: the
+    /// stroke did end, and nothing was dropped, so it can't fail the save or the close it landed
+    /// for.
+    fn ended_with(&mut self, error: ProjectError) {
+        if recovery_report(&error) {
+            self.recovery_reports.push(error);
+        } else {
             self.fail("ending the stroke", &error);
         }
     }
@@ -2059,6 +2073,10 @@ impl Brush for Sculpting {
 
     fn drops(&self) -> u64 {
         self.drops.0
+    }
+
+    fn take_recovery_reports(&mut self) -> Vec<ProjectError> {
+        std::mem::take(&mut self.recovery_reports)
     }
 
     fn dropped_since(&self, before: u64) -> Result<(), DabsDropped> {
