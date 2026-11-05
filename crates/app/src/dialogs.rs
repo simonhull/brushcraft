@@ -6,11 +6,20 @@
 //! with the frame. The pen touches only the fades ([`Dialogs::pen_down`], [`Dialogs::pen_up`]), and
 //! a chip where there was none waits for it to lift, so nothing appears, and no atlas uploads,
 //! during a stroke.
+//!
+//! **Routing:** with a bar up, a `Down` or a press goes here first ([`Dialogs::claim`],
+//! [`Dialogs::claim_mouse`]). One on the bar is the UI's, whole: the stroke's other samples stop
+//! here too, and its control acts only if the stroke ends with an `Up` inside it
+//! ([`Dialogs::release`], [`Dialogs::release_mouse`]). With no bar the owner's one look at
+//! [`Dialogs::routes`] is all the pen pays.
 
 use std::time::Instant;
 
 use render::surface::Size;
 use ui::{Blend, Chip, Mark, Theme, Ui, UiFrame};
+
+use crate::camera::Pixel;
+use crate::navigate::Button;
 
 /// What a control on a bar does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +46,34 @@ pub(crate) enum Action {
     OpenCopy,
     /// Leave found work where it is.
     Ignore,
+}
+
+/// Who a `Down` belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// It landed on a bar: the UI has the whole stroke.
+    Ui,
+    /// It goes where it would with no bar.
+    Elsewhere,
+}
+
+/// What a stroke the UI took landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    /// A bar's glass, or a control the press can't act on: it is swallowed and does nothing.
+    Glass,
+    /// A control: it acts if the stroke ends inside it.
+    Control(Action),
+}
+
+impl Press {
+    /// What this press does if it ends over `under`: only a control's action, and only there.
+    fn ends_over(self, under: Option<Action>) -> Option<Action> {
+        match self {
+            Self::Control(action) => under.filter(|&ended_on| ended_on == action),
+            Self::Glass => None,
+        }
+    }
 }
 
 /// What the owner knows that decides the chip.
@@ -79,6 +116,28 @@ impl Status {
     }
 }
 
+/// Who has the pointer's input: the bar, and what it has been pressed with.
+#[derive(Debug, Default)]
+struct Routing {
+    /// Whether a bar is meant to show.
+    bar_up: bool,
+    /// The pen stroke the UI took, while it lasts.
+    pen: Option<Press>,
+    /// The mouse press the UI took, while it lasts, and its button.
+    mouse: Option<(Button, Press)>,
+    /// Where the pointer last was, while input is routed here: a release doesn't say.
+    pointer: Option<Pixel>,
+    /// Whether input goes through here first: a bar is up, or a press it took is still down.
+    on: bool,
+}
+
+impl Routing {
+    /// Brings `on` up to date.
+    const fn update(&mut self) {
+        self.on = self.bar_up || self.pen.is_some() || self.mouse.is_some();
+    }
+}
+
 /// What shows when: the app's whole UI state, on top of [`Ui`].
 #[derive(Debug)]
 pub(crate) struct Dialogs {
@@ -96,11 +155,26 @@ pub(crate) struct Dialogs {
     pen_is_down: bool,
     /// Whether a chip is waiting for the pen to lift.
     waiting: bool,
+    /// Input on its way to the bar.
+    routing: Routing,
+    /// How many hit tests were made.
+    #[cfg(test)]
+    hit_tests: std::cell::Cell<u32>,
 }
 
 /// `size` as the UI takes it; a window with none draws nothing, so any will do.
 fn pixels(size: Option<Size>) -> (u32, u32) {
     size.map_or((1, 1), |size| (size.width(), size.height()))
+}
+
+/// `at` as the UI takes it.
+fn ui_point(at: Pixel) -> (f32, f32) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a pixel of a window is far inside what f32 holds exactly enough to hit a control"
+    )]
+    let point = (at.x as f32, at.y as f32);
+    point
 }
 
 /// A window's scale factor as the UI takes it.
@@ -125,6 +199,9 @@ impl Dialogs {
             saved_at: None,
             pen_is_down: false,
             waiting: false,
+            routing: Routing::default(),
+            #[cfg(test)]
+            hit_tests: std::cell::Cell::new(0),
         }
     }
 
@@ -208,6 +285,164 @@ impl Dialogs {
     /// Whether the pen is down.
     pub(crate) const fn pen_is_down(&self) -> bool {
         self.pen_is_down
+    }
+
+    /// Whether input goes through here first. All the pen pays with no bar up.
+    pub(crate) const fn routes(&self) -> bool {
+        self.routing.on
+    }
+
+    /// Whether the bar's glass is under `at`, and which control if one is.
+    fn press_at(&self, at: Pixel, now: Instant) -> Option<Press> {
+        #[cfg(test)]
+        self.hit_tests.set(self.hit_tests.get() + 1);
+        let (x, y) = ui_point(at);
+        match self.ui.hit(x, y, now) {
+            Some(action) => Some(Press::Control(action)),
+            None => self.ui.on_bar(x, y, now).then_some(Press::Glass),
+        }
+    }
+
+    /// Who the pen's `Down` at `at` belongs to. If it is the UI, so is the stroke, until
+    /// [`Dialogs::release`] or [`Dialogs::drop_pen_press`] ends it.
+    pub(crate) fn claim(&mut self, at: Pixel, now: Instant) -> Claim {
+        self.routing.pen = self.press_at(at, now);
+        self.routing.update();
+        if self.routing.pen.is_some() {
+            Claim::Ui
+        } else {
+            Claim::Elsewhere
+        }
+    }
+
+    /// Whether the UI holds a pen stroke.
+    pub(crate) const fn pen_pressed(&self) -> bool {
+        self.routing.pen.is_some()
+    }
+
+    /// The pen's `Up` at `at` ended the stroke the UI held: what to do, if it ended on the control
+    /// it began on.
+    pub(crate) fn release(&mut self, at: Pixel, now: Instant) -> Option<Action> {
+        let press = self.routing.pen.take();
+        self.routing.update();
+        let (x, y) = ui_point(at);
+        press.and_then(|press| press.ends_over(self.ui.hit(x, y, now)))
+    }
+
+    /// The stroke the UI held ended with no `Up`: nothing was pressed after all.
+    pub(crate) const fn drop_pen_press(&mut self) {
+        self.routing.pen = None;
+        self.routing.update();
+    }
+
+    /// Who the mouse's press of `button` at `at` belongs to. A press on the bar is the UI's until
+    /// [`Dialogs::release_mouse`] or [`Dialogs::drop_mouse_press`], and only the left button acts.
+    /// Another button pressed meanwhile is swallowed if it is on the bar, and held by nothing.
+    pub(crate) fn claim_mouse(&mut self, button: Button, at: Pixel, now: Instant) -> Claim {
+        self.routing.pointer = Some(at);
+        let Some(press) = self.press_at(at, now) else {
+            return Claim::Elsewhere;
+        };
+        if self.routing.mouse.is_none() {
+            let press = if button == Button::MouseLeft {
+                press
+            } else {
+                Press::Glass
+            };
+            self.routing.mouse = Some((button, press));
+            self.routing.update();
+        }
+        Claim::Ui
+    }
+
+    /// Whether the press of `button` is the UI's.
+    pub(crate) fn mouse_holds(&self, button: Button) -> bool {
+        self.routing.mouse.is_some_and(|(held, _)| held == button)
+    }
+
+    /// The press the UI held came up, with the pointer where it last was: what to do, if that's on
+    /// the control it began on.
+    pub(crate) fn release_mouse(&mut self, now: Instant) -> Option<Action> {
+        let press = self.routing.mouse.take();
+        self.routing.update();
+        let (x, y) = ui_point(self.routing.pointer?);
+        press.and_then(|(_, press)| press.ends_over(self.ui.hit(x, y, now)))
+    }
+
+    /// The press the UI held won't come up where anyone can tell: nothing was pressed after all.
+    pub(crate) const fn drop_mouse_press(&mut self) {
+        self.routing.mouse = None;
+        self.routing.update();
+    }
+
+    /// The pointer is at `at` (`None`: gone): whether that changed what draws.
+    pub(crate) fn hover(&mut self, at: Option<Pixel>) -> bool {
+        self.routing.pointer = at;
+        self.ui.hover(at.map(ui_point))
+    }
+
+    /// Takes the bar away.
+    pub(crate) fn clear_bar(&mut self, now: Instant) {
+        self.routing.bar_up = false;
+        self.routing.update();
+        self.ui.set_bar(None, now);
+    }
+}
+
+/// What the frame loop's tests need of a bar: one to show, and where its parts are.
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+impl Dialogs {
+    /// Shows `bar`, as seen: its fade began long enough ago to be over.
+    pub(crate) fn show_bar(&mut self, bar: ui::Bar<Action>) {
+        let seen = Instant::now().checked_sub(Theme::GLASS.fade * 2);
+        self.ui
+            .set_bar(Some(bar), seen.expect("the clock is past a fade"));
+        self.routing.bar_up = true;
+        self.routing.update();
+    }
+
+    /// Whether a bar is meant to show.
+    pub(crate) const fn bar_showing(&self) -> bool {
+        self.routing.bar_up
+    }
+
+    /// How many hit tests were made.
+    pub(crate) fn hit_tests(&self) -> u32 {
+        self.hit_tests.get()
+    }
+
+    /// Every pixel of the window, on a coarse grid.
+    fn grid(&self) -> impl Iterator<Item = Pixel> {
+        let (width, height) = self.size;
+        let rows = (0..height).step_by(4);
+        let points = rows.flat_map(move |y| (0..width).step_by(4).map(move |x| (x, y)));
+        points.map(|(x, y)| Pixel {
+            x: f64::from(x),
+            y: f64::from(y),
+        })
+    }
+
+    /// A point on the control that does `action`.
+    pub(crate) fn control(&self, action: Action) -> Pixel {
+        let now = Instant::now();
+        let mut points = self.grid();
+        let hits = |at: &Pixel| {
+            let (x, y) = ui_point(*at);
+            self.ui.hit(x, y, now) == Some(action)
+        };
+        points.find(hits).expect("a control that does it")
+    }
+
+    /// A point on the bar's glass, off any control.
+    pub(crate) fn bare_glass(&self) -> Pixel {
+        let now = Instant::now();
+        let mut points = self.grid();
+        let bare = |at: &Pixel| {
+            let (x, y) = ui_point(*at);
+            self.ui.on_bar(x, y, now) && self.ui.hit(x, y, now).is_none()
+        };
+        points.find(bare).expect("bare glass")
     }
 }
 

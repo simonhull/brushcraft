@@ -44,6 +44,10 @@
 //! Handing off before the jobs keeps them out of the input's latency (the plan's order,
 //! amended by the Task 1 review).
 //!
+//! **The UI comes before all of it:** with a bar up, input reaches [`crate::dialogs`] as it
+//! arrives, before it is queued, and a stroke or press that lands on the bar stops there whole.
+//! With none that is one branch ([`Dialogs::routes`]).
+//!
 //! **The pen's latency** (the M1 spec's target: sample to present submitted ≤ 8 ms at p99 below
 //! F, "with mailbox presentation and late input"):
 //!
@@ -119,7 +123,7 @@ use ui::{Blend, UiFrame};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing, UPKEEP_INTERVAL};
 use crate::camera::{Arcball, Boundary, Camera, Pixel};
-use crate::dialogs::{Dialogs, Facts};
+use crate::dialogs::{Action, Claim, Dialogs, Facts};
 use crate::navigate::{Button, Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
@@ -1302,6 +1306,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// input may move the camera, or starts a drag (whose press may move the pivot, which the
     /// overlay shows).
     pub(crate) fn input(&mut self, input: Input) {
+        if self.dialogs.routes() && self.ui_took_input(input) {
+            return;
+        }
         if input == Input::Cancel {
             // Navigation forgets the pen's buttons too: the next sample presses them again.
             self.pen_navigation = PenNavigation::default();
@@ -1318,6 +1325,103 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.input_at.push(Instant::now());
     }
 
+    /// Whether `input` was the UI's alone: a press on a bar, or the release of one. The rest goes
+    /// on to navigation, the UI hearing where the pointer went.
+    fn ui_took_input(&mut self, input: Input) -> bool {
+        let now = Instant::now();
+        let took = match input {
+            Input::Press { button, at } => {
+                let claim = self.dialogs.claim_mouse(button, at, now);
+                claim == Claim::Ui
+            }
+            Input::Release { button } if self.dialogs.mouse_holds(button) => {
+                let action = self.dialogs.release_mouse(now);
+                self.act_on(action, now);
+                true
+            }
+            Input::Move { at } => {
+                self.ui_hover(Some(at));
+                false
+            }
+            Input::Cancel => {
+                self.dialogs.drop_mouse_press();
+                false
+            }
+            Input::Release { .. } | Input::Wheel { .. } | Input::Modifiers(_) => false,
+        };
+        if took && let Input::Press { at, .. } = input {
+            self.point(Some(at));
+        }
+        took
+    }
+
+    /// Whether `sample` was the UI's alone: a `Down` on a bar, or the rest of its stroke. A stroke
+    /// the UI holds ends as any does: at its `Up`, or at a sample out of a stroke with its `Up`
+    /// lost, which drops the action and goes on as it would.
+    fn ui_took_pen(&mut self, sample: &PenSample) -> bool {
+        use input::Phase;
+        let now = Instant::now();
+        if self.dialogs.pen_pressed() {
+            match sample.phase {
+                Phase::Drag => {
+                    self.ui_hover(Some(sample.at));
+                    return true;
+                }
+                Phase::Up => {
+                    let action = self.dialogs.release(sample.at, now);
+                    self.act_on(action, now);
+                    return true;
+                }
+                Phase::Down | Phase::Enter | Phase::Hover | Phase::Leave => {
+                    self.dialogs.drop_pen_press();
+                }
+            }
+        }
+        match sample.phase {
+            Phase::Down => self.dialogs.claim(sample.at, now) == Claim::Ui,
+            Phase::Enter | Phase::Hover => {
+                self.ui_hover(Some(sample.at));
+                false
+            }
+            Phase::Leave => {
+                self.ui_hover(None);
+                false
+            }
+            Phase::Drag | Phase::Up => false,
+        }
+    }
+
+    /// The pointer is at `at` as far as the UI goes, and a frame is wanted if that changes what
+    /// draws.
+    fn ui_hover(&mut self, at: Option<Pixel>) {
+        if self.dialogs.hover(at) {
+            self.scheduler.want(Reason::Overlay);
+        }
+    }
+
+    /// Runs `action`, if a press ended with one.
+    fn act_on(&mut self, action: Option<Action>, now: Instant) {
+        if let Some(action) = action {
+            self.act(action, now);
+        }
+    }
+
+    /// Does what a control on a bar says, and wants the frame that shows it.
+    fn act(&mut self, action: Action, now: Instant) {
+        match action {
+            Action::Dismiss => self.dialogs.clear_bar(now),
+            Action::Save
+            | Action::DontSave
+            | Action::KeepSculpting
+            | Action::Cancel
+            | Action::TryAgain
+            | Action::UseLastSave
+            | Action::OpenCopy
+            | Action::Ignore => {}
+        }
+        self.scheduler.want(Reason::Overlay);
+    }
+
     /// Queues a pen sample for the next frame's input phase, where it is routed.
     ///
     /// **The contract:** who a sample belongs to is decided in the input phase, not here: a
@@ -1332,6 +1436,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// A sample of a brush stroke (or a `Down`, or a sample behind a `Down` not routed yet: either
     /// may be the brush's) wants a frame for the stroke ([`Reason::Stroke`], started on input where
     /// presentation allows); any other in a stroke wants one paced as ever ([`Reason::Input`]).
+    ///
+    /// **Before all that, with a bar up,** the UI hears the sample ([`Owner::ui_took_pen`]): a
+    /// stroke that lands on the bar goes no further, nor does a sample of it. With no bar this is
+    /// one branch.
     pub(crate) fn pen(&mut self, sample: PenSample) {
         self.queue_pen(sample, true);
     }
@@ -1340,6 +1448,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// itself wants none).
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
         if self.closing() {
+            return;
+        }
+        if self.dialogs.routes() && self.ui_took_pen(&sample) {
             return;
         }
         if sample.phase == input::Phase::Down {
@@ -1400,6 +1511,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// The pointer left the window: nothing is under it to pick.
     pub(crate) fn pointer_left(&mut self) {
+        if self.dialogs.routes() {
+            self.ui_hover(None);
+        }
         self.point(None);
     }
 

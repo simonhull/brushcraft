@@ -18,10 +18,11 @@ use render::surface::{Offscreen, Target};
 use render::tree::Place;
 use render::{DroppedReadbacks, Outcome, Renderer};
 use store::{Epoch, ProjectConfig, StoreConfig};
-use ui::{Theme, UiFrame};
+use ui::{Bar, Control, Emphasis, Theme, UiFrame};
 
 use super::*;
 use crate::camera::Pixel;
+use crate::dialogs::Action;
 use crate::navigate::Button;
 use crate::pen::PenFrame;
 use crate::render_thread::draw_frame;
@@ -2344,4 +2345,337 @@ fn a_first_chip_waiting_comes_on_a_leave_too() {
     owner.pen(pen_sample(input::Phase::Leave, (11.0, 10.0)));
     wants_a_frame(&mut owner, "the chip that waited");
     assert!(ui_of(&mut owner).is_some(), "the chip");
+}
+
+/// A bar of two quiet controls: one puts it away, the other does nothing yet.
+fn test_bar() -> Bar<Action> {
+    let quiet = |label: &str, action| Control {
+        label: label.to_owned(),
+        action,
+        emphasis: Emphasis::Quiet,
+    };
+    let controls = vec![
+        quiet("Put it away", Action::Dismiss),
+        quiet("Leave it", Action::Ignore),
+    ];
+    Bar::new("A question", controls)
+}
+
+/// A window big enough for a bar's controls, its frames on demand.
+fn big_setup() -> Setup {
+    Setup {
+        size: Size::new(1280, 800),
+        ..setup(None)
+    }
+}
+
+/// [`pen_owner`] in a window big enough for a bar, showing [`test_bar`].
+fn bar_owner(dir: &TestDir, claims: bool) -> Owner<PenLog, NoUploads> {
+    let brush = PenLog {
+        claims,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(project(dir), brush, NoUploads, big_setup(), Instant::now());
+    run(&mut owner, 10_000);
+    owner.dialogs.show_bar(test_bar());
+    run(&mut owner, 10_000);
+    owner.brush.frames.clear();
+    owner
+}
+
+/// A pen sample in `phase` at `at`.
+fn pen_at(phase: input::Phase, at: Pixel) -> PenSample {
+    pen_sample(phase, (at.x, at.y))
+}
+
+/// Every sample the brush was handed, frame after frame.
+fn brush_saw(owner: &Owner<PenLog, NoUploads>) -> Vec<input::Phase> {
+    let frames = owner.brush.frames.iter();
+    frames
+        .flat_map(|(phases, _)| phases.iter().copied())
+        .collect()
+}
+
+/// A point well off any bar.
+const ON_THE_MODEL: Pixel = Pixel { x: 640.0, y: 200.0 };
+
+#[test]
+fn a_down_on_a_control_never_reaches_the_brush() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let on = owner.dialogs.control(Action::Dismiss);
+    owner.pen(pen_at(Phase::Down, on));
+    assert!(owner.pen_queue.is_empty(), "no sample is queued");
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(brush_saw(&owner).is_empty(), "{:?}", owner.brush.frames);
+    assert_eq!(owner.pen_router.stroke(), None, "no stroke began");
+    assert!(!owner.dialogs.pen_is_down(), "the bar stays up under it");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_rest_of_that_stroke_never_reaches_the_brush_either() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let on = owner.dialogs.control(Action::Ignore);
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Drag, on));
+    owner.pen(pen_at(Phase::Up, on));
+    assert!(owner.pen_queue.is_empty(), "none of it is queued");
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(brush_saw(&owner).is_empty(), "{:?}", owner.brush.frames);
+    assert_eq!(owner.pen_router.stroke(), None, "no stroke began");
+
+    owner.brush.frames.clear();
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert_eq!(
+        brush_saw(&owner),
+        [Phase::Down],
+        "the next stroke is the brush's"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_control_acts_on_the_up_inside_it_and_not_outside() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let (on, other) = (
+        owner.dialogs.control(Action::Dismiss),
+        owner.dialogs.control(Action::Ignore),
+    );
+    owner.pen(pen_at(Phase::Down, on));
+    assert!(owner.dialogs.bar_showing(), "the Down does nothing");
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Up, ON_THE_MODEL));
+    assert!(owner.dialogs.bar_showing(), "the Up was off it");
+
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Up, other));
+    assert!(owner.dialogs.bar_showing(), "the Up was on another control");
+
+    owner.pen(pen_at(Phase::Down, other));
+    owner.pen(pen_at(Phase::Up, on));
+    assert!(owner.dialogs.bar_showing(), "and the other way about");
+
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Up, on));
+    assert!(!owner.dialogs.bar_showing(), "back inside it: it acts");
+    wants_a_frame(&mut owner, "the bar's fade");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_claimed_stroke_ended_by_a_leave_drops_its_action_and_the_leave_goes_on() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let on = owner.dialogs.control(Action::Dismiss);
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Leave, on));
+    assert!(owner.dialogs.bar_showing(), "no Up, no action");
+    assert_eq!(owner.pen_queue.len(), 1, "the Leave is the pen's news");
+    owner.pen(pen_at(Phase::Up, on));
+    assert!(owner.dialogs.bar_showing(), "a stray Up is nobody's");
+
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Hover, on));
+    owner.pen(pen_at(Phase::Up, on));
+    assert!(owner.dialogs.bar_showing(), "a Hover ends it just the same");
+
+    owner.pen(pen_at(Phase::Down, on));
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    assert!(
+        owner.dialogs.pen_is_down(),
+        "a Down with the Up lost starts over"
+    );
+    assert!(owner.dialogs.bar_showing(), "and acts on nothing");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_down_on_the_bars_glass_off_any_control_is_swallowed() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let glass = owner.dialogs.bare_glass();
+    owner.pen(pen_at(Phase::Down, glass));
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Up, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(brush_saw(&owner).is_empty(), "{:?}", owner.brush.frames);
+    assert!(owner.dialogs.bar_showing(), "and nothing was pressed");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_down_off_the_bar_goes_where_it_went_before() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Drag, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert_eq!(
+        brush_saw(&owner),
+        [Phase::Down, Phase::Drag, Phase::Up],
+        "the whole stroke"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_stroke_that_began_on_the_model_keeps_going_over_the_bar() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    let on = owner.dialogs.control(Action::Dismiss);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Drag, on));
+    owner.pen(pen_at(Phase::Up, on));
+    run(&mut owner, 100);
+    assert_eq!(
+        brush_saw(&owner),
+        [Phase::Down, Phase::Drag, Phase::Up],
+        "every sample"
+    );
+    assert!(owner.dialogs.bar_showing(), "and the Up pressed nothing");
+    owner.close().expect("closed");
+}
+
+/// The mouse's left button.
+const LEFT: Button = Button::MouseLeft;
+
+#[test]
+fn a_mouse_press_on_a_control_never_reaches_navigation() {
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, false);
+    let before = *owner.camera();
+    let at = owner.dialogs.control(Action::Ignore);
+    owner.input(Input::Press { button: LEFT, at });
+    assert!(owner.input.is_empty(), "the press stops here");
+    owner.input(Input::Move { at: ON_THE_MODEL });
+    run(&mut owner, 100);
+    assert_eq!(*owner.camera(), before, "no drag began, so nothing orbits");
+    owner.input(Input::Release { button: LEFT });
+    assert!(
+        !owner
+            .input
+            .iter()
+            .any(|input| matches!(input, Input::Release { .. })),
+        "nor does its release go on"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_mouse_acts_on_a_release_inside_the_control_only() {
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, false);
+    let at = owner.dialogs.control(Action::Dismiss);
+    owner.input(Input::Press { button: LEFT, at });
+    owner.input(Input::Move { at: ON_THE_MODEL });
+    owner.input(Input::Release { button: LEFT });
+    assert!(owner.dialogs.bar_showing(), "released off it");
+
+    owner.input(Input::Press { button: LEFT, at });
+    owner.input(Input::Cancel);
+    owner.input(Input::Release { button: LEFT });
+    assert!(
+        owner.dialogs.bar_showing(),
+        "focus went, and the press with it"
+    );
+
+    owner.input(Input::Press { button: LEFT, at });
+    owner.pointer_left();
+    owner.input(Input::Release { button: LEFT });
+    assert!(owner.dialogs.bar_showing(), "released outside the window");
+
+    owner.input(Input::Move { at });
+    owner.input(Input::Press {
+        button: Button::MouseRight,
+        at,
+    });
+    owner.input(Input::Release {
+        button: Button::MouseRight,
+    });
+    assert!(owner.dialogs.bar_showing(), "only the left button presses");
+
+    owner.input(Input::Press { button: LEFT, at });
+    owner.input(Input::Release { button: LEFT });
+    assert!(!owner.dialogs.bar_showing(), "a click");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_press_off_the_bar_navigates_as_ever() {
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, false);
+    let before = *owner.camera();
+    owner.input(Input::Press {
+        button: LEFT,
+        at: ON_THE_MODEL,
+    });
+    owner.input(Input::Move {
+        at: Pixel { x: 700.0, y: 240.0 },
+    });
+    run(&mut owner, 100);
+    assert_ne!(*owner.camera(), before, "it orbits");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn with_no_bar_routing_costs_one_branch() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, true);
+    assert!(!owner.dialogs.routes(), "nothing to route to");
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    owner.pen(pen_sample(Phase::Drag, (170.0, 100.0)));
+    owner.pen(pen_sample(Phase::Up, (170.0, 100.0)));
+    owner.pen(pen_sample(Phase::Hover, (170.0, 100.0)));
+    let at = Pixel { x: 160.0, y: 100.0 };
+    owner.input(Input::Press { button: LEFT, at });
+    owner.input(Input::Move { at });
+    owner.input(Input::Release { button: LEFT });
+    assert_eq!(owner.dialogs.hit_tests(), 0, "nothing was hit tested");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn hovering_a_control_wants_a_frame_and_only_with_a_bar() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, false);
+    let on = owner.dialogs.control(Action::Dismiss);
+    let hover = Theme::GLASS.hover;
+    let hovered = |ui: Option<UiFrame>| {
+        let frame = ui.expect("the bar");
+        frame.list.rects.iter().any(|rect| rect.fill == hover)
+    };
+
+    owner.input(Input::Move { at: on });
+    wants_a_frame(&mut owner, "the mouse's hover");
+    assert!(hovered(ui_of(&mut owner)), "it fills");
+    owner.pen(pen_at(Phase::Hover, ON_THE_MODEL));
+    wants_a_frame(&mut owner, "the pen moved off");
+    assert!(!hovered(ui_of(&mut owner)), "it clears");
+    owner.pen(pen_at(Phase::Hover, on));
+    assert!(hovered(ui_of(&mut owner)), "the pen's hover too");
+    owner.pen(pen_at(Phase::Leave, on));
+    assert!(!hovered(ui_of(&mut owner)), "the pen left");
+    owner.input(Input::Move { at: on });
+    owner.pointer_left();
+    assert!(!hovered(ui_of(&mut owner)), "the mouse left");
+    owner.close().expect("closed");
 }
