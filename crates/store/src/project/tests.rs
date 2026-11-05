@@ -301,6 +301,65 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     assert_eq!(names, Vec::<String>::new(), "no temporary file left");
 }
 
+/// A project saved at `dir`, a file beside it standing for a recovery file it stands in front of,
+/// and an edit no save holds.
+fn superseding(dir: &TestDir) -> (Project, PathBuf) {
+    let mut project = Project::new((*mesh()).clone(), config(dir)).unwrap();
+    let mut map = CorrectionMap::new();
+    stroke(&mut project, &mut map, 100, 41);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    stroke(&mut project, &mut map, 100, 42);
+    let older = dir.path("recovery").join("older.bcrf");
+    fs::write(&older, b"older work").unwrap();
+    project.supersede(vec![older.clone()]);
+    (project, older)
+}
+
+#[test]
+fn discarding_removes_the_files_superseded() {
+    let dir = TestDir::new();
+    let (project, older) = superseding(&dir);
+    project.discard().unwrap();
+    assert!(!older.exists());
+}
+
+#[test]
+fn a_save_removes_the_files_superseded() {
+    let dir = TestDir::new();
+    let (mut project, older) = superseding(&dir);
+    assert_saved(project.save());
+    assert!(!older.exists());
+    project.close(false).unwrap();
+}
+
+#[test]
+fn closing_leaves_the_files_superseded() {
+    let dir = TestDir::new();
+    let (project, older) = superseding(&dir);
+    project.close(true).unwrap();
+    assert!(older.exists(), "kept");
+}
+
+#[test]
+fn closing_without_the_edits_leaves_the_files_superseded_too() {
+    let dir = TestDir::new();
+    let (project, older) = superseding(&dir);
+    project.close(false).unwrap();
+    assert!(older.exists());
+}
+
+/// The new file isn't on the save point the older one is: saving it says nothing of that work.
+#[test]
+fn a_save_as_leaves_the_files_superseded_for_good() {
+    let dir = TestDir::new();
+    let (mut project, older) = superseding(&dir);
+    assert_saved(project.save_as(&dir.path("elsewhere.bcrf")));
+    assert!(older.exists(), "another project now");
+    assert_saved(project.save());
+    assert!(older.exists(), "and its saves cover nothing of it");
+    project.close(false).unwrap();
+}
+
 /// A save whose new recovery file can't be put in place (a crash before its rename, as far as
 /// the file goes) goes through all the same: crash protection pauses, and the next save puts it
 /// back.

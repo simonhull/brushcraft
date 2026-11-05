@@ -323,7 +323,9 @@ impl ProjectToOpen {
 
     /// [`ProjectToOpen::open_restoring`], with `found` the listing of recovery files. A listing
     /// that failed, or a restore that does, is said on stderr and the project opens as ever: the
-    /// user's project must open, and the recovery file is kept for another try.
+    /// user's project must open, and the recovery file is kept for another try. Files of this
+    /// project holding nothing go first, and a project restored answers for the older files behind
+    /// the one it came from ([`Project::supersede`]).
     ///
     /// # Errors
     ///
@@ -337,6 +339,7 @@ impl ProjectToOpen {
             saving::log(&format!("brushcraft: looking for recovery files: {why:#}"));
             Vec::new()
         });
+        self.sweep_empty(&found);
         let ours = found.into_iter().filter(|found| self.holds_work_of(found));
         let ours: Vec<RecoveryCandidate> = ours.collect();
         let has = |status: CandidateStatus| {
@@ -345,7 +348,22 @@ impl ProjectToOpen {
         };
         if let Some(candidate) = has(CandidateStatus::Restorable) {
             match Project::restore(candidate, self.config.clone()) {
-                Ok(project) => {
+                // A save by another instance came between the listing and the restore: the file is
+                // on an earlier save now, and is that note's to offer.
+                Ok(project) if project.path().is_none() => {
+                    if let Err(error) = project.close(true) {
+                        let why = anyhow::Error::new(error);
+                        saving::log(&format!("brushcraft: closing a restored file: {why:#}"));
+                    }
+                    let candidate = RecoveryCandidate {
+                        status: CandidateStatus::RestorableOnEarlierSave,
+                        ..candidate.clone()
+                    };
+                    let note = OpenNote::EarlierVersion { candidate };
+                    return Ok((self.open()?, Some(note)));
+                }
+                Ok(mut project) => {
+                    project.supersede(older_than(candidate, &ours));
                     let note = OpenNote::Restored {
                         path: candidate.path.clone(),
                         when: candidate.modified,
@@ -417,9 +435,49 @@ impl ProjectToOpen {
     /// file, and its project id and save points say nothing of that, so they aren't asked. A
     /// candidate with no edits would bring back nothing to tell the user of.
     fn holds_work_of(&self, candidate: &RecoveryCandidate) -> bool {
-        let extends = candidate.base_path.as_deref();
-        candidate.last_edit.is_some() && extends.is_some_and(|base| same_file(base, &self.path))
+        candidate.last_edit.is_some() && self.extended_by(candidate)
     }
+
+    /// Whether `candidate` was made on the project being opened.
+    fn extended_by(&self, candidate: &RecoveryCandidate) -> bool {
+        let extends = candidate.base_path.as_deref();
+        extends.is_some_and(|base| same_file(base, &self.path))
+    }
+
+    /// Removes this project's recovery files in `found` that hold no edits: a session that died
+    /// having drawn nothing leaves one, and nothing else ever would. None of them is in use, as a
+    /// listing skips those, and only one on the last save is sure to hold nothing to go back to. A
+    /// file that can't be removed is said on stderr and tried at the next open.
+    fn sweep_empty(&self, found: &[RecoveryCandidate]) {
+        let empty = |candidate: &&RecoveryCandidate| {
+            candidate.status == CandidateStatus::Restorable
+                && candidate.last_edit.is_none()
+                && self.extended_by(candidate)
+        };
+        let removing = found.iter().filter(empty);
+        for candidate in removing {
+            if let Err(error) = std::fs::remove_file(&candidate.path) {
+                let path = candidate.path.display();
+                saving::log(&format!("brushcraft: removing {path}: {error}"));
+            }
+        }
+    }
+}
+
+/// The files of `candidates` that `chosen`, about to be restored, stands in front of.
+///
+/// Those are other files on its save point with older edits. Op ids order edits only within a site,
+/// so a file of another site is never called older.
+fn older_than(chosen: &RecoveryCandidate, candidates: &[RecoveryCandidate]) -> Vec<PathBuf> {
+    let older = |other: &&RecoveryCandidate| {
+        let edits = other.last_edit.zip(chosen.last_edit);
+        other.status == CandidateStatus::Restorable
+            && other.base == chosen.base
+            && other.path != chosen.path
+            && edits.is_some_and(|(its, ours)| its.site() == ours.site() && its.seq() < ours.seq())
+    };
+    let files = candidates.iter().filter(older);
+    files.map(|file| file.path.clone()).collect()
 }
 
 /// Swaps `old`'s project for the one `reopen` asks for on the same `gpu`, as `setup` says.
@@ -1249,6 +1307,170 @@ mod tests {
         render.stop().expect("stopped");
         owner.close().expect("closed");
         assert!(file.exists(), "no stroke, so the way back stays");
+    }
+
+    /// A save by another instance lands between the listing and the restore.
+    ///
+    /// The file is no longer on the project's last save, so the restore gives a project that can't
+    /// save. It is treated as what it now is, and the work stays where it was found, to copy.
+    #[test]
+    fn a_restore_racing_a_save_opens_the_project_and_offers_the_work() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let stale = listed(&opening);
+        assert_eq!(stale[0].status, CandidateStatus::Restorable);
+        let mut other = opening.clone().open().expect("opened");
+        edit_by(&mut other, 0.5);
+        drop(other.save().expect("saved"));
+        other.close(false).expect("closed");
+
+        let (project, note) = opening.clone().open_with(Ok(stale)).expect("opened");
+        assert_eq!(project.path(), Some(opening.path.as_path()), "it saves");
+        assert!(!project.has_unsaved_edits(), "the last save, as it is");
+        let Some(OpenNote::EarlierVersion { candidate }) = note else {
+            panic!("the note says what was found: {note:?}");
+        };
+        assert_eq!(candidate.path, file);
+        assert!(file.exists(), "the work is kept");
+        project.close(false).expect("closed");
+
+        let copied = opening
+            .reopen(Reopen::Copy { candidate })
+            .expect("reopened");
+        assert!(copied.failed.is_none(), "{:?}", copied.failed);
+        assert!(copied.copied.is_some(), "and the offer can be taken");
+        copied.project.close(false).expect("closed");
+    }
+
+    /// Sessions that die with no edits leave files that nothing else ever removes.
+    #[test]
+    fn empty_recovery_files_do_not_pile_up() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        for _ in 0..5 {
+            let (project, _) = opening.clone().open_restoring().expect("opened");
+            project.close(true).expect("closed, as a crash leaves it");
+        }
+        let (project, _) = opening.clone().open_restoring().expect("opened");
+        project.close(false).expect("a clean close");
+        assert_eq!(left(&opening), Vec::<PathBuf>::new(), "none left behind");
+    }
+
+    /// Only files that hold nothing, and only this project's, go.
+    #[test]
+    fn the_sweep_leaves_work_and_other_projects_files() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let other = saved(&dir, "other.bcrf");
+        let work = left_work(&opening);
+        let theirs = other.open().expect("opened");
+        let empty = theirs.recovery_path().expect("protected").to_owned();
+        theirs.close(true).expect("closed, as a crash leaves it");
+
+        let (project, _) = opening.open_restoring().expect("opened");
+        close(project);
+        assert!(work.exists(), "it holds work");
+        assert!(empty.exists(), "it's another project's to sweep");
+    }
+
+    /// The sweep is a tidying: a file it can't remove opens the project all the same.
+    #[test]
+    fn a_sweep_that_fails_opens_the_project_all_the_same() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let (project, _) = opening.clone().open_restoring().expect("opened");
+        project.close(true).expect("closed, as a crash leaves it");
+        let mut found = listed(&opening);
+        found[0].path = opening.config.recovery_dir.join("gone.bcrf");
+        let opened = opening.open_with(Ok(found));
+        close(opened.expect("opened").0);
+    }
+
+    /// Don't save on the restored file mustn't bring the older one back on the next open.
+    #[test]
+    fn dont_save_is_not_undone_by_an_older_file() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let older = left_work(&opening);
+        let newer = left_work(&opening);
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert!(matches!(&note, Some(OpenNote::Restored { path, .. }) if *path == newer));
+        project.discard().expect("Don't save");
+        assert!(!older.exists(), "it goes with the work it stands behind");
+        let (again, found) = opening.open_restoring().expect("opened");
+        let unsaved = again.has_unsaved_edits();
+        close(again);
+        assert!(!unsaved, "{} came back: {found:?}", older.display());
+    }
+
+    /// The other way about: the file chosen is the older, as a listing out of order would give, and
+    /// the file with newer work must outlive Don't save.
+    #[test]
+    fn dont_save_never_takes_a_file_with_newer_work() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let first = left_work(&opening);
+        let second = left_work(&opening);
+        let mut found = listed(&opening);
+        found.reverse();
+        let chosen = found[0].path.clone();
+        let (project, _) = opening.open_with(Ok(found)).expect("opened");
+        project.discard().expect("Don't save");
+        assert!(!chosen.exists(), "the file restored goes");
+        let other = if chosen == first { &second } else { &first };
+        assert!(other.exists(), "newer work stays");
+    }
+
+    /// A file on an earlier save point isn't behind the one restored: it is other work.
+    #[test]
+    fn dont_save_leaves_work_on_an_earlier_save() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let earlier = left_on_an_earlier_save(&opening);
+        let later = left_work(&opening);
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert!(matches!(&note, Some(OpenNote::Restored { path, .. }) if *path == later));
+        project.discard().expect("Don't save");
+        assert!(earlier.exists(), "the user hasn't dropped this");
+    }
+
+    /// Only Don't save and a save end an older file: closing leaves everything to the next open.
+    #[test]
+    fn closing_leaves_an_older_file() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let older = left_work(&opening);
+        drop(left_work(&opening));
+        let (project, _) = opening.open_restoring().expect("opened");
+        close(project);
+        assert!(older.exists(), "nothing was decided");
+    }
+
+    /// A project opened without restoring has decided nothing of the files it finds.
+    #[test]
+    fn a_save_of_a_project_not_restored_leaves_the_files_found() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let mut project = opening.open().expect("opened");
+        edit_by(&mut project, 0.25);
+        drop(project.save().expect("saved"));
+        project.close(false).expect("closed");
+        assert!(file.exists(), "not ours to end");
+    }
+
+    #[test]
+    fn a_save_of_the_restored_work_covers_an_older_file() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let older = left_work(&opening);
+        drop(left_work(&opening));
+        let (mut project, _) = opening.open_restoring().expect("opened");
+        let outcome = project.save().expect("saved");
+        assert!(outcome.kept.is_empty(), "{outcome:?}");
+        assert!(!older.exists(), "it would come back as found work");
+        project.close(false).expect("closed");
     }
 
     /// A run's summary, its details aside.

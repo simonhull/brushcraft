@@ -434,6 +434,8 @@ pub struct Project {
     /// they are or the project closes, so no listing offers them while it runs (see
     /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
     held: Vec<(PathBuf, ProjectFile)>,
+    /// Recovery files older than the one restored ([`Project::supersede`]).
+    superseded: Vec<PathBuf>,
     /// The failed recovery file the store has moved off ([`Project::strand`]), still held (open
     /// and locked) while the store works on a scratch file instead. It stays the project's
     /// recovery file on disk ([`Project::recovery_path`]), at its last durable save point, until
@@ -700,6 +702,7 @@ impl Project {
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
+            superseded: Vec::new(),
             stranded: None,
             stroke: None,
             recorded: None,
@@ -748,6 +751,9 @@ impl Project {
             self.store.forget_copied_ahead();
         }
         kept.extend(switched?);
+        let superseded = std::mem::take(&mut self.superseded);
+        let unremoved = superseded.iter().filter_map(|file| retire(file).err());
+        kept.extend(unremoved);
         Ok(self.outcome(kept))
     }
 
@@ -833,6 +839,8 @@ impl Project {
         // The new project file lacks them whatever happens next, as `save` reports them.
         self.unreported.extend(saved.lost());
         kept.extend(self.switch(saved, &project, &path)?);
+        // Another project from here on: its saves say nothing of those files' work.
+        self.superseded.clear();
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
@@ -925,11 +933,21 @@ impl Project {
         self.report()
     }
 
+    /// Names `files`, recovery files this project's restored one stands in front of: the same
+    /// project on the same save point, with older edits. They go with its work:
+    /// [`Project::discard`] removes them, or the next [`Project::save`], and nothing else does,
+    /// so a close leaves them for the next open to judge. Otherwise dropping the work would
+    /// bring the older file back.
+    pub fn supersede(&mut self, files: Vec<PathBuf>) {
+        self.superseded = files;
+    }
+
     /// Closes the project, dropping what no save holds: the user's choice, which a full disk
     /// mustn't overrule. So unlike [`Project::close`], which finishes the recovery writer's flushes
     /// first and keeps the recovery file if it can't, this stops the writer where it is, with no
-    /// flush or roll-over, and removes the recovery file and any old one still held whatever state
-    /// they are in. A file already gone is what was wanted.
+    /// flush or roll-over, and removes the recovery file, any old one still held and those it
+    /// supersedes ([`Project::supersede`]), whatever state they are in. A file already gone is what
+    /// was wanted.
     ///
     /// Otherwise the file would be found at the next open, and bring back work the user dropped.
     ///
@@ -945,7 +963,9 @@ impl Project {
         self.unreported.clear();
         let held = std::mem::take(&mut self.held);
         let held = held.into_iter().map(|(path, _file)| path);
+        let superseded = std::mem::take(&mut self.superseded);
         let files = self.recovery_path.take().into_iter().chain(held);
+        let files = files.chain(superseded);
         let mut first_failure = Ok(());
         for path in files {
             let removed = retire(&path);
