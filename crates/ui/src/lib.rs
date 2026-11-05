@@ -15,7 +15,7 @@ use std::time::Instant;
 
 pub use draw::{DrawList, Fade, GlyphQuad, Layer, Rect, RoundedRect, UiFrame};
 pub use text::{AtlasImage, Line, PlacedGlyph, Text, Weight};
-pub use theme::{Colour, Theme};
+pub use theme::{Blend, Colour, Theme};
 pub use widgets::{Bar, Chip, Control, Emphasis, Mark};
 use widgets::{BarLayout, ChipLayout, View};
 
@@ -64,12 +64,12 @@ pub struct Ui<A> {
 }
 
 impl<A: Copy + PartialEq> Ui<A> {
-    /// A UI showing nothing, in a window of `size` physical pixels at `scale` of them a logical
-    /// one, with printable ASCII ready to draw.
+    /// A UI showing nothing, for a renderer that blends as `blend` says, in a window of `size`
+    /// physical pixels at `scale` of them a logical one, with printable ASCII ready to draw.
     #[must_use]
-    pub fn new(theme: Theme, size: (u32, u32), scale: f32, now: Instant) -> Self {
+    pub fn new(theme: Theme, blend: Blend, size: (u32, u32), scale: f32, now: Instant) -> Self {
         let mut ui = Self {
-            theme,
+            theme: theme.for_blend(blend),
             text: Text::new(),
             view: view(size, scale),
             bar: None,
@@ -157,16 +157,18 @@ impl<A: Copy + PartialEq> Ui<A> {
         self.aim_fades(now);
     }
 
-    /// The pen is up: bars return. Touches the fades only.
+    /// The pen is up: bars return, and the hover catches up with where the pointer went.
     pub fn pen_up(&mut self, now: Instant) {
         self.pen_is_down = false;
         self.aim_fades(now);
+        self.refresh_hover();
     }
 
-    /// The action under the point; `None` with no bar, or the pen down.
+    /// The action under the point at `now`; `None` with no bar, the pen down, or a bar still too
+    /// faint to have been seen, so a quick tap can't land on what isn't there yet.
     #[must_use]
-    pub fn hit(&self, x: f32, y: f32) -> Option<A> {
-        let shown = self.live_bar()?;
+    pub fn hit(&self, x: f32, y: f32, now: Instant) -> Option<A> {
+        let shown = self.visible_bar(now)?;
         let at = shown.layout.control_at(x, y)?;
         shown
             .widget
@@ -175,10 +177,10 @@ impl<A: Copy + PartialEq> Ui<A> {
             .map(|control| control.action)
     }
 
-    /// Whether the point is on the bar's glass at all.
+    /// Whether the point is on the bar's glass at all at `now`, by the same test as [`Ui::hit`].
     #[must_use]
-    pub fn on_bar(&self, x: f32, y: f32) -> bool {
-        self.live_bar()
+    pub fn on_bar(&self, x: f32, y: f32, now: Instant) -> bool {
+        self.visible_bar(now)
             .is_some_and(|shown| shown.layout.glass.contains(x, y))
     }
 
@@ -188,20 +190,13 @@ impl<A: Copy + PartialEq> Ui<A> {
         if self.pen_is_down {
             return false;
         }
-        let hovered = self.control_under_pointer();
-        let changed = hovered != self.hovered;
-        self.hovered = hovered;
-        self.stale |= changed;
-        changed
+        self.refresh_hover()
     }
 
     /// What to draw, rebuilding only if something changed; `None` with nothing to show.
     pub fn frame(&mut self, now: Instant) -> Option<UiFrame> {
         self.drop_what_left(now);
-        let visible = |shown: bool, fade: Fade| shown && (fade.to > 0.0 || !fade.settled(now));
-        let bar = visible(self.bar.is_some(), self.bar_fade);
-        let chip = visible(self.chip.is_some(), self.chip_fade);
-        if !bar && !chip {
+        if !self.showing(now) {
             return None;
         }
         if self.stale {
@@ -215,10 +210,18 @@ impl<A: Copy + PartialEq> Ui<A> {
         })
     }
 
-    /// Whether a fade is moving at `now`: a frame is wanted.
+    /// Whether a fade is moving at `now`.
     #[must_use]
     pub fn animating(&self, now: Instant) -> bool {
         !self.bar_fade.settled(now) || !self.chip_fade.settled(now)
+    }
+
+    /// Whether a frame is wanted at `now`: a fade is moving, or what shows has changed since the
+    /// last frame, as one bar swapped for another does with no fade. A change nothing would show,
+    /// such as a bar waiting for the pen, wants none.
+    #[must_use]
+    pub fn needs_frame(&self, now: Instant) -> bool {
+        self.animating(now) || (self.stale && self.showing(now))
     }
 
     /// Rasterises printable ASCII at every size the widgets use, at this scale.
@@ -233,10 +236,30 @@ impl<A: Copy + PartialEq> Ui<A> {
         ]);
     }
 
-    /// The bar, if the pen can reach it.
+    /// Whether anything can be seen at `now`.
+    fn showing(&self, now: Instant) -> bool {
+        let visible = |shown: bool, fade: Fade| shown && (fade.to > 0.0 || !fade.settled(now));
+        visible(self.bar.is_some(), self.bar_fade) || visible(self.chip.is_some(), self.chip_fade)
+    }
+
+    /// The bar, if it isn't going or held back by the pen.
     fn live_bar(&self) -> Option<&Shown<Bar<A>, BarLayout>> {
         let shown = self.bar.as_ref()?;
         (!shown.leaving && !self.pen_is_down).then_some(shown)
+    }
+
+    /// The bar, if it's live and at least half there at `now`.
+    fn visible_bar(&self, now: Instant) -> Option<&Shown<Bar<A>, BarLayout>> {
+        self.live_bar().filter(|_| self.bar_fade.at(now) >= 0.5)
+    }
+
+    /// Brings the hover up to date with the pointer; whether that changed what draws.
+    fn refresh_hover(&mut self) -> bool {
+        let hovered = self.control_under_pointer();
+        let changed = hovered != self.hovered;
+        self.hovered = hovered;
+        self.stale |= changed;
+        changed
     }
 
     /// The quiet control under the pointer.
@@ -319,7 +342,7 @@ mod tests {
 
     /// A UI at scale 1 in [`WINDOW`], showing nothing.
     fn new_ui(now: Instant) -> Ui<u8> {
-        Ui::new(Theme::GLASS, WINDOW, 1.0, now)
+        Ui::new(Theme::GLASS, Blend::Display, WINDOW, 1.0, now)
     }
 
     /// A control drawn quietly.
@@ -464,29 +487,38 @@ mod tests {
     #[test]
     fn a_bar_hit_gives_its_buttons_action_and_a_miss_gives_none() {
         let now = Instant::now();
+        let seen = after_a_fade(now);
         let mut ui = new_ui(now);
-        assert_eq!(ui.hit(640.0, 750.0), None, "no bar");
+        assert_eq!(ui.hit(640.0, 750.0, seen), None, "no bar");
         ui.set_bar(Some(close_bar()), now);
         let rects = control_rects(&ui);
         let with_actions = rects.into_iter().zip([1, 2, 3]);
         for (rect, action) in with_actions {
             let (x, y) = centre(rect);
-            assert_eq!(ui.hit(x, y), Some(action), "{rect:?}");
+            assert_eq!(ui.hit(x, y, seen), Some(action), "{rect:?}");
         }
-        assert_eq!(ui.hit(640.0, 100.0), None, "over the model");
+        assert_eq!(ui.hit(640.0, 100.0, seen), None, "over the model");
         let glass = glass_of(&ui);
-        assert_eq!(ui.hit(glass.x + 5.0, glass.y + 5.0), None, "the bare glass");
+        assert_eq!(
+            ui.hit(glass.x + 5.0, glass.y + 5.0, seen),
+            None,
+            "the bare glass"
+        );
     }
 
     #[test]
     fn on_bar_is_the_whole_glass_and_nothing_else() {
         let now = Instant::now();
+        let seen = after_a_fade(now);
         let mut ui = new_ui(now);
-        assert!(!ui.on_bar(640.0, 750.0), "no bar");
+        assert!(!ui.on_bar(640.0, 750.0, seen), "no bar");
         ui.set_bar(Some(close_bar()), now);
         let glass = glass_of(&ui);
-        assert!(ui.on_bar(glass.x + 5.0, glass.y + 5.0), "bare glass");
-        assert!(!ui.on_bar(glass.x - 1.0, glass.y + 5.0), "just outside");
+        assert!(ui.on_bar(glass.x + 5.0, glass.y + 5.0, seen), "bare glass");
+        assert!(
+            !ui.on_bar(glass.x - 1.0, glass.y + 5.0, seen),
+            "just outside"
+        );
     }
 
     #[test]
@@ -495,11 +527,13 @@ mod tests {
         let mut ui = new_ui(now);
         ui.set_bar(Some(close_bar()), now);
         let (x, y) = centre(control_rects(&ui)[2]);
-        ui.pen_down(now);
-        assert_eq!(ui.hit(x, y), None, "the pen is sculpting");
-        assert!(!ui.on_bar(x, y), "the bar has gone");
-        ui.pen_up(now);
-        assert_eq!(ui.hit(x, y), Some(3), "back");
+        let seen = after_a_fade(now);
+        assert_eq!(ui.hit(x, y, seen), Some(3), "there");
+        ui.pen_down(seen);
+        assert_eq!(ui.hit(x, y, seen), None, "the pen is sculpting");
+        assert!(!ui.on_bar(x, y, seen), "the bar has gone");
+        ui.pen_up(seen);
+        assert_eq!(ui.hit(x, y, after_a_fade(seen)), Some(3), "back");
     }
 
     #[test]
@@ -508,9 +542,28 @@ mod tests {
         let mut ui = new_ui(now);
         ui.set_bar(Some(close_bar()), now);
         let (x, y) = centre(control_rects(&ui)[2]);
-        ui.set_bar(None, now);
-        assert_eq!(ui.hit(x, y), None, "gone as far as the pen goes");
-        assert!(!ui.on_bar(x, y), "and its glass");
+        let seen = after_a_fade(now);
+        ui.set_bar(None, seen);
+        assert_eq!(ui.hit(x, y, seen), None, "gone as far as the pen goes");
+        assert!(!ui.on_bar(x, y, seen), "and its glass");
+    }
+
+    #[test]
+    fn a_bar_that_arrived_under_the_pen_is_not_hit_until_it_can_be_seen() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        ui.pen_down(now);
+        ui.set_bar(Some(close_bar()), now);
+        ui.pen_up(now);
+        let (x, y) = centre(control_rects(&ui)[0]);
+        assert_eq!(ui.hit(x, y, now), None, "at opacity 0");
+        assert!(!ui.on_bar(x, y, now), "nor its glass");
+
+        let faint = now + Theme::GLASS.fade / 4;
+        assert_eq!(ui.hit(x, y, faint), None, "a quarter there");
+        let half = now + Theme::GLASS.fade / 2;
+        assert_eq!(ui.hit(x, y, half), Some(1), "half there");
+        assert!(ui.on_bar(x, y, half), "and its glass");
     }
 
     #[test]
@@ -626,22 +679,148 @@ mod tests {
         let mut ui = new_ui(now);
         ui.set_bar(Some(close_bar()), now);
         let rects = control_rects(&ui);
-        let (x, y) = centre(rects[2]);
-        assert!(!ui.hover(Some((x, y))), "the filled control doesn't change");
+        assert!(!ui.hover(Some(centre(rects[2]))), "the filled control");
 
+        assert!(ui.hover(Some(centre(rects[0]))), "a quiet one does");
+        let before = ui.frame(now).expect("a bar shows");
         ui.pen_down(now);
-        let (quiet_x, quiet_y) = centre(rects[0]);
         assert!(
-            !ui.hover(Some((quiet_x, quiet_y))),
+            !ui.hover(Some(centre(rects[1]))),
             "nothing moves under a stroke"
         );
+        assert!(!ui.hover(None), "not even leaving");
+        let during = ui.frame(now).expect("fading");
+        assert!(Arc::ptr_eq(&before.list, &during.list), "no rebuild");
+    }
+
+    #[test]
+    fn the_up_catches_the_hover_up_with_the_pointer() {
+        let now = Instant::now();
+        let hover = Theme::GLASS.hover;
+        let mut ui = new_ui(now);
+        ui.set_bar(Some(close_bar()), now);
+        let rects = control_rects(&ui);
+        ui.hover(Some(centre(rects[0])));
+        ui.pen_down(now);
+        ui.hover(Some(centre(rects[1])));
+        ui.pen_up(now);
+        let frame = ui.frame(now).expect("a bar shows");
+        assert_eq!(filled_with(&frame.list, hover), [rects[1]], "where it went");
+
+        ui.pen_down(now);
+        ui.pen_up(now);
+        let same = ui.frame(now).expect("a bar shows");
+        assert!(
+            Arc::ptr_eq(&frame.list, &same.list),
+            "no change, no rebuild"
+        );
+    }
+
+    #[test]
+    fn a_new_bar_finds_the_pointer_where_it_is() {
+        let now = Instant::now();
+        let hover = Theme::GLASS.hover;
+        let mut ui = new_ui(now);
+        ui.set_bar(Some(close_bar()), now);
+        let rects = control_rects(&ui);
+        ui.hover(Some(centre(rects[1])));
+
+        let wider = Bar::new("Another", vec![quiet("Cancel out of all of this now", 1)]);
+        ui.set_bar(Some(wider), now);
+        let over = control_rects(&ui)[0];
+        assert!(
+            over.contains(centre(rects[1]).0, centre(rects[1]).1),
+            "under it"
+        );
+        let frame = ui.frame(now).expect("a bar shows");
+        assert_eq!(filled_with(&frame.list, hover), [over], "hover moved over");
+
+        ui.set_bar(Some(Bar::new("Nothing there", Vec::new())), now);
+        let bare = ui.frame(now).expect("a bar shows");
+        assert!(
+            filled_with(&bare.list, hover).is_empty(),
+            "nothing to hover"
+        );
+    }
+
+    #[test]
+    fn a_new_view_finds_the_pointer_where_it_is() {
+        let now = Instant::now();
+        let hover = Theme::GLASS.hover;
+        let mut ui = new_ui(now);
+        ui.set_bar(Some(close_bar()), now);
+        ui.hover(Some(centre(control_rects(&ui)[1])));
+        ui.set_view((1280, 400), 1.0);
+        let frame = ui.frame(now).expect("a bar shows");
+        assert!(
+            filled_with(&frame.list, hover).is_empty(),
+            "the bar moved away"
+        );
+    }
+
+    #[test]
+    fn a_swap_with_no_fade_still_wants_a_frame() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        assert!(!ui.needs_frame(now), "nothing showing");
+        ui.set_bar(Some(close_bar()), now);
+        let settled = after_a_fade(now);
+        ui.frame(settled);
+        assert!(!ui.needs_frame(settled), "nothing changed");
+
+        ui.set_bar(Some(bar_titled("Something else")), settled);
+        assert!(!ui.animating(settled), "no fade");
+        assert!(ui.needs_frame(settled), "but the list changed");
+        ui.frame(settled);
+        assert!(!ui.needs_frame(settled), "and that frame shows it");
+    }
+
+    #[test]
+    fn a_bar_waiting_for_the_pen_wants_no_frames() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        ui.pen_down(now);
+        ui.set_bar(Some(close_bar()), now);
+        assert!(ui.frame(now).is_none(), "out of sight");
+        assert!(!ui.needs_frame(now), "so none is wanted under the stroke");
+        ui.pen_up(now);
+        assert!(ui.needs_frame(now), "until the up");
+    }
+
+    #[test]
+    fn linear_blending_raises_the_glass_it_draws() {
+        let now = Instant::now();
+        let theme = Theme::GLASS;
+        let mut ui: Ui<u8> = Ui::new(theme, Blend::Linear, WINDOW, 1.0, now);
+        ui.set_chip(Some(unsaved()), now);
+        let frame = ui.frame(now).expect("a chip shows");
+        let raised = theme.for_blend(Blend::Linear).glass;
+        assert_eq!(frame.list.rects[0].fill, raised, "the theme's alpha for it");
+    }
+
+    #[test]
+    fn glyph_quads_are_whole_pixels_at_any_scale() {
+        let now = Instant::now();
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut ui = Ui::new(Theme::GLASS, Blend::Display, (1920, 1080), scale, now);
+            let bar = close_bar().with_detail("Your work is safe and still open.");
+            ui.set_bar(Some(bar.needing_you()), now);
+            ui.set_chip(Some(unsaved()), now);
+            let frame = ui.frame(now).expect("both show");
+            assert!(frame.list.glyphs.len() > 40, "text at {scale}");
+            for glyph in &frame.list.glyphs {
+                let Rect { x, y, w, h } = glyph.rect;
+                let whole = [x, y, w, h].iter().all(|side| side.fract() == 0.0);
+                assert!(whole, "{glyph:?} at {scale}");
+            }
+        }
     }
 
     #[test]
     fn a_bars_controls_are_44_logical_pixels_tall_at_any_scale() {
         let now = Instant::now();
         for scale in [1.0, 1.25, 1.1, 1.5, 2.0, 3.0] {
-            let mut ui = Ui::new(Theme::GLASS, (3840, 2160), scale, now);
+            let mut ui = Ui::new(Theme::GLASS, Blend::Display, (3840, 2160), scale, now);
             ui.set_bar(Some(close_bar()), now);
             let rects = control_rects(&ui);
             for rect in &rects {
@@ -657,7 +836,7 @@ mod tests {
     fn the_bar_sits_centred_28_up_and_the_chip_20_in() {
         let now = Instant::now();
         for scale in [1.0, 2.0] {
-            let mut ui = Ui::new(Theme::GLASS, WINDOW, scale, now);
+            let mut ui = Ui::new(Theme::GLASS, Blend::Display, WINDOW, scale, now);
             ui.set_bar(Some(close_bar()), now);
             ui.set_chip(Some(unsaved()), now);
             let frame = ui.frame(now).expect("both show");
@@ -708,13 +887,12 @@ mod tests {
         let long = Bar::new("Long ".repeat(200), vec![quiet("Cancel", 1)]);
         ui.set_bar(Some(long), now);
         let cancel = control_rects(&ui)[0];
-        let frame = ui.frame(now).expect("a bar shows");
-        let title = glyphs_in(&frame.list, Theme::GLASS.text);
-        let left_of_cancel = title.iter().filter(|glyph| glyph.rect.x < cancel.x);
-        let ends = left_of_cancel.map(|glyph| glyph.rect.x + glyph.rect.w);
-        let end = ends.fold(0.0, f32::max);
-        assert!(end > 900.0, "the room is used: {end}");
-        assert!(end <= cancel.x, "{end} against {cancel:?}");
+        let shown = ui.bar.as_ref().expect("a bar");
+        let title = &shown.layout.lines[0];
+        let end = title.x + title.line.width;
+        let room = cancel.x - Theme::GLASS.gap;
+        assert!(end <= room, "{end} against {room}");
+        assert!(end > room - 20.0, "the room is used: {end} of {room}");
     }
 
     #[test]
@@ -787,7 +965,7 @@ mod tests {
         assert!(near(frame.fades[0].at(midway), 0.5), "no jump");
         assert!(near(frame.fades[0].to, 1.0), "rising");
         let (x, y) = centre(control_rects(&ui)[2]);
-        assert_eq!(ui.hit(x, y), Some(3), "and live");
+        assert_eq!(ui.hit(x, y, after_a_fade(midway)), Some(3), "and live");
     }
 
     #[test]
@@ -827,7 +1005,7 @@ mod tests {
         let mut ui = new_ui(now);
         let saved = Chip {
             text: "Saved".to_owned(),
-            mark: Mark::None,
+            mark: Mark::Dot,
             dimmed: true,
         };
         ui.set_chip(Some(saved), now);
@@ -843,6 +1021,8 @@ mod tests {
             theme.hairline.faded(theme.saved_alpha),
             "its line"
         );
+        let dot = frame.list.rects[1];
+        assert_eq!(dot.fill, theme.accent.faded(theme.saved_alpha), "its mark");
         let text = glyphs_in(&frame.list, theme.text.faded(theme.saved_alpha));
         assert_eq!(text.len(), frame.list.glyphs.len(), "its text");
     }
@@ -858,7 +1038,15 @@ mod tests {
             plain.list.rects[0].stroke, theme.hairline,
             "a plain hairline"
         );
-        let title_x = plain.list.glyphs[0].rect.x;
+        let title = |shown: &Ui<u8>| shown.bar.as_ref().expect("a bar").layout.lines[0].x;
+        let inset = |shown: &Ui<u8>| title(shown) - glass_of(shown).x;
+        let plain_inset = inset(&ui);
+        let plain_title = title(&ui);
+        let in_the_list = |list: &DrawList, x: f32| {
+            let lefts = list.glyphs.iter().map(|glyph| glyph.rect.x);
+            lefts.fold(f32::MAX, f32::min) >= x
+        };
+        assert!(in_the_list(&plain.list, plain_title), "nothing left of it");
 
         ui.set_bar(Some(close_bar().needing_you()), now);
         let frame = ui.frame(now).expect("a bar shows");
@@ -871,7 +1059,9 @@ mod tests {
             1,
             "its mark"
         );
-        assert!(frame.list.glyphs[0].rect.x > title_x, "the text moved over");
+        let moved = inset(&ui) - plain_inset;
+        assert!(near(moved, 22.0), "the mark and its gap: {moved}");
+        assert!(in_the_list(&frame.list, title(&ui)), "the glyphs moved too");
     }
 
     #[test]
@@ -913,6 +1103,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&before.list, &after.list), "a new list");
         let glass = rects_of(&after.list, Layer::Bar)[0].rect;
         assert!(near(1600.0 - (glass.y + glass.h), 56.0), "{glass:?}");
+        let chip = rects_of(&after.list, Layer::Chip)[0].rect;
+        assert!(near(chip.y, 40.0) && near(chip.h, 64.0), "{chip:?}");
+        assert!(near(2560.0 - (chip.x + chip.w), 40.0), "{chip:?}");
 
         ui.set_bar(Some(Bar::new("Fresh words", vec![quiet("Fine", 1)])), now);
         assert_eq!(ui.text.atlas().version, version, "the atlas was ready");

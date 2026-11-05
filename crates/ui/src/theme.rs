@@ -7,6 +7,15 @@ use std::time::Duration;
 
 use crate::text::Weight;
 
+/// Where a renderer's blending happens, which decides how light glass comes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blend {
+    /// In display values, as the mockups do.
+    Display,
+    /// In linear light, on a surface with no other way: glass comes out lighter.
+    Linear,
+}
+
 /// A colour in display (sRGB-encoded) values, straight alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Colour {
@@ -60,6 +69,25 @@ impl Colour {
         )
     }
 
+    /// This over an opaque `ground`, blended as `blend` says. The result is opaque.
+    #[must_use]
+    pub fn over_in(self, ground: Self, blend: Blend) -> Self {
+        match blend {
+            Blend::Display => self.over(ground),
+            Blend::Linear => {
+                let alpha = f64::from(self.a) / 255.0;
+                let mixed = |top: u8, under: u8| {
+                    encoded(alpha * decoded(top) + (1.0 - alpha) * decoded(under))
+                };
+                Self::rgb(
+                    mixed(self.r, ground.r),
+                    mixed(self.g, ground.g),
+                    mixed(self.b, ground.b),
+                )
+            }
+        }
+    }
+
     /// WCAG relative luminance, 0 to 1. Alpha plays no part: blend with [`Colour::over`] first.
     #[must_use]
     pub fn luminance(self) -> f64 {
@@ -93,6 +121,16 @@ fn decoded(channel: u8) -> f64 {
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// A value in linear light, 0 to 1, as the nearest channel value.
+fn encoded(value: f64) -> u8 {
+    let display = if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    to_channel(display * 255.0)
 }
 
 /// Every colour, size and duration of the UI. Nothing else in the workspace hard-codes one, so a
@@ -225,6 +263,22 @@ impl Theme {
         saved_alpha: 0.6,
         glass_alpha_linear: 0.9,
     };
+
+    /// This theme for a renderer that blends as `blend` says: as it is in display values, and with
+    /// glass raised to `glass_alpha_linear` in linear light.
+    #[must_use]
+    pub fn for_blend(self, blend: Blend) -> Self {
+        match blend {
+            Blend::Display => self,
+            Blend::Linear => Self {
+                glass: Colour {
+                    a: to_channel(f64::from(self.glass_alpha_linear) * 255.0),
+                    ..self.glass
+                },
+                ..self
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +300,28 @@ mod tests {
             theme.accent_text.contrast(theme.accent) >= 4.5,
             "text on the accent"
         );
+    }
+
+    #[test]
+    fn text_on_glass_meets_contrast_in_linear_light_too() {
+        let theme = Theme::GLASS.for_blend(Blend::Linear);
+        let ground = theme.glass.over_in(BRIGHTEST_CLAY, Blend::Linear);
+        for text in [theme.text, theme.quiet_text] {
+            assert!(text.contrast(ground) >= 4.5, "{text:?} on {ground:?}");
+        }
+
+        // The bite: the same glass as it is, in linear light, falls short.
+        let plain = Theme::GLASS.glass.over_in(BRIGHTEST_CLAY, Blend::Linear);
+        assert!(theme.text.contrast(plain) < 4.5, "{plain:?}");
+    }
+
+    #[test]
+    fn only_linear_light_raises_the_glass() {
+        let theme = Theme::GLASS;
+        assert_eq!(theme.for_blend(Blend::Display), theme, "as it is");
+        let raised = theme.for_blend(Blend::Linear);
+        assert_eq!(raised.glass.a, 229, "0.9 of 255");
+        assert_eq!(raised.hairline, theme.hairline, "nothing else moves");
     }
 
     #[test]

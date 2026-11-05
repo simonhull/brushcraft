@@ -5,7 +5,9 @@
 //! share one advance, in every weight, so status text is tabular as it stands.
 
 use std::collections::HashMap;
+use std::iter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ttf_parser::{Face, GlyphId};
 
@@ -18,12 +20,24 @@ const MEDIUM: &[u8] = include_bytes!("../fonts/IBMPlexSans-Medium.ttf");
 /// The semibold face.
 const SEMI_BOLD: &[u8] = include_bytes!("../fonts/IBMPlexSans-SemiBold.ttf");
 
+/// What a line cut short ends in.
+pub(crate) const ELLIPSIS: char = '\u{2026}';
+
 /// The atlas's side to begin with.
 const ATLAS_SIZE: u32 = 1024;
 /// The side it grows to when full, enough for a 4K scale's glyphs, and no further.
 const LARGEST_ATLAS_SIZE: u32 = 2048;
 /// Shelf heights are multiples of this, so glyphs of nearly one height share a shelf.
 const SHELF_STEP: u32 = 8;
+
+/// The last atlas version handed out, by any [`Text`]: a renderer may outlive one and meet the
+/// next, and must never take a new atlas for the one it holds.
+static LAST_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// A version no atlas in this process has had.
+fn next_version() -> u64 {
+    LAST_VERSION.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// A face of the bundled font.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,17 +58,18 @@ pub struct AtlasImage {
     pub size: u32,
     /// Coverage, row by row.
     pub texels: Vec<u8>,
-    /// Goes up whenever a texel changes, so a renderer uploads only then.
+    /// Changes whenever a texel does, and is never the same in two atlases of this process, so a
+    /// renderer uploads only then, whichever [`Text`] the atlas came from.
     pub version: u64,
 }
 
 impl AtlasImage {
     /// An atlas of the first size with nothing in it.
-    fn empty(version: u64) -> Self {
+    fn empty() -> Self {
         Self {
             size: ATLAS_SIZE,
             texels: vec![0; (ATLAS_SIZE * ATLAS_SIZE) as usize],
-            version,
+            version: next_version(),
         }
     }
 
@@ -72,7 +87,7 @@ impl AtlasImage {
                 target.copy_from_slice(source);
             }
         }
-        self.version += 1;
+        self.version = next_version();
     }
 
     /// Doubles the side, what it holds staying where it is.
@@ -89,7 +104,7 @@ impl AtlasImage {
         }
         self.texels = texels;
         self.size *= 2;
-        self.version += 1;
+        self.version = next_version();
     }
 }
 
@@ -181,28 +196,28 @@ impl Text {
             medium: face(MEDIUM),
             semi_bold: face(SEMI_BOLD),
             glyphs: HashMap::new(),
-            atlas: Arc::new(AtlasImage::empty(0)),
+            atlas: Arc::new(AtlasImage::empty()),
             shelves: Vec::new(),
             shelves_end: 0,
         }
     }
 
-    /// Forgets every glyph: a new, empty atlas, with a higher version so a renderer uploads it.
+    /// Forgets every glyph: a new, empty atlas, with a new version so a renderer uploads it.
     ///
     /// Lines laid out before this point into the old atlas. Frames in flight keep that one, and
     /// anything still to be drawn must be laid out again.
     pub fn reset(&mut self) {
-        let version = self.atlas.version + 1;
-        self.atlas = Arc::new(AtlasImage::empty(version));
+        self.atlas = Arc::new(AtlasImage::empty());
         self.glyphs.clear();
         self.shelves.clear();
         self.shelves_end = 0;
     }
 
-    /// Rasterises printable ASCII for `sizes`, physical px.
+    /// Rasterises printable ASCII and the ellipsis a long line ends in for `sizes`, physical px.
     pub fn warm(&mut self, sizes: &[(Weight, f32)]) {
         for &(weight, px) in sizes {
-            for character in ' '..='~' {
+            let characters = (' '..='~').chain(iter::once(ELLIPSIS));
+            for character in characters {
                 self.place(character, weight, px);
             }
         }
@@ -471,6 +486,30 @@ mod tests {
     }
 
     #[test]
+    fn warming_covers_the_ellipsis() {
+        let mut text = Text::new();
+        text.warm(&SIZES);
+        let version = text.atlas().version;
+        for (weight, px) in SIZES {
+            text.line("\u{2026}", weight, px);
+        }
+        assert_eq!(text.atlas().version, version, "already there");
+    }
+
+    #[test]
+    fn two_texts_never_share_a_version() {
+        let (mut one, mut two) = (Text::new(), Text::new());
+        assert_ne!(one.atlas().version, two.atlas().version, "empty");
+        one.line("E", Weight::Regular, 15.0);
+        two.line("S", Weight::Regular, 15.0);
+        assert_ne!(
+            one.atlas().version,
+            two.atlas().version,
+            "with a glyph each"
+        );
+    }
+
+    #[test]
     fn a_new_character_rasterises_on_demand_and_only_once() {
         let mut text = Text::new();
         text.warm(&SIZES);
@@ -531,18 +570,22 @@ mod tests {
     fn a_full_atlas_grows_and_leaves_what_it_held_where_it_was() {
         let mut text = Text::new();
         let first = text.line("E", Weight::Regular, 40.0).glyphs[0];
-        let width = whole_size(first.size.0).unwrap();
-        let before = text.atlas().texels[..width].to_vec();
+        let held = |atlas: &AtlasImage| -> Vec<u8> {
+            let (width, height) = (
+                whole_size(first.size.0).unwrap(),
+                whole_size(first.size.1).unwrap(),
+            );
+            let rows = atlas.texels.chunks(atlas.size as usize).take(height);
+            rows.flat_map(|row| row[..width].iter().copied()).collect()
+        };
+        let before = held(text.atlas());
+        assert!(before.iter().any(|&texel| texel > 0), "it has ink");
         assert_eq!(first.atlas, (0, 0), "the first glyph in");
         assert_eq!(text.atlas().size, 1024, "the first size");
 
         text.warm(&[(Weight::Regular, 200.0)]);
         assert_eq!(text.atlas().size, 2048, "too much for 1024 square");
-        assert_eq!(
-            text.atlas().texels[..width],
-            before[..],
-            "its top row is where it was"
-        );
+        assert_eq!(held(text.atlas()), before, "every texel is where it was");
         let again = text.line("E", Weight::Regular, 40.0).glyphs[0];
         assert_eq!(again.atlas, first.atlas, "and the cache still points at it");
     }
@@ -555,8 +598,9 @@ mod tests {
         assert_eq!(in_flight.size, 2048, "grown");
 
         text.reset();
-        assert!(
-            text.atlas().version > in_flight.version,
+        assert_ne!(
+            text.atlas().version,
+            in_flight.version,
             "a renderer uploads it"
         );
         assert_eq!(text.atlas().size, 1024, "the first size again");

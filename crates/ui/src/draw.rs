@@ -39,7 +39,7 @@ impl Rect {
     }
 }
 
-/// A rounded rectangle with an optional hairline, which lies inside its edge.
+/// A rounded rectangle with an optional hairline, which lies inside its edge, over its fill.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RoundedRect {
     /// Where it goes.
@@ -76,6 +76,14 @@ pub struct DrawList {
     pub rects: Vec<RoundedRect>,
     /// The glyphs, over every rectangle.
     pub glyphs: Vec<GlyphQuad>,
+}
+
+impl DrawList {
+    /// Whether there is nothing to draw.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rects.is_empty() && self.glyphs.is_empty()
+    }
 }
 
 /// An opacity moving from `from` to `to` over `length` from `start`, linearly.

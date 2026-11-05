@@ -6,7 +6,10 @@
 use ttf_parser::OutlineBuilder;
 
 /// The most a flattened curve may stray from the true one, in pixels.
-const TOLERANCE: f32 = 0.25;
+///
+/// Pieces cut inside a curve, so a loose tolerance thins everything round, and a small dot the
+/// most. Each glyph rasterises once, so being fine costs next to nothing.
+const TOLERANCE: f32 = 1.0 / 256.0;
 
 /// A size as a coordinate.
 pub(crate) fn coordinate(size: usize) -> f32 {
@@ -32,7 +35,7 @@ fn index(coordinate: f32) -> usize {
 /// How many straight pieces keep a curve within [`TOLERANCE`], given how far it bends: `bend` is
 /// the largest second difference of its control points, weighted for the curve's degree.
 fn pieces(bend: f32) -> usize {
-    index((bend / TOLERANCE).sqrt().ceil().clamp(1.0, 64.0))
+    index((bend / TOLERANCE).sqrt().ceil().clamp(1.0, 256.0))
 }
 
 /// How far three control points are from lying evenly on a line.
@@ -347,10 +350,10 @@ mod tests {
     /// A curve cut too coarsely loses area.
     ///
     /// The area between a quadratic and its chord is 2/3 of the triangle its control points make,
-    /// here half of 16 x 16. Straying a quarter pixel along a curve 26 px long loses at most
-    /// 2/3 x 0.25 x 26, about 4.3 px, and pieces cut inside the curve, so never gain any.
+    /// here half of 16 x 16. Straying 1/256 px along a curve 26 px long loses at most
+    /// 2/3 x 26 / 256, about 0.07 px, and pieces cut inside the curve, so never gain any.
     #[test]
-    fn a_quadratic_is_flat_only_to_a_quarter_pixel() {
+    fn a_quadratic_loses_only_what_the_tolerance_allows() {
         let mut raster = Raster::placed(16, 16, 1.0, (0.0, 16.0));
         raster.move_to(0.0, 0.0);
         raster.quad_to(16.0, 0.0, 16.0, 16.0);
@@ -358,14 +361,34 @@ mod tests {
         let exact = 2.0 / 3.0 * 128.0;
         let found = area(&raster.finish());
         assert!(
-            found <= exact && exact - found < 4.3,
+            found <= exact + 0.1 && exact - found < 0.1,
+            "{found} against {exact}"
+        );
+    }
+
+    /// A dot 3 px across, as a full stop is at small sizes: four cubics of the usual circle.
+    #[test]
+    fn a_small_round_dot_keeps_its_area() {
+        let radius = 1.5;
+        let handle = radius * 0.552_284_8;
+        let mut raster = Raster::placed(4, 4, 1.0, (2.0, 2.0));
+        raster.move_to(radius, 0.0);
+        raster.curve_to(radius, handle, handle, radius, 0.0, radius);
+        raster.curve_to(-handle, radius, -radius, handle, -radius, 0.0);
+        raster.curve_to(-radius, -handle, -handle, -radius, 0.0, -radius);
+        raster.curve_to(handle, -radius, radius, -handle, radius, 0.0);
+        raster.close();
+        let exact = std::f32::consts::PI * radius * radius;
+        let found = area(&raster.finish());
+        assert!(
+            (found - exact).abs() / exact < 0.01,
             "{found} against {exact}"
         );
     }
 
     /// That quadratic as a cubic, which must fill what it fills.
     #[test]
-    fn a_cubic_is_flat_only_to_a_quarter_pixel() {
+    fn a_cubic_loses_only_what_the_tolerance_allows() {
         let mut raster = Raster::placed(16, 16, 1.0, (0.0, 16.0));
         let third = 16.0 * 2.0 / 3.0;
         raster.move_to(0.0, 0.0);
@@ -374,7 +397,7 @@ mod tests {
         let exact = 2.0 / 3.0 * 128.0;
         let found = area(&raster.finish());
         assert!(
-            found <= exact && exact - found < 4.3,
+            found <= exact + 0.1 && exact - found < 0.1,
             "{found} against {exact}"
         );
     }

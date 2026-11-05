@@ -5,7 +5,7 @@
 //! widget or the window changes, never on the pen's path.
 
 use crate::draw::{DrawList, GlyphQuad, Layer, Rect, RoundedRect};
-use crate::text::{Line, Text, Weight};
+use crate::text::{ELLIPSIS, Line, Text, Weight};
 use crate::theme::{Colour, Theme};
 
 /// How a control draws.
@@ -137,11 +137,11 @@ impl View {
 
 /// A line of text placed in the window.
 #[derive(Debug, Clone, PartialEq)]
-struct PlacedLine {
+pub(crate) struct PlacedLine {
     /// The line.
-    line: Line,
+    pub(crate) line: Line,
     /// Its origin's x, a whole pixel.
-    x: f32,
+    pub(crate) x: f32,
     /// Its baseline's y, a whole pixel.
     baseline: f32,
     /// Its colour.
@@ -175,7 +175,7 @@ fn fitted(text: &mut Text, string: &str, weight: Weight, px: f32, room: f32) -> 
     }
     let shortened = |end: usize| {
         let kept = string.get(..end).unwrap_or_default();
-        format!("{}\u{2026}", kept.trim_end())
+        format!("{}{ELLIPSIS}", kept.trim_end())
     };
     let ends: Vec<usize> = string.char_indices().map(|(end, _)| end).collect();
     let fitting = ends.partition_point(|&end| text.line(&shortened(end), weight, px).width <= room);
@@ -391,7 +391,7 @@ pub(crate) struct BarLayout {
     /// Its controls, left to right.
     pub(crate) controls: Vec<ControlLayout>,
     /// Its title, and its detail if it has one.
-    lines: Vec<PlacedLine>,
+    pub(crate) lines: Vec<PlacedLine>,
     /// Its needs-you mark, if it has one.
     mark: Option<Rect>,
     /// Its progress line, if it has one.
