@@ -334,6 +334,9 @@ mod tests {
         let child = Command::new(env!("CARGO_BIN_EXE_brushcraft"))
             .arg(project)
             .args(["--offscreen", "--script", "--script-path", "strokes"])
+            // The path keeps to the clock: at a quarter of its speed each segment has frames on a
+            // slow machine too, where a software adapter draws a few a second.
+            .args(["--script-speed", "0.25"])
             .args(["--no-gpu-timing", "--record"])
             .arg(record)
             .args(SMALL_RUN)
