@@ -1,6 +1,6 @@
 # BrushCraft
 
-Rust digital sculpting app. **Specs, roadmap and research are in `~/Code/brushcraft-docs`.** Read
+Rust digital sculpting app. **Specs, roadmap and research are in `~/Code/docs/brushcraft`.** Read
 `STATUS.md` there first, then the spec for the current milestone (`specs/`). The code follows the specs;
 if they disagree, raise it rather than drifting silently.
 

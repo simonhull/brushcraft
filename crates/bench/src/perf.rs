@@ -451,7 +451,7 @@ fn history_file(dir: &Path, machine: &Machine) -> Result<PathBuf> {
     ensure!(
         parent.is_dir(),
         "{} doesn't exist: check --history (scripts/perf.sh sets it from BRUSHCRAFT_DOCS, \
-         default ~/Code/brushcraft-docs)",
+         default ~/Code/docs/brushcraft)",
         parent.display()
     );
     // The parent exists, so this makes at most `dir` itself.
