@@ -2305,7 +2305,9 @@ fn a_save_that_ends_between_frames_still_says_saved() {
         if owner.save_stage().is_none() {
             break;
         }
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         owner.upkeep(Instant::now()).expect("upkeep");
     }
     assert_eq!(owner.save_stage(), None, "saved, and no frame saw it");
@@ -4680,7 +4682,9 @@ fn a_lost_up_under_finishing_has_a_way_out() {
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     std::thread::sleep(STROKE_QUIET);
     for _ in 0..10 {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         run(&mut owner, 1);
     }
     assert_eq!(owner.save_stage(), Some(Stage::PenDown), "it can't go on");
@@ -5043,7 +5047,9 @@ fn a_project_with_no_path_is_not_stranded() {
     run(&mut owner, 10_000);
     assert!(owner.key(UiKey::Enter, Instant::now()), "the bar's Save");
     for _ in 0..1000 {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if owner.save_stage().is_none() {
             break;
         }
@@ -5245,7 +5251,9 @@ fn a_save_puts_the_restored_note_away() {
         if owner.save_stage().is_none() {
             break;
         }
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         owner.upkeep(Instant::now()).expect("upkeep");
     }
     assert!(!owner.unsaved(), "saved");
@@ -5348,7 +5356,9 @@ fn a_save_that_goes_through_removes_a_kept_recovery_file() {
         if owner.save_stage().is_none() {
             break;
         }
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         owner.upkeep(Instant::now()).expect("upkeep");
     }
     assert!(!owner.unsaved(), "saved");

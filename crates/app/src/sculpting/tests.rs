@@ -1451,7 +1451,9 @@ fn paused_protection_at_a_stroke_end_fails_no_save() {
     owner.request_save(Instant::now());
     let mut waits = 0;
     while owner.save_stage() == Some(crate::saving::Stage::PenDown) {
-        owner.save_step();
+        if owner.save_step() == crate::saving::SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         run(&mut owner, 1);
         waits += 1;
         assert!(waits < 1_000, "the pen lifts");
@@ -1460,7 +1462,9 @@ fn paused_protection_at_a_stroke_end_fails_no_save() {
     std::thread::sleep(Duration::from_millis(1200));
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == crate::saving::SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         steps += 1;
         assert!(steps < 100_000, "the save ends");
     }

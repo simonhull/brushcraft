@@ -30,6 +30,19 @@ fn slow_owner(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
     )
 }
 
+/// Runs a close to its end as the window's passes do, however long the disk takes: a flush's sync
+/// can outlast any count of passes that don't wait for it, so the limit is one of time.
+fn close_out(owner: &mut Owner<Sculpting, NoUploads>) {
+    let began = Instant::now();
+    while !owner.ready_to_close() {
+        owner.close_step().expect("a step");
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "it ends");
+    }
+}
+
 /// Runs the save under way as the window's passes do, a step and then a frame, until it ends.
 fn finish_save(owner: &mut Owner<Sculpting, NoUploads>) {
     let mut passes = 0;
@@ -177,7 +190,9 @@ fn a_save_is_answered_at_once_and_lands_a_batch_a_step() {
     let mut said = Vec::new();
     while owner.save_stage() == Some(Stage::Landing) {
         let before = owner.landing();
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         run(&mut owner, 1);
         assert!(
             before.saturating_sub(owner.landing()) <= 2,
@@ -338,7 +353,9 @@ fn a_stroke_about_to_begin_at_ctrl_s_is_in_the_save() {
     owner.request_save(Instant::now());
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         steps += 1;
         assert!(steps < 100_000, "it ends");
     }
@@ -431,7 +448,9 @@ fn a_store_error_while_landing_fails_the_save() {
     // No frames between the steps, as a close's test: they would let the pins go.
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         steps += 1;
         assert!(steps < 10_000, "the save ends");
     }
@@ -530,13 +549,7 @@ fn a_close_during_a_save_waits_for_it_and_it_holds_every_stroke() {
     assert!(!owner.brush().deferred.is_empty(), "the second waits");
     owner.request_close().expect("a close");
     assert!(!owner.ready_to_close(), "the save goes first");
-    let mut steps = 0;
-    while !owner.ready_to_close() {
-        owner.close_step().expect("a step");
-        owner.save_step();
-        steps += 1;
-        assert!(steps < 100_000, "it ends");
-    }
+    close_out(&mut owner);
     assert_eq!(owner.save_stage(), None, "saved");
     owner.close().expect("closed");
     assert_eq!(records_on_disk(&dir), 2, "both strokes");
@@ -564,13 +577,7 @@ fn a_close_as_a_save_writes_saves_a_waiting_stroke_whole() {
         run(&mut owner, 1);
         assert!(!owner.brush().deferred.is_empty(), "it waits");
         owner.request_close().expect("a close");
-        let mut passes = 0;
-        while !owner.ready_to_close() {
-            owner.close_step().expect("a step");
-            owner.save_step();
-            passes += 1;
-            assert!(passes < 100_000, "it ends");
-        }
+        close_out(&mut owner);
         owner.close().expect("closed");
         assert_eq!(records_on_disk(&dir), 2, "{steps}: both strokes, whole");
         assert_eq!(recovery_files(&dir), 0, "{steps}: nothing unsaved");
@@ -714,7 +721,9 @@ fn a_save_needs_no_frames() {
     owner.request_save(Instant::now());
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         steps += 1;
         assert!(steps < 100_000, "it ends");
     }
@@ -727,7 +736,9 @@ fn a_save_needs_no_frames() {
 /// for the test to take.
 fn finish_closing_save(owner: &mut Owner<Sculpting, NoUploads>) {
     finish_save(owner);
-    owner.save_step();
+    if owner.save_step() == SaveStep::Waiting {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// A failed save is the window's to survive: with `exit_after_save` set it stays, the edits and the
@@ -777,11 +788,15 @@ fn a_save_after_asking_with_dabs_dropped_keeps_the_window() {
     // No frames between the steps, as a close's test: they would let the pins go.
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         steps += 1;
         assert!(steps < 10_000, "the save ends");
     }
-    owner.save_step();
+    if owner.save_step() == SaveStep::Waiting {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(owner.take_request(), None, "not saved: the window stays");
     let title = owner.title_change().expect("it says so");
     assert!(title.contains("save failed"), "{title}");
@@ -947,7 +962,9 @@ fn discard_during_a_save_leaves_what_the_project_file_holds() {
     let (tiles, points, before) = (tiles_on_disk(&dir), save_points(&dir), length());
     owner.request_save(Instant::now());
     while owner.save_stage() != Some(Stage::Writing) {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     let mut steps = 0;
     loop {
@@ -1086,12 +1103,16 @@ fn dabs_dropped_under_the_bar_stop_the_exit() {
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     let mut steps = 0;
     while owner.save_stage().is_some() {
-        owner.save_step();
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         run(&mut owner, 1);
         steps += 1;
         assert!(steps < 100_000, "the save ends");
     }
-    owner.save_step();
+    if owner.save_step() == SaveStep::Waiting {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
         owner.take_request(),
         None,
