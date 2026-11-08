@@ -101,6 +101,7 @@ use thiserror::Error;
 use crate::OpId;
 use crate::file::{FileError, PRIVATE_MODE, ProjectFile, SHARED_MODE, sync_parent};
 use crate::index::{IndexError, LoadStats, SpatialIndex};
+use crate::journal::{DAB_BYTES, JournalError};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::stroke_record::StrokeRecord;
@@ -241,6 +242,14 @@ pub enum ProjectError {
     /// stroke ended then, and its record is kept once. Nothing was recorded again.
     #[error("the stroke of op {0:?} has its record already")]
     AlreadyRecorded(OpId),
+    /// [`Project::journal`] or [`Project::journal_landed`] with no stroke open: there is no
+    /// journal to add to. Nothing changed.
+    #[error("no stroke is open to journal dabs for")]
+    NoStroke,
+    /// The open stroke's journal refused what it was given: a landed count that goes back or
+    /// passes the dabs placed, or dabs past the last index a stroke counts. Nothing changed.
+    #[error("the stroke's dab journal refused it")]
+    Journal(#[from] JournalError),
 }
 
 /// Takes what `writer` left out: the tiles gone into `lost`, those only late into `left_out`.
@@ -1117,6 +1126,7 @@ impl Project {
         self.recorded = Some(op);
         self.stroke = None;
         self.store.release_pen_down();
+        self.store.end_journal();
         self.end_stroke_at(Instant::now())
     }
 
@@ -1130,7 +1140,40 @@ impl Project {
     pub fn end_unrecorded_stroke(&mut self) -> Result<(), ProjectError> {
         self.stroke = None;
         self.store.release_pen_down();
+        self.store.end_journal();
         self.end_stroke_at(Instant::now())
+    }
+
+    /// Dabs the open stroke placed, the next in placement order (symmetry copies included), as
+    /// opaque rows, each a `stroke::Dab`'s bytes: kept for the next flush to journal into the
+    /// recovery file, with the count landed at its cut (see [`crate::DabBatch`]).
+    ///
+    /// The cost here is pushing the rows; the flush copies those not yet written on this thread
+    /// at its snapshot, and encodes them on the writer thread. The rows stay in memory until
+    /// [`Project::journal_landed`] passes them: the landing's backlog.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NoStroke`] if no stroke is open; [`ProjectError::Journal`] with
+    /// [`JournalError::PastLastIndex`] if the stroke's dabs would run past the last index a `u32`
+    /// counts. Nothing is kept then.
+    pub fn journal(&mut self, placed: &[[u8; DAB_BYTES]]) -> Result<(), ProjectError> {
+        let op = self.stroke.ok_or(ProjectError::NoStroke)?;
+        Ok(self.store.journal(op, placed)?)
+    }
+
+    /// How many of the open stroke's dabs have landed: called as their edits are made, before
+    /// the next tick, so a flush's cut always pairs the store's tiles with the count that made
+    /// them. A dab landed and not yet written is never written.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NoStroke`] if no stroke is open; [`ProjectError::Journal`] with
+    /// [`JournalError::LandedBack`] for a count below the last, or
+    /// [`JournalError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
+    pub fn journal_landed(&mut self, landed: u32) -> Result<(), ProjectError> {
+        let op = self.stroke.ok_or(ProjectError::NoStroke)?;
+        Ok(self.store.journal_landed(op, landed)?)
     }
 
     /// [`Project::end_stroke`] at `now`.

@@ -143,6 +143,7 @@ mod evaluate;
 mod frames;
 #[cfg(test)]
 mod hooks;
+mod journal;
 mod layers;
 mod page;
 mod pen_down;
@@ -163,6 +164,7 @@ pub use config::{Evaluation, StoreConfig};
 pub use edit::TileEdit;
 pub use error::{CacheError, Invariant};
 pub use frames::{ParentSlots, Predictor};
+pub(crate) use journal::JournalCut;
 pub(crate) use layers::{Saved, Snapshot};
 pub use pen_down::{MadePenDown, PenDownMaker, PenDownShape, PenDownTaker, TakenShape};
 pub use pins::PinGuard;
@@ -529,6 +531,9 @@ pub struct TileStore {
     /// Stroke records framed at their strokes' ends, waiting for the next flush (or save) to
     /// append them (see [`TileStore::record_stroke`]).
     strokes_waiting: Vec<Vec<u8>>,
+    /// The open stroke's dab journal, and those of strokes ended with their last batch still to
+    /// write (see the `journal` module).
+    journals: journal::Journals,
     /// What the tests read and set: the log of what was computed, and the faults they inject.
     #[cfg(test)]
     hooks: TestHooks,

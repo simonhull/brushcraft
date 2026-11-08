@@ -58,13 +58,6 @@ pub(super) fn batch_locs(heads: &[(u64, Head)]) -> impl Iterator<Item = Loc> + '
 ///
 /// [`FileError::Io`] if compressing fails; [`FileError::TooLarge`] never, for a batch within its
 /// limits.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the recovery flush writes batches with the journal's next step; tests do now"
-    )
-)]
 pub(crate) fn frame_batch(batch: &DabBatch) -> Result<Vec<u8>, FileError> {
     frame(KIND_JOURNAL, &batch.encode()?).ok_or(FileError::TooLarge)
 }
@@ -80,13 +73,6 @@ impl ProjectFile {
     /// # Errors
     ///
     /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the recovery flush writes batches with the journal's next step; tests do now"
-        )
-    )]
     pub(crate) fn append_batches(&mut self, framed: &[Vec<u8>]) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
             return Err(FileError::ReadOnly);
@@ -110,13 +96,6 @@ impl ProjectFile {
 
     /// Records that a batch was appended at `loc`: the next save point holds it, and a sync
     /// before that save point must cover it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the recovery flush writes batches with the journal's next step; tests do now"
-        )
-    )]
     fn note_batch(&mut self, loc: Loc) {
         if let Some(cut) = &mut self.cut {
             cut.named_end = cut.named_end.max(loc.offset + loc.len);

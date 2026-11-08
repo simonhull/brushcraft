@@ -231,6 +231,10 @@ pub enum Invariant {
         /// Values the buffer held.
         got: usize,
     },
+    /// The open stroke's journal cut a dab batch that [`crate::DabBatch::new`] refused, though
+    /// the journal holds its counts to what a batch takes.
+    #[error("the journal cut a dab batch it can't make")]
+    Journal(#[source] crate::JournalError),
     /// A full save point would have named a different number of records than the maps derived
     /// for it hold (see [`FileError::SavePointMismatch`]). Nothing was written.
     #[error("a full save point names {named} records, but its derived maps hold {derived}")]

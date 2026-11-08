@@ -49,11 +49,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::fixture::{display_layer, record, tight};
+use crate::fixture::{dab_at, display_layer, record, tight};
 use crate::index::SpatialIndex;
 use crate::index::tests::assert_loads_as_built;
+use crate::journal::{DAB_BYTES, DabBatch};
 use crate::stroke_record::tests::wobbly;
-use crate::{OpId, StrokeRecord};
+use crate::{FLUSH_INTERVAL, OpId, StrokeRecord};
 
 /// The level the child indexes: the tests' finest.
 fn top() -> Level {
@@ -408,9 +409,11 @@ fn crash_child() {
     wait_for_the_kill();
 }
 
-/// Asserts that the process `pid`, a killed child, left no test directory of its own: it works
-/// in the parent's, as a killed process runs no drops and anything of its own would stay behind.
-fn assert_no_directory_of(pid: u32, scenario: Scenario) {
+/// Asserts that the process `pid`, a killed child, left no test directory of its own.
+///
+/// It works in the parent's, as a killed process runs no drops and anything of its own would
+/// stay behind. `what` names the case.
+fn assert_no_directory_of(pid: u32, what: &str) {
     let own = format!("brushcraft-store-{pid}-");
     let left: Vec<String> = fs::read_dir(std::env::temp_dir())
         .unwrap()
@@ -420,18 +423,26 @@ fn assert_no_directory_of(pid: u32, scenario: Scenario) {
     assert_eq!(
         left,
         Vec::<String>::new(),
-        "{scenario:?}: the child left directories"
+        "{what}: the child left directories"
     );
 }
 
-/// Runs `scenario` in a child process up to where it is to crash, kills it there with
-/// `SIGKILL`, then restores what it left and checks it.
-fn crash(scenario: Scenario) {
-    let dir = TestDir::new();
+/// Runs a child test until it prints [`READY`], then kills it `delay` later.
+///
+/// The child is `child_test`, by its full path, in a process of its own working in `dir`, with
+/// `scenario` in `variable`. It is killed with `SIGKILL`, and the call checks that it died of it
+/// and left nothing of its own. `what` names the case.
+fn run_and_kill(
+    child_test: &str,
+    (variable, scenario): (&str, &str),
+    dir: &TestDir,
+    delay: Duration,
+    what: &str,
+) {
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+        .args([child_test, "--exact", "--ignored", "--nocapture"])
         .args(["--test-threads", "1"])
-        .env(SCENARIO, scenario.to_string())
+        .env(variable, scenario)
         .env(DIR, dir.path(""))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -462,19 +473,34 @@ fn crash(scenario: Scenario) {
         text
     });
     let got_there = ready_seen.recv_timeout(CHILD_TIMEOUT);
+    if got_there.is_ok() {
+        std::thread::sleep(delay);
+    }
     child.kill().unwrap();
     let status = child.wait().unwrap();
-    assert_no_directory_of(child.id(), scenario);
+    assert_no_directory_of(child.id(), what);
     let output = format!("{}\n{}", out.join().unwrap(), err.join().unwrap());
     assert!(
         got_there.is_ok(),
-        "{scenario:?}: the child never got where it was to crash ({status}); its output:\n\
-         {output}"
+        "{what}: the child never got where it was to crash ({status}); its output:\n{output}"
     );
     assert_eq!(
         status.signal(),
         Some(SIGKILL),
-        "{scenario:?}: the child is killed ({status}); its output:\n{output}"
+        "{what}: the child is killed ({status}); its output:\n{output}"
+    );
+}
+
+/// Runs `scenario` in a child process up to where it is to crash, kills it there with
+/// `SIGKILL`, then restores what it left and checks it.
+fn crash(scenario: Scenario) {
+    let dir = TestDir::new();
+    run_and_kill(
+        CHILD_TEST,
+        (SCENARIO, &scenario.to_string()),
+        &dir,
+        Duration::ZERO,
+        &format!("{scenario:?}"),
     );
     let mut listed = find_recoveries(&dir.path("recovery")).unwrap();
     assert_eq!(
@@ -649,5 +675,151 @@ fn a_crash_after_display_records_written_through_restores_a_current_layer() {
             tight: false,
             through: true,
         });
+    }
+}
+
+/// The variable that makes the test binary the journal crash test's child; its value is unread.
+const JOURNAL: &str = "BRUSHCRAFT_CRASH_JOURNAL";
+
+/// The journal crash test's child, by its full path.
+const JOURNAL_CHILD_TEST: &str = "project::tests::crash::journal_child";
+
+/// The dabs the journal child places a step.
+const PLACE_EACH: u32 = 8;
+
+/// The most dabs the journal child places: once there, it waits for the kill.
+const JOURNAL_DABS: u32 = 400_000;
+
+/// The seed of the journal child's edits, those of its first step; each step's is the next.
+const JOURNAL_SEED: u64 = 4_000;
+
+/// The edits standing for the work of the journal child's dabs of step `step`, one a dab.
+fn step_edits(mesh: &BaseMesh, step: u32) -> Vec<crate::fixture::Edit> {
+    random_edits(mesh, TOP, PLACE_EACH, JOURNAL_SEED + u64::from(step))
+}
+
+/// How many dabs the journal child has landed once it has placed `placed`: a backlog of five to
+/// eleven dabs, varying with the step, never going back.
+fn landed_by(placed: u32, before: u32) -> u32 {
+    let backlog = 5 + (placed / PLACE_EACH) % 7;
+    placed.saturating_sub(backlog).max(before)
+}
+
+/// The journal crash test's child: one long stroke, journalled and landed until it is killed.
+///
+/// Each step journals [`PLACE_EACH`] dabs and lands dabs some steps behind, as edits, then ticks
+/// a clock that runs a flush interval a step, so every tick is due. It prints [`READY`] once a
+/// flush is durable and goes on, until it has placed [`JOURNAL_DABS`]; then it waits for the
+/// kill. Does nothing unless [`JOURNAL`] is set.
+#[test]
+#[ignore = "the journal crash test's child: the test runs it in a process of its own"]
+fn journal_child() {
+    let (Some(_), Some(dir)) = (std::env::var_os(JOURNAL), std::env::var_os(DIR)) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let config = ProjectConfig {
+        store: roomy(),
+        recovery_dir: dir.join("recovery"),
+    };
+    let mut project = Project::new((*mesh()).clone(), config).unwrap();
+    let mesh = project.store().working().mesh();
+    project.begin_stroke().unwrap();
+    let start = Instant::now();
+    let mut ready = false;
+    let (mut placed, mut landed) = (0, 0);
+    let mut edits = Vec::new();
+    for step in 0..JOURNAL_DABS / PLACE_EACH {
+        let dabs: Vec<[u8; DAB_BYTES]> = (placed..placed + PLACE_EACH).map(dab_at).collect();
+        project.journal(&dabs).unwrap();
+        placed += PLACE_EACH;
+        edits.extend(step_edits(&mesh, step));
+        let target = landed_by(placed, landed);
+        apply_dabs(
+            project.store(),
+            &mut CorrectionMap::new(),
+            &edits[landed as usize..target as usize],
+        );
+        project.journal_landed(target).unwrap();
+        landed = target;
+        project.tick(start + FLUSH_INTERVAL * (step + 1)).unwrap();
+        if !ready && project.writer.as_ref().unwrap().flushes() > 0 {
+            ready = true;
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{READY}").unwrap();
+            stdout.flush().unwrap();
+        }
+    }
+    wait_for_the_kill();
+}
+
+/// A delay up to `max`, from the clock's nanoseconds: a different moment every run.
+fn random_delay(max: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    max.mul_f64(f64::from(nanos) / 1e9)
+}
+
+#[test]
+fn a_kill_keeps_every_dab_journalled_by_the_last_save_point() {
+    for run in 0..3 {
+        let dir = TestDir::new();
+        let delay = random_delay(Duration::from_secs(1));
+        let what = format!("run {run}, killed {delay:?} after its first save point");
+        run_and_kill(JOURNAL_CHILD_TEST, (JOURNAL, "1"), &dir, delay, &what);
+        let candidate = find_recoveries(&dir.path("recovery"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(candidate.status, CandidateStatus::NeverSaved, "{what}");
+        let mut project = Project::restore(&candidate, config(&dir)).unwrap();
+        let batches: Vec<DabBatch> = project
+            .store()
+            .working()
+            .batches()
+            .map(Result::unwrap)
+            .collect();
+        let (first, last) = (batches.first().unwrap(), batches.last().unwrap());
+        assert_eq!(
+            first.first(),
+            first.landed(),
+            "{what}: from its landed count"
+        );
+        for pair in batches.windows(2) {
+            let (before, after) = (&pair[0], &pair[1]);
+            assert_eq!(after.op(), first.op(), "{what}: one stroke");
+            assert!(
+                after.landed() >= before.landed(),
+                "{what}: dabs never unland"
+            );
+            assert_eq!(
+                after.first(),
+                before.placed().max(after.landed()),
+                "{what}: no gap or overlap among the dabs not landed"
+            );
+        }
+        for batch in &batches {
+            let expected: Vec<[u8; DAB_BYTES]> =
+                (batch.first()..batch.placed()).map(dab_at).collect();
+            assert_eq!(batch.dabs(), expected, "{what}: the dabs as placed");
+        }
+        // The tiles the last save point names are those of exactly the dabs its last batch
+        // counts landed.
+        let mesh = mesh();
+        let mut map = CorrectionMap::new();
+        let steps = last.landed().div_ceil(PLACE_EACH);
+        let edits: Vec<crate::fixture::Edit> = (0..steps)
+            .flat_map(|step| step_edits(&mesh, step))
+            .collect();
+        record(&mesh, &mut map, &edits[..last.landed() as usize]);
+        assert_positions(
+            project.store(),
+            &dense(&mesh, &map),
+            &tiles(&mesh, 1, TOP),
+            &what,
+        );
+        project.close(false).unwrap();
     }
 }

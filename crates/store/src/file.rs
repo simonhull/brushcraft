@@ -65,6 +65,7 @@ pub use error::FileError;
 #[cfg(any(feature = "fuzzing", test))]
 pub(crate) use format::HEADER_LEN;
 pub use format::{MAX_MESH_RAW, MAX_RAW};
+pub(crate) use journal_io::frame_batch;
 pub(crate) use lock::open_regular;
 pub(crate) use reader::{FileReader, FileSyncer, FramedTile, ReadScratch, frame_displacement};
 pub(crate) use stroke_io::frame_stroke;

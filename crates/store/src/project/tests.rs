@@ -8,6 +8,7 @@ mod base;
 mod bounds;
 mod crash;
 mod hostile;
+mod journal;
 mod restore;
 mod strokes;
 

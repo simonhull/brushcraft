@@ -14,17 +14,27 @@
 //!    the bounds an index computes with no edit pending stay out, see [`crate::bounds`]), so the
 //!    save point names the bounds of the state the snapshot copies. The records of the strokes
 //!    ended by then go in with the same write's neighbour ([`TileStore::flush_strokes`]), so the
-//!    save point that holds a stroke's last edits holds its record. This is all a stroke end costs
-//!    the drawing thread, and it grows with the edits since the last flush.
+//!    save point that holds a stroke's last edits holds its record. The open stroke's dab journal
+//!    is cut at the same moment ([`TileStore::cut_journal`]): a [`crate::DabBatch`] of the dabs
+//!    placed and not yet written or landed, with the count landed as of the snapshot, so the count
+//!    describes exactly the tiles the snapshot copies (see `crate::tiles::journal`). This is all a
+//!    stroke end costs the drawing thread, and it grows with the edits since the last flush: a slot
+//!    copy per tile, and a copy of the dabs placed since (84 bytes each).
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
-//!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
-//!    changed are appended as unknown, at the cut, whatever its slot holds now. If its live slot is
-//!    broken too, the tile is lost in the store, as a save loses one; a valid slot means the
-//!    failure was transient, and it stays dirty, for the next flush to try again.
+//!    records come back, with the journal's batches framed after them. A copy that doesn't encode
+//!    is left out, and the bounds its edit could have changed are appended as unknown, at the cut,
+//!    whatever its slot holds now. If its live slot is broken too, the tile is lost in the store,
+//!    as a save loses one; a valid slot means the failure was transient, and it stays dirty, for
+//!    the next flush to try again. A batch that doesn't encode abandons the flush instead (see
+//!    "Failure").
 //! 3. **Syncing tiles**: the owner appends the records to the working file
-//!    ([`TileStore::append_streamed`], page-cache writes), then asks the writer to `fdatasync` the
-//!    file. Appending a record clears its slot's dirty flag only if the slot is unchanged since the
-//!    snapshot; a slot edited meanwhile stays dirty, and the next flush takes it.
+//!    ([`TileStore::append_streamed`], page-cache writes), then the batches
+//!    ([`TileStore::append_journal`]), and asks the writer to `fdatasync` the file. Appending a
+//!    record clears its slot's dirty flag only if the slot is unchanged since the snapshot; a slot
+//!    edited meanwhile stays dirty, and the next flush takes it. The journal notes its batches
+//!    written only once they are appended, so a flush abandoned before then leaves them for the
+//!    next, and none is ever written twice. Both are appended before the sync is asked for, so the
+//!    sync covers them and the save point holds them.
 //! 4. **Syncing the save point**: once that sync has completed, the owner appends a save point
 //!    naming every tile (and bound) in the file, and asks for a second sync. When it completes, the
 //!    save point is durable: a crash from then on loses nothing up to the snapshot.
@@ -72,6 +82,11 @@
 //! with any flush queued behind it: the edits it held stay in the store's flush mark (or, if
 //! already appended, in the file waiting for a save point), and the next trigger tries again.
 //!
+//! A dab batch that doesn't encode ([`RecoveryError::Journal`]) is such an error, unlike a tile:
+//! its dabs stay in the journal for the next flush, with nothing of the flush appended. Leaving
+//! the batch out and writing the save point would name tiles with dabs landed past the count the
+//! file's last batch states, and a restore would land those dabs a second time.
+//!
 //! A failed sync is different, and final for the file. After one, the kernel may have dropped
 //! the unsynced pages, so the records appended since the last durable save point may not be on
 //! disk although the store counts them as written, and a later sync that succeeds proves
@@ -106,8 +121,9 @@ use geom::TileKey;
 use thiserror::Error;
 
 use crate::feed::ConsumerId;
-use crate::file::{FileError, FileSyncer, FramedTile, frame_displacement};
-use crate::tiles::{CacheError, Snapshot, TileStore};
+use crate::file::{FileError, FileSyncer, FramedTile, frame_batch, frame_displacement};
+use crate::journal::DabBatch;
+use crate::tiles::{CacheError, JournalCut, Snapshot, TileStore};
 
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -137,6 +153,11 @@ pub enum RecoveryError {
     /// the module notes): the edits need a new recovery file and a new writer.
     #[error("the recovery file failed to sync: the edits need a new one")]
     NeedsNewFile,
+    /// A dab batch of the open stroke's journal couldn't be encoded. The flush is abandoned
+    /// with nothing of it appended, and its dabs wait in the journal for the next (see the module
+    /// notes).
+    #[error("a dab batch of the stroke's journal couldn't be encoded")]
+    Journal(#[source] FileError),
     /// A reply arrived that the flush in flight wasn't waiting for: a bug in the writer.
     #[error("the recovery writer's thread replied out of step")]
     OutOfStep,
@@ -168,8 +189,9 @@ enum Phase {
 /// What the owner asks of the writer thread.
 #[derive(Debug)]
 enum Request {
-    /// Encode, compress and frame these copies as tile records.
-    Encode(Vec<Snapshot>),
+    /// Encode, compress and frame these copies as tile records, and these batches of the
+    /// journal as dab-batch records.
+    Encode(Vec<Snapshot>, Vec<DabBatch>),
     /// Sync this file. Each request carries the store's current working file, so a writer
     /// outlives a swap of the file.
     Sync(FileSyncer),
@@ -178,9 +200,13 @@ enum Request {
 /// What the writer thread answers, one reply per request, in order.
 #[derive(Debug)]
 enum Reply {
-    /// The framed records, in snapshot order, and the tiles whose copies didn't encode, left
-    /// out.
-    Encoded(Vec<FramedTile>, Vec<TileKey>),
+    /// The framed records, in snapshot order, the tiles whose copies didn't encode, left out,
+    /// and the framed batches, in order, or why one didn't encode.
+    Encoded(
+        Vec<FramedTile>,
+        Vec<TileKey>,
+        Result<Vec<Vec<u8>>, FileError>,
+    ),
     /// The sync completed, or why it failed.
     Synced(Result<(), FileError>),
 }
@@ -204,6 +230,9 @@ struct Hooks {
     /// Encodes still to fail, counting down: each fails as a transient compression error
     /// would, whatever the copy holds.
     failing_encodes: std::sync::atomic::AtomicUsize,
+    /// Encodes of dab batches still to fail, counting down, as [`Hooks::failing_encodes`] for
+    /// tiles.
+    failing_batch_encodes: std::sync::atomic::AtomicUsize,
     /// Bytes of snapshot copies handed to the writer thread and not yet dropped by it.
     in_flight: std::sync::atomic::AtomicUsize,
     /// The most [`Hooks::in_flight`] has been.
@@ -225,6 +254,11 @@ impl Hooks {
     /// Whether this encode is to fail, counting it down.
     fn encode_fails(&self) -> bool {
         count_down(&self.failing_encodes)
+    }
+
+    /// Whether this batch's encode is to fail, counting it down.
+    fn batch_encode_fails(&self) -> bool {
+        count_down(&self.failing_batch_encodes)
     }
 
     /// The bytes `snapshots` hold: their slots' copies.
@@ -289,6 +323,9 @@ pub struct RecoveryWriter {
     thread: Option<JoinHandle<()>>,
     /// Where the flush in flight is.
     phase: Phase,
+    /// What the flush in flight's cut took of the store's journals: noted written once its
+    /// batches are appended.
+    journal_cut: Vec<JournalCut>,
     /// When a trigger that met a flush in flight came: the next flush is owed, and starts as
     /// soon as the current one is durable.
     queued: Option<Instant>,
@@ -345,6 +382,7 @@ impl RecoveryWriter {
             stop,
             thread: Some(thread),
             phase: Phase::Idle,
+            journal_cut: Vec::new(),
             queued: None,
             unconfirmed: false,
             last_flush: None,
@@ -504,10 +542,13 @@ impl RecoveryWriter {
     }
 
     /// Whether a trigger now would have anything to flush: edits not yet in the working file,
-    /// tiles in it since its last save point (written back to make room), or a failed flush to
-    /// confirm.
+    /// tiles in it since its last save point (written back to make room), a dab batch due, or a
+    /// failed flush to confirm.
     fn has_work(&self, store: &TileStore) -> bool {
-        self.unconfirmed || store.has_unflushed(self.consumer) || store.has_unsaved_records()
+        self.unconfirmed
+            || store.has_unflushed(self.consumer)
+            || store.has_unsaved_records()
+            || store.has_journal_work()
     }
 
     /// A trigger at `now`: starts a flush, or queues one if a flush is in flight (keeping the
@@ -528,9 +569,9 @@ impl RecoveryWriter {
         }
     }
 
-    /// Starts a flush at `at`: snapshots the dirty slots and hands them to the writer thread.
-    /// With nothing to encode it goes straight to syncing, if the file holds tiles no save point
-    /// names yet or the last flush failed, and does nothing otherwise.
+    /// Starts a flush at `at`: snapshots the dirty slots and cuts the journal, and hands both to
+    /// the writer thread. With nothing to encode it goes straight to syncing, if the file holds
+    /// tiles no save point names yet or the last flush failed, and does nothing otherwise.
     ///
     /// # Errors
     ///
@@ -545,20 +586,23 @@ impl RecoveryWriter {
         let snapshot = store
             .snapshot_dirty(self.consumer, &mut self.skipped)
             .and_then(|snapshots| {
-                // The bounds of the snapshot's state, at the same cut, and the records of the
-                // strokes it ends.
+                // The journal as of the snapshot, so its landed count is the snapshot's; the
+                // bounds of the snapshot's state, at the same cut; and the records of the strokes
+                // it ends.
+                let (batches, cuts) = store.cut_journal()?;
                 store.flush_bounds(self.skipped.get(before..).unwrap_or_default())?;
                 store.flush_strokes()?;
-                Ok(snapshots)
+                Ok((snapshots, batches, cuts))
             });
         // A dirty slot with no op is a broken one: lost, not late.
         self.lost
             .extend(self.skipped.get(before..).unwrap_or_default());
         let started = match snapshot {
-            Ok(snapshots) if !snapshots.is_empty() => {
+            Ok((snapshots, batches, cuts)) if !snapshots.is_empty() || !batches.is_empty() => {
                 #[cfg(test)]
                 self.hooks.sent(&snapshots);
-                self.send(Request::Encode(snapshots))
+                self.journal_cut = cuts;
+                self.send(Request::Encode(snapshots, batches))
                     .map(|()| self.phase = Phase::Encoding)
             }
             Ok(_) if owed || store.has_unsaved_records() => self.request_tile_sync(store),
@@ -612,7 +656,11 @@ impl RecoveryWriter {
             return Err(RecoveryError::OutOfStep);
         }
         match (self.phase, reply) {
-            (Phase::Encoding, Reply::Encoded(tiles, broken)) => {
+            (Phase::Encoding, Reply::Encoded(tiles, broken, batches)) => {
+                // A batch left out would leave the save point naming tiles past the landed
+                // count of the file's last batch: the flush is abandoned before anything of it is
+                // appended, and the journal keeps the dabs for the next.
+                let batches = batches.map_err(RecoveryError::Journal)?;
                 // Every tile left out is unprotected by this save point, which names unknown
                 // bounds for whatever its at-cut edit could change. Only a broken live slot is
                 // lost in memory; a valid one stays dirty, for the next flush to retry.
@@ -624,6 +672,10 @@ impl RecoveryWriter {
                 self.lost.extend(lost.iter().copied());
                 store.forget_bounds_at_cut(&broken, &lost)?;
                 store.append_streamed(self.consumer, &tiles)?;
+                // Before the sync is asked for, so it covers them and the save point holds them;
+                // the journal moves on only once they are in the file.
+                let cuts = std::mem::take(&mut self.journal_cut);
+                store.append_journal(&batches, &cuts)?;
                 self.request_tile_sync(store)
             }
             (Phase::SyncingTiles { end }, Reply::Synced(synced)) => {
@@ -720,6 +772,14 @@ impl RecoveryWriter {
     /// would, whatever the copies hold.
     pub(crate) fn fail_encodes(&self, fail: usize) {
         self.hooks.failing_encodes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes the writer thread's next `fail` encodes of dab batches fail, as
+    /// [`RecoveryWriter::fail_encodes`] does for tiles.
+    pub(crate) fn fail_batch_encodes(&self, fail: usize) {
+        self.hooks
+            .failing_batch_encodes
+            .store(fail, Ordering::SeqCst);
     }
 
     /// Holds the writer thread back before it takes its next request, or lets it go.
@@ -821,15 +881,18 @@ impl Worker {
             #[cfg(test)]
             self.hooks.wait_while_paused();
             let reply = match request {
-                Request::Encode(snapshots) => {
+                Request::Encode(snapshots, batches) => {
                     let encoded = self.encode(&snapshots);
                     #[cfg(test)]
                     self.hooks.dropped(&snapshots);
                     drop(snapshots);
-                    match encoded {
-                        Some((framed, broken)) => Reply::Encoded(framed, broken),
-                        None => return,
-                    }
+                    let Some((framed, broken)) = encoded else {
+                        return;
+                    };
+                    let Some(framed_batches) = self.frame_batches(&batches) else {
+                        return;
+                    };
+                    Reply::Encoded(framed, broken, framed_batches)
                 }
                 Request::Sync(syncer) => Reply::Synced(sync(
                     &syncer,
@@ -866,6 +929,29 @@ impl Worker {
             }
         }
         Some((framed, broken))
+    }
+
+    /// Frames every batch as a dab-batch record, in order, or says why one didn't encode;
+    /// `None` if the owner stopped the writer part-way.
+    fn frame_batches(&self, batches: &[DabBatch]) -> Option<Result<Vec<Vec<u8>>, FileError>> {
+        let mut framed = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if self.stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let encoded = frame_batch(batch);
+            #[cfg(test)]
+            let encoded = if self.hooks.batch_encode_fails() {
+                Err(io::Error::other("a failing batch encode, for the test").into())
+            } else {
+                encoded
+            };
+            match encoded {
+                Ok(record) => framed.push(record),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(framed))
     }
 }
 

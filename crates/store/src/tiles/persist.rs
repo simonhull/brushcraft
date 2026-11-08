@@ -179,6 +179,7 @@ impl TileStore {
             previews: super::preview::Previews::default(),
             pen_down: super::pen_down::PenDown::default(),
             strokes_waiting: Vec::new(),
+            journals: super::journal::Journals::default(),
             floor: std::collections::BTreeMap::new(),
             floor_read: std::collections::BTreeMap::new(),
             floor_top: config.floor_top,
@@ -505,6 +506,7 @@ impl TileStore {
         self.since_rebase.clear();
         self.forget_copied_ahead();
         self.forget_saved_strokes(strokes);
+        self.rebase_journal();
         self.bounds.rebased();
         self.display.rebased();
         self.generation += 1;
