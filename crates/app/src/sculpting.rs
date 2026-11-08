@@ -108,10 +108,10 @@
 //! and never a landed part of the stroke.
 //!
 //! - **Placed:** each dab goes to [`Project::journal`] once, as it joins the stroke's queue, in
-//!   placement order (symmetry copies included), as its 84 bytes ([`DabRow`]), through one buffer
-//!   the brush keeps, so the frame's path allocates nothing a dab for it. A dab shown ahead is
-//!   placed like any other: a big brush's stroke is journalled from its first dab, however long it
-//!   is shown before any lands.
+//!   placement order (symmetry copies included), as its 84 bytes ([`DabRow`]): the queue's own
+//!   memory, cast in place, so the frame's path copies and allocates nothing for it. A dab shown
+//!   ahead is placed like any other: a big brush's stroke is journalled from its first dab, however
+//!   long it is shown before any lands.
 //! - **Landed:** the stroke counts the dabs [`apply_dabs`] has applied (shown or not: showing lands
 //!   nothing), and passes the count to [`Project::journal_landed`] right after each [`apply_dabs`]
 //!   that succeeds, in the same call on the owner thread. The brush never ticks the project
@@ -585,8 +585,9 @@ struct Pending {
     op: OpId,
     /// Its dabs not yet applied, oldest first.
     dabs: VecDeque<Dab>,
-    /// How many of its dabs [`apply_dabs`] has applied, in placement order: the landed count its
-    /// journal was last given ([`Project::journal_landed`]). Placed, it has `landed + dabs.len()`.
+    /// How many of its dabs [`apply_dabs`] has applied, in placement order: the last landed count
+    /// its journal accepted ([`Project::journal_landed`]). Placed, it has `landed + dabs.len()`
+    /// until the journal refuses a count, which ends the stroke.
     landed: u32,
     /// Where each of `dabs` came from, and its cost.
     sources: VecDeque<Source>,
@@ -609,16 +610,12 @@ struct Pending {
 /// [`store::DAB_BYTES`].
 type DabRow = [u8; store::DAB_BYTES];
 
-// A dab is exactly one row, so `row_of` never meets a size it can't cast.
+// A dab is exactly one row, so casting dabs to rows ([`Pending::place`]) never meets a size it
+// can't cast; a row's alignment is 1, a dab's 4, so any dab is a row in place.
 const _: () = assert!(
     size_of::<Dab>() == store::DAB_BYTES,
     "a dab is one journal row"
 );
-
-/// `dab` as its journal row: its bytes as they are in memory, which a restore casts back.
-fn row_of(dab: Dab) -> DabRow {
-    bytemuck::cast(dab)
-}
 
 impl Pending {
     /// Notes the stroke's start in `start` once its first dab is queued, dated by its `Down`:
@@ -643,9 +640,12 @@ impl Pending {
     }
 
     /// Queues `placed`, the dabs the sample at `times` placed, each with the tiles of `index` its
-    /// sphere touches, and journals them in `project` ([`Project::journal`]), in order, through
-    /// `rows`, the brush's buffer: the frame's path allocates nothing a dab for the journal.
-    /// Returns how many joined the queue.
+    /// sphere touches, and journals them in `project` ([`Project::journal`]), in order, as their
+    /// bytes in the queue itself: the journal is given the queue's memory, cast to rows, so it
+    /// costs no copy and no allocation here. Returns how many joined the queue.
+    ///
+    /// Making the queue contiguous moves its dabs only when its ring has wrapped, as
+    /// [`apply_dabs`]'s batch makes it so anyway.
     ///
     /// # Errors
     ///
@@ -656,7 +656,6 @@ impl Pending {
         times: SampleTimes,
         index: &SpatialIndex,
         project: &mut Project,
-        rows: &mut Vec<DabRow>,
     ) -> Result<usize, ProjectError> {
         let (before, heading) = (self.dabs.len(), self.heading);
         for dab in placed {
@@ -671,19 +670,20 @@ impl Pending {
                 shown: false,
             });
         }
-        rows.clear();
-        let new = self.dabs.range(before..).copied().map(row_of);
-        rows.extend(new);
-        if rows.is_empty() {
+        let queue: &[Dab] = self.dabs.make_contiguous();
+        let new = queue.get(before..).unwrap_or_default();
+        if new.is_empty() {
             return Ok(0);
         }
+        let rows: &[DabRow] = bytemuck::cast_slice(new);
+        let count = rows.len();
         if let Err(error) = project.journal(rows) {
             self.dabs.truncate(before);
             self.sources.truncate(before);
             self.heading = heading;
             return Err(error);
         }
-        Ok(rows.len())
+        Ok(count)
     }
 }
 
@@ -730,9 +730,6 @@ pub(crate) struct Sculpting {
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
-    /// The rows of the dabs a push places, as they go to the journal ([`Pending::place`]): kept
-    /// across pushes, so journalling allocates only while a push places more than any before.
-    rows: Vec<DabRow>,
     /// The stroke not over yet, if one is: its pen down, or its dabs still to apply. A stroke
     /// started meanwhile waits in `deferred`.
     stroke: Option<Pending>,
@@ -816,7 +813,6 @@ impl Sculpting {
             settings,
             strength_factor: 1.0,
             state,
-            rows: Vec::new(),
             stroke: None,
             kept: Kept::default(),
             cost: DabCost::CALIBRATED,
@@ -1160,7 +1156,7 @@ impl Sculpting {
             self.dropped("placing dabs", &error);
             return;
         }
-        let queued = pending.place(placed, times, scene.index, scene.project, &mut self.rows);
+        let queued = pending.place(placed, times, scene.index, scene.project);
         match queued {
             Ok(count) => {
                 pending.engine = Some(engine);
@@ -1192,7 +1188,7 @@ impl Sculpting {
             self.dropped("placing the stroke's last dabs", &error);
             return;
         }
-        let queued = pending.place(tail, times, scene.index, scene.project, &mut self.rows);
+        let queued = pending.place(tail, times, scene.index, scene.project);
         match queued {
             Ok(_) => pending.note_start(&mut self.stroke_start),
             Err(error) => self.dropped("journalling the stroke's last dabs", &error),
@@ -1446,14 +1442,19 @@ impl Sculpting {
         match applied {
             Ok(stats) => {
                 let direct: Vec<Dab> = batch.get(landing..).unwrap_or_default().to_vec();
-                front.dabs.drain(..count);
-                front.sources.drain(..count);
+                // The dabs `apply_dabs` was given: what landed.
+                let taken = batch.len();
+                front.dabs.drain(..taken);
+                front.sources.drain(..taken);
                 // The count goes with the edits, in this call: nothing ticks the project between
                 // them (see "The journal" in the module notes). A count past a `u32` saturates,
                 // and the journal refuses it.
-                let batch_dabs = u32::try_from(count).unwrap_or(u32::MAX);
-                front.landed = front.landed.saturating_add(batch_dabs);
-                let counted = scene.project.journal_landed(front.landed);
+                let batch_dabs = u32::try_from(taken).unwrap_or(u32::MAX);
+                let reached = front.landed.saturating_add(batch_dabs);
+                let counted = scene.project.journal_landed(reached);
+                if counted.is_ok() {
+                    front.landed = reached;
+                }
                 report.dabs_applied += stats.dabs;
                 report.tiles_edited += stats.tiles_edited;
                 self.land(scene, landing, false);

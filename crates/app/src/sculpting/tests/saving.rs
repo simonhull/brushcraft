@@ -995,8 +995,8 @@ fn discard_during_a_save_leaves_what_the_project_file_holds() {
 fn discard_in_a_saves_landing_with_an_op_open() {
     let dir = TestDir::new();
     let mut owner = holding_everything(&dir);
-    // A stroke under way has its op open, from its `Down`.
-    assert!(owner.brush().stroke.is_some(), "an op is open");
+    // The store's stroke is open, from the `Down`: its journal takes dabs.
+    assert!(owner.project().journal(&[]).is_ok(), "an op is open");
     owner.request_save(Instant::now());
     let saved = tiles_on_disk(&dir);
     owner.discard().expect("discarded");

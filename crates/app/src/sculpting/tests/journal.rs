@@ -5,6 +5,7 @@
 //! replayed; and a journal that refuses ends the stroke cleanly.
 
 use store::{DabBatch, FLUSH_INTERVAL, SaveAhead};
+use stroke::{MirrorPlanes, Symmetry};
 
 use super::*;
 
@@ -43,10 +44,35 @@ fn batches_at(path: &std::path::Path, op: OpId) -> Vec<DabBatch> {
     of_op.collect()
 }
 
+/// `dab` as the journal's row: its bytes.
+fn row_of(dab: Dab) -> DabRow {
+    bytemuck::cast(dab)
+}
+
+/// `brush` with its settings copied by `symmetry`, all else as it was.
+fn symmetric(mut brush: Sculpting, symmetry: Symmetry) -> Sculpting {
+    let settings = &brush.settings;
+    let copied = StrokeSettings::new(
+        *settings.path(),
+        settings.spacing(),
+        settings.size_mode(),
+        settings.radius(),
+        settings.dynamics().clone(),
+        symmetry,
+        settings.action_params(),
+    )
+    .expect("the brush's own settings");
+    brush.settings = copied
+        .with_strength(settings.strength())
+        .with_strength_mode(settings.strength_mode())
+        .with_hardness(settings.hardness());
+    brush
+}
+
 /// A brush stepped directly over a project saved in a directory of its own.
 ///
-/// A dab at a time is too dear for any time ([`DabCost::one_at_a_time`]): a frame's step shows
-/// every dab it can't fit and lands none, and the tests land them one by one
+/// By default a dab at a time is too dear for any time ([`DabCost::one_at_a_time`]): a frame's
+/// step shows every dab it can't fit and lands none, and the tests land them one by one
 /// ([`Journalling::land_one`]).
 struct Journalling {
     /// The project's directory, kept until the batches are read.
@@ -64,8 +90,13 @@ struct Journalling {
 }
 
 impl Journalling {
-    /// The brush over a fresh project, saved.
+    /// The default brush over a fresh project, saved.
     fn new() -> Self {
+        Self::with(|brush| brush)
+    }
+
+    /// The default brush as `made` makes it, over a fresh project, saved.
+    fn with(made: impl FnOnce(Sculpting) -> Sculpting) -> Self {
         let dir = TestDir::new();
         let mut project = project(&dir);
         drop(
@@ -76,7 +107,7 @@ impl Journalling {
         let picker = Picker::load(&mut project)
             .expect("the index loads")
             .expect("a display layer");
-        let brush = Sculpting::new(&mut project).with_cost(DabCost::one_at_a_time());
+        let brush = made(Sculpting::new(&mut project).with_cost(DabCost::one_at_a_time()));
         Self {
             dir,
             project,
@@ -87,7 +118,8 @@ impl Journalling {
         }
     }
 
-    /// A frame's step of the brush given `samples`, all routed to it: no dab fits, and none lands.
+    /// A frame's step of the brush given `samples`, all routed to it: with the default brush, no
+    /// dab fits, and none lands.
     fn frame(&mut self, samples: &[PenSample]) -> BrushReport {
         let mut pen = PenFrame::default();
         for sample in samples {
@@ -252,15 +284,22 @@ fn a_stroke_shown_ahead_is_journalled_before_any_dab_lands() {
 #[test]
 fn dabs_dropped_after_an_error_are_never_replayed() {
     let (dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
-    let op = owner.brush().stroke.as_ref().expect("its pen down").op;
+    let light = owner.brush().stroke.as_ref().expect("its pen down");
+    let op = light.op;
+    assert!(light.dabs.is_empty(), "the light half has landed");
     // Held from landing while they are placed, shown and cut: the journal holds them unlanded.
     owner.brush_mut().landing = Landing::InSteps;
     queue(&mut owner, heavy);
     run(&mut owner, 1);
-    let stroke = owner.brush().stroke.as_ref().expect("its dabs wait");
-    let landed = stroke.landed;
-    let placed = landed + u32::try_from(stroke.dabs.len()).expect("a few");
-    assert!(placed > landed, "the heavy dabs wait to land");
+    let waiting = owner
+        .brush()
+        .stroke
+        .as_ref()
+        .expect("its dabs wait")
+        .dabs
+        .len();
+    let waiting = u32::try_from(waiting).expect("a few");
+    assert!(waiting > 0, "the heavy dabs wait to land");
     cut(owner.project(), &mut Instant::now());
     owner.brush_mut().landing = Landing::InFrames;
     run(&mut owner, 10_000);
@@ -276,10 +315,12 @@ fn dabs_dropped_after_an_error_are_never_replayed() {
         .iter()
         .map(|batch| (batch.placed(), batch.landed()))
         .collect();
-    assert!(
-        counts.contains(&(placed, landed)),
-        "the cut journalled them unlanded: {counts:?}"
-    );
+    // The cut's batch: every dab but the heavy ones waiting had landed.
+    let at_cut = counts
+        .iter()
+        .find(|&&(placed, landed)| placed == landed + waiting);
+    let &(placed, _) =
+        at_cut.unwrap_or_else(|| panic!("the cut journalled them unlanded: {counts:?}"));
     assert_eq!(
         counts.last(),
         Some(&(placed, placed)),
@@ -317,4 +358,85 @@ fn a_journal_that_refuses_ends_the_stroke_cleanly_and_says_so() {
     assert_eq!(run.brush.drops(), drops + 2, "the rest dropped");
     assert!(run.brush.error().is_some(), "said");
     run.project.close(false).expect("closed");
+}
+
+/// The common path, with `symmetry`: no previews, the dabs landing as finest work in the steps
+/// that place them, a cut while some wait and one once none does.
+///
+/// Its oracles are independent of the brush's own count: the dabs come from the same samples
+/// through a brush that lands none (placement reads the pen-down surface, so the dabs are the
+/// same, bit for bit), and the landed counts from what each step says it applied.
+fn landed_at_once_is_counted_as_applied(symmetry: Symmetry) {
+    let epoch = Instant::now();
+    let samples = stroke(ACROSS, 12);
+    let (first, rest) = samples.split_at(7);
+    let (drags, up) = rest.split_at(rest.len() - 1);
+    let mut oracle = Journalling::with(|brush| symmetric(brush.with_epoch(epoch), symmetry));
+    oracle.frame(&samples);
+    let placed = oracle.queued_rows();
+    oracle.project.close(false).expect("closed");
+    // A dab a step while the cost is dear (a brush showing nothing makes progress), then all.
+    let mut run = Journalling::with(|brush| {
+        symmetric(brush.with_epoch(epoch).with_previews(false), symmetry)
+    });
+    let one = run.frame(first).dabs_applied;
+    assert_eq!(one, 1, "a dab at a time");
+    assert!(!run.stroke().dabs.is_empty(), "some wait");
+    let op = run.stroke().op;
+    run.cut();
+    run.brush.cost = DabCost::any_number();
+    let more = run.frame(drags).dabs_applied;
+    assert!(run.stroke().dabs.is_empty(), "the rest landed at once");
+    run.cut();
+    let tail = run.frame(up).dabs_applied;
+    assert!(!run.brush.stroking(), "the stroke ended with its tail");
+    let batches = run.close(op);
+    let counts = batches
+        .iter()
+        .map(|batch| usize::try_from(batch.landed()).expect("a few"));
+    let landed: Vec<usize> = counts.collect();
+    assert_eq!(
+        landed,
+        [one, one + more, one + more + tail],
+        "the cuts', then the end's: what the steps applied"
+    );
+    assert_eq!(
+        landed.last(),
+        Some(&placed.len()),
+        "every dab placed landed"
+    );
+    for batch in &batches {
+        let index = |at: u32| usize::try_from(at).expect("a few");
+        let span = index(batch.first())..index(batch.placed());
+        let expected = placed.get(span.clone()).expect("dabs placed");
+        assert_eq!(batch.dabs(), expected, "the dabs {span:?} as placed");
+    }
+    assert!(
+        batches.iter().any(|batch| !batch.dabs().is_empty()),
+        "the dabs waiting at the first cut were written"
+    );
+    let copies = placed
+        .iter()
+        .map(|&row| {
+            let dab: Dab = bytemuck::cast(row);
+            dab.copy
+        })
+        .filter(|&copy| copy != 0)
+        .count();
+    assert_eq!(
+        copies > 0,
+        symmetry.copies() > 1,
+        "the copies are rows of their own: {copies} of {}",
+        placed.len()
+    );
+}
+
+#[test]
+fn dabs_landed_as_they_are_placed_are_counted_by_what_each_step_applied() {
+    landed_at_once_is_counted_as_applied(Symmetry::NONE);
+}
+
+#[test]
+fn symmetry_copies_are_journalled_and_counted_landed_as_dabs_of_their_own() {
+    landed_at_once_is_counted_as_applied(Symmetry::mirror(MirrorPlanes::X));
 }
