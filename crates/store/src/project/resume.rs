@@ -6,7 +6,11 @@
 //! A restore opens the recovery file at its last durable save point, which holds every dab batch
 //! before it. The **last** of them gives the open stroke: its op, and its landed count, which
 //! describes exactly the tiles that save point names. If that batch's dabs have all landed (a
-//! stroke that ended writes a last batch so), no stroke is open. Otherwise the batches of its op,
+//! stroke that ended writes a last batch so), no stroke is open. Nor is one if the file holds an
+//! edit of a later op ([`ProjectFile::head`]): an op began after the stroke's, so the stroke ended
+//! (dropped, or never resumed after an earlier restore, see [`crate::Project::begin_stroke`]), or
+//! a save in its middle moved its later edits to a new op; landing its rows now would land them
+//! over that op's edits. Otherwise the batches of its op,
 //! read back from the last, give its dabs from the landed count on: each batch's first index is
 //! the later of the dabs the one before it placed and its own landed count (a batch's dabs start
 //! where the last left off, or past the dabs that landed before they were written), so the read
@@ -31,14 +35,18 @@
 //!
 //! The file may be hostile. Each batch read is bounded by its record ([`crate::journal`]), the
 //! batches read are those of the open stroke, from the last back, and the stroke's rows and
-//! pen-down shapes together may hold no more than the store's whole budget: a journal that would
-//! is [`JournalUnusable::TooLarge`]. A real stroke's are far less.
+//! pen-down shapes together may hold no more than the pools' share of the store's budget
+//! ([`TileStore::pools_budget`]): a journal that would is [`JournalUnusable::TooLarge`]. A live
+//! stroke has no such cap (its backlog and its shapes are unbounded, the shapes held beyond the
+//! budget if they must), so a stroke that big lands live and its journal can't be restored: the
+//! price of never letting a hostile file make a restore allocate without bound. A real stroke's
+//! rows and shapes are a few MB.
 
 use geom::{CorrectionTile, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
-use crate::file::{FileError, Loc, ProjectFile, ReadScratch};
+use crate::file::{Loc, ProjectFile, ReadScratch};
 use crate::journal::{DAB_BYTES, DabBatch, PenDown};
 use crate::slot::CorrectionSlot;
 use crate::tiles::{PenDownShape, StoreId, TileStore};
@@ -49,7 +57,6 @@ use crate::tiles::{PenDownShape, StoreId, TileStore};
 /// pen-down shapes, for [`crate::Project::resume_stroke`] to land on. Only a restore makes one, and
 /// it names the store it was found in, as that store's working file was then: so it resumes only
 /// there, once.
-#[derive(Debug)]
 pub struct OpenStroke {
     /// The stroke's op.
     op: OpId,
@@ -112,15 +119,23 @@ impl OpenStroke {
         self.shapes.iter().map(|(key, _)| key)
     }
 
-    /// The parts [`crate::Project::resume_stroke`] installs: the landed count, the dabs, the
-    /// pen-down save point, the dab format and the shapes.
-    pub(super) fn into_parts(self) -> Resumed {
-        Resumed {
+    /// Each changed tile's corrections as the stroke found them, in key order: what
+    /// [`crate::Project::resume_stroke`] installs as its pen-down shapes.
+    pub(super) fn shapes(&self) -> &[(TileKey, CorrectionTile)] {
+        &self.shapes
+    }
+
+    /// What the project keeps of the stroke until it is resumed, to close it in the file if it
+    /// never is ([`Unresumed`]).
+    pub(super) fn unresumed(&self) -> Unresumed {
+        let rows = u32::try_from(self.dabs.len()).unwrap_or(u32::MAX);
+        Unresumed {
+            op: self.op,
             landed: self.landed,
-            dabs: self.dabs,
+            placed: self.landed.saturating_add(rows),
             pen_down: self.pen_down,
             dab_format: self.dab_format,
-            shapes: self.shapes,
+            generation: self.generation,
         }
     }
 
@@ -130,18 +145,73 @@ impl OpenStroke {
     }
 }
 
-/// An [`OpenStroke`] taken apart to resume.
-pub(super) struct Resumed {
-    /// How many of its dabs had landed.
+/// Shows the counts, never the rows or the shapes.
+impl std::fmt::Debug for OpenStroke {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenStroke")
+            .field("op", &self.op)
+            .field("landed", &self.landed)
+            .field("dabs", &self.dabs.len())
+            .field("dab_format", &self.dab_format)
+            .field("pen_down", &self.pen_down)
+            .field("shapes", &self.shapes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`crate::Project::resume_stroke`] didn't resume a stroke, with the stroke given back: the
+/// project is as it was, and a call made again may resume it (after a transient error).
+#[derive(Debug, Error)]
+#[error("the restored stroke wasn't resumed")]
+pub struct NotResumed {
+    /// The stroke, as it was given.
+    stroke: Box<OpenStroke>,
+    /// Why.
+    #[source]
+    error: crate::ProjectError,
+}
+
+impl NotResumed {
+    /// `stroke` wasn't resumed, for `error`.
+    pub(super) fn new(stroke: OpenStroke, error: crate::ProjectError) -> Self {
+        Self {
+            stroke: Box::new(stroke),
+            error,
+        }
+    }
+
+    /// Why the stroke wasn't resumed: [`crate::ProjectError::NotResumable`], or the error of
+    /// installing its pen-down shapes.
+    #[must_use]
+    pub const fn error(&self) -> &crate::ProjectError {
+        &self.error
+    }
+
+    /// The stroke, to try again or let go.
+    #[must_use]
+    pub fn into_stroke(self) -> OpenStroke {
+        *self.stroke
+    }
+}
+
+/// A stroke a restore found still landing, until it is resumed: if the project begins another
+/// op first, the stroke has ended, and the project closes it in the file
+/// ([`TileStore::close_restored_journal`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Unresumed {
+    /// The stroke's op.
+    pub(super) op: OpId,
+    /// The landed count of its last batch.
     pub(super) landed: u32,
-    /// The dabs from `landed` on.
-    pub(super) dabs: Vec<[u8; DAB_BYTES]>,
-    /// The save point holding its pen-down surface.
+    /// Its dabs placed: the landed count and the dabs not landed.
+    pub(super) placed: u32,
+    /// The save point its batches name.
     pub(super) pen_down: PenDown,
-    /// The rows' format.
+    /// Its rows' format.
     pub(super) dab_format: u32,
-    /// Its pen-down shapes' corrections.
-    pub(super) shapes: Vec<(TileKey, CorrectionTile)>,
+    /// The store's working file it was found in ([`TileStore::generation`]): one moved onto
+    /// since holds none of its batches, so nothing is closed there.
+    pub(super) generation: u64,
 }
 
 /// Why a journal was found and not used: the restored tiles stand, as they would with no journal,
@@ -177,8 +247,9 @@ pub enum JournalUnusable {
     /// The rows' format is 0: the app never set it, so no app can say it reads them.
     #[error("the stroke's dabs are of no format")]
     UnsetFormat,
-    /// The stroke's dabs and pen-down shapes would hold more than the store's whole budget: no
-    /// stroke a store landed live, so the file isn't one to trust.
+    /// The stroke's dabs and pen-down shapes would hold more than the pools' share of the
+    /// store's budget. A live stroke has no such cap, so this can be a real stroke's journal, but
+    /// a restore never allocates past it for a file it can't trust (see the module notes).
     #[error("the stroke's journal is larger than the store's budget")]
     TooLarge,
 }
@@ -192,7 +263,8 @@ pub(super) fn find(store: &TileStore) -> Option<Result<OpenStroke, JournalUnusab
     let Ok(last) = file.read_batch(last) else {
         return Some(Err(JournalUnusable::Damaged));
     };
-    if last.landed() == last.placed() {
+    let later_op = file.head().is_some_and(|head| head > last.op());
+    if last.landed() == last.placed() || later_op {
         return None;
     }
     Some(open_stroke(store, last, earlier))
@@ -333,8 +405,8 @@ fn check_run(run: &[DabBatch], landed: u32) -> Result<(PenDown, u32), JournalUnu
 ///
 /// # Errors
 ///
-/// [`JournalUnusable::PenDownMissing`] if `earlier` isn't a save point of the file's chain, or
-/// its state doesn't load; [`JournalUnusable::Damaged`] if a record doesn't read;
+/// [`JournalUnusable::PenDownMissing`] if `earlier` isn't a save point of the file's chain;
+/// [`JournalUnusable::Damaged`] if its state doesn't load or a record doesn't read;
 /// [`JournalUnusable::TooLarge`] past `room`.
 fn pen_down_surface(
     store: &TileStore,
@@ -344,7 +416,7 @@ fn pen_down_surface(
     let file = store.working();
     let changed = match file.tiles_changed_since(earlier) {
         Ok(Some(changed)) => changed,
-        Ok(None) | Err(FileError::Damaged { .. }) => return Err(JournalUnusable::PenDownMissing),
+        Ok(None) => return Err(JournalUnusable::PenDownMissing),
         Err(_) => return Err(JournalUnusable::Damaged),
     };
     let needed = changed.iter().fold(0_usize, |bytes, (key, _)| {

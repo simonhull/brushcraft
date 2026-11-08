@@ -167,6 +167,7 @@ pub use frames::{ParentSlots, Predictor};
 pub use journal::JournalCountError;
 pub(crate) use journal::{CutId, PenDownPoint};
 pub(crate) use layers::{Saved, Snapshot};
+pub(crate) use pen_down::keeps_pen_down;
 pub use pen_down::{MadePenDown, PenDownMaker, PenDownShape, PenDownTaker, TakenShape};
 pub use pins::PinGuard;
 pub use preview::DisplayPreview;

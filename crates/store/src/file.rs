@@ -16,7 +16,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use geom::{BaseMesh, Channel, CorrectionTile, LayerId, TileKey};
+use geom::{BaseMesh, Channel, CorrectionTile, TileKey};
 
 use self::bounds_io::{bounds_record, read_bounds_at};
 #[cfg(test)]
@@ -1253,8 +1253,8 @@ impl ProjectFile {
     /// tiles were as it found them (see [`crate::journal`]). `earlier` is `None` for the state
     /// the file starts from, before its first save point, which holds no record.
     ///
-    /// Only base-layer displacement tiles are listed, the ones a stroke keeps pen-down shapes of
-    /// (see `crate::tiles::pen_down`), never display tiles. Records written since the latest
+    /// Only the tiles a stroke keeps pen-down shapes of are listed
+    /// ([`crate::tiles::keeps_pen_down`]), never display tiles. Records written since the latest
     /// save point are left out: the latest save point is the state compared.
     ///
     /// `Ok(None)` if `earlier` isn't a save point of the latest one's chain, or the file has no
@@ -1300,9 +1300,7 @@ impl ProjectFile {
             .map(|(&key, _)| (key, None));
         let mut changed: Changed = gone
             .chain(new)
-            .filter(|(key, _)| {
-                key.layer() == LayerId::BASE && key.channel() == Channel::DISPLACEMENT
-            })
+            .filter(|(key, _)| crate::tiles::keeps_pen_down(key))
             .collect();
         changed.sort_unstable_by_key(|&(key, _)| key);
         Ok(Some(changed))

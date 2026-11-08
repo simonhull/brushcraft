@@ -91,6 +91,18 @@ use crate::Aabb;
 use crate::index::TileBlocks;
 use crate::tiles::config::Evaluation;
 
+/// Whether a stroke keeps a pen-down shape of tile `key` once it changes it.
+///
+/// It does of a base-layer displacement tile, the tiles the store evaluates. A restore reads the
+/// shapes of these tiles, and only these, back from the file
+/// ([`ProjectFile::tiles_changed_since`]), so a tile a stroke keeps a shape of must be one of them:
+/// the shape-keeping calls check it in debug builds.
+///
+/// [`ProjectFile::tiles_changed_since`]: crate::file::ProjectFile::tiles_changed_since
+pub(crate) fn keeps_pen_down(key: &TileKey) -> bool {
+    key.layer() == LayerId::BASE && key.channel() == Channel::DISPLACEMENT
+}
+
 /// A tile's shape at pen-down: its corrections as they were, and the box of its positions then
 /// (see the module notes).
 #[derive(Debug, Clone, PartialEq)]
@@ -347,6 +359,10 @@ impl TileStore {
     /// As [`TileStore::evaluate_many`] and [`TileStore::evaluate`]; the shapes made before the
     /// error are kept.
     pub fn keep_pen_down(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+        debug_assert!(
+            keys.iter().all(keeps_pen_down),
+            "a pen-down shape of a tile a restore wouldn't read back"
+        );
         let new: Vec<TileKey> = keys
             .iter()
             .filter(|key| !self.pen_down.shapes.contains_key(key))
@@ -425,14 +441,15 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`] if `corrections` isn't of `key`'s side; as
+    /// [`CacheError::NotATile`] if `corrections` isn't of `key`'s side, or `key` isn't a tile a
+    /// stroke keeps a shape of ([`keeps_pen_down`]); as
     /// [`TileStore::evaluate`] for the tile's parents. Nothing is kept then.
     pub(crate) fn install_pen_down(
         &mut self,
         key: TileKey,
         corrections: CorrectionTile,
     ) -> Result<(), CacheError> {
-        if corrections.side() != key.side() {
+        if corrections.side() != key.side() || !keeps_pen_down(&key) {
             return Err(CacheError::NotATile(key));
         }
         if self.pen_down.shapes.contains_key(&key) {

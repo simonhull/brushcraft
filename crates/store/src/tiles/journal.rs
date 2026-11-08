@@ -413,11 +413,13 @@ impl TileStore {
     ///
     /// [`JournalCountError::PastLastIndex`] if the rows run past the last index a `u32` counts;
     /// nothing is opened then.
+    ///
+    /// The rows are copied: the stroke keeps its own until the resume is done.
     pub(crate) fn resume_journal(
         &mut self,
         op: OpId,
         landed: u32,
-        rows: Vec<[u8; DAB_BYTES]>,
+        rows: &[[u8; DAB_BYTES]],
         pen_down: PenDown,
         dab_format: u32,
     ) -> Result<(), JournalCountError> {
@@ -431,7 +433,7 @@ impl TileStore {
             op,
             placed,
             landed,
-            rows: rows.into(),
+            rows: rows.iter().copied().collect(),
             written: Some(written),
             in_flight: None,
             pen_down: PenDownPoint::Known(pen_down),
@@ -439,6 +441,43 @@ impl TileStore {
             begun_at: None,
         });
         Ok(())
+    }
+
+    /// Drops the open journal without ending it: no batch is written of it, as if it had never
+    /// opened. For a resume that failed after [`TileStore::resume_journal`], which must leave the
+    /// file saying nothing it didn't (ending it would write a batch counting every dab landed).
+    pub(crate) fn discard_journal(&mut self) {
+        self.journals.open = None;
+    }
+
+    /// The stroke made as `op`, restored still landing and never resumed, has ended: its dabs
+    /// not landed are dropped. Queues the batch that says so for the next flush, of no dabs, its
+    /// landed count `placed`, its dabs placed (see the module notes, "When the stroke ends"), so
+    /// the file itself says the stroke is closed, and a second crash's restore never offers it
+    /// over the edits that follow. `landed` is the count its last batch in the file has, its
+    /// pen-down and its rows' format those the batches name.
+    pub(crate) fn close_restored_journal(
+        &mut self,
+        op: OpId,
+        landed: u32,
+        placed: u32,
+        pen_down: PenDown,
+        dab_format: u32,
+    ) {
+        let journal = Journal {
+            op,
+            placed,
+            landed: placed,
+            rows: VecDeque::new(),
+            written: Some(Written { placed, landed }),
+            in_flight: None,
+            pen_down: PenDownPoint::Known(pen_down),
+            dab_format,
+            begun_at: None,
+        };
+        if journal.is_pending() {
+            self.journals.ended.push(journal);
+        }
     }
 
     /// The rows the app journals are laid out in dab format `dab_format`, the version of

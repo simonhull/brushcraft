@@ -16,22 +16,23 @@ use crate::{JournalUnusable, OpenStroke};
 /// The dab format the tests' app sets.
 const FORMAT: u32 = 7;
 
-/// `count` random edits at the finest level alone, with `seed`.
+/// `count` random edits at level `level` alone, with `seed`.
 ///
 /// A stroke of them never changes the level below the tiles it edits, so its pen-down shapes'
 /// boxes are those of the tiles' predictions as they are after it.
-fn top_edits(mesh: &BaseMesh, count: u32, seed: u64) -> Vec<Edit> {
-    let top = Level::new(TOP).unwrap();
-    let on_top = random_edits(mesh, TOP, count * u32::from(TOP) * 4, seed)
+fn level_edits(mesh: &BaseMesh, level: u8, count: u32, seed: u64) -> Vec<Edit> {
+    let wanted = Level::new(level).unwrap();
+    let on_level = random_edits(mesh, level, count * u32::from(level) * 4, seed)
         .into_iter()
-        .filter(|edit| edit.level == top);
-    let edits: Vec<Edit> = on_top.take(count as usize).collect();
-    assert_eq!(
-        edits.len(),
-        count as usize,
-        "enough edits on the finest level"
-    );
+        .filter(|edit| edit.level == wanted);
+    let edits: Vec<Edit> = on_level.take(count as usize).collect();
+    assert_eq!(edits.len(), count as usize, "enough edits on level {level}");
     edits
+}
+
+/// `count` random edits at the finest level alone, with `seed` (see [`level_edits`]).
+fn top_edits(mesh: &BaseMesh, count: u32, seed: u64) -> Vec<Edit> {
+    level_edits(mesh, TOP, count, seed)
 }
 
 /// The tiles `edits` write, in key order.
@@ -194,6 +195,24 @@ fn the_pen_down_shapes_are_the_tiles_at_the_save_point_its_batches_name() {
 }
 
 #[test]
+fn a_stroke_below_the_finest_level_restores_its_shapes_as_found() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = new_project(&dir);
+    stroke(&mut project, &mut map, 300, 66);
+    flush(&mut project);
+    let pen_down = latest(&project);
+    let edits = level_edits(&mesh(), TOP - 1, 30, 67);
+    let stroke = begin_with(&mut project, edits);
+    let live = live_shapes(&mut project, &stroke);
+    assert!(
+        live.keys().all(|key| key.level().get() == TOP - 1),
+        "the level below the finest"
+    );
+    assert_shapes_as_found(&dir, project, stroke, &mut map, &live, pen_down);
+}
+
+#[test]
 fn a_tile_never_in_the_recovery_file_reads_its_pen_down_shape_from_the_project_file() {
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
@@ -283,31 +302,35 @@ fn a_restored_stroke_resumes_its_op() {
 fn a_stroke_resumes_only_where_it_was_found_and_before_another_op() {
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
-    let stroke = crash_landing(new_project(&dir), &mut map, 49);
+    crash_landing(new_project(&dir), &mut map, 49);
     let mut restored = restore(&dir);
     let refused = restored.take_open_stroke().unwrap().unwrap();
     let op = refused.op();
     let begun = restored.begin_stroke().unwrap();
     assert_ne!(begun, op, "a new op");
+    let not = restored.resume_stroke(refused).unwrap_err();
     assert!(
-        matches!(restored.resume_stroke(refused), Err(ProjectError::NotResumable(not)) if not == op),
-        "another op began since the restore"
+        matches!(not.error(), ProjectError::NotResumable(named) if *named == op),
+        "another op began since the restore: {not:?}"
     );
     restored.end_unrecorded_stroke().unwrap();
     assert_eq!(restored.store().pen_down_tiles(), 0, "no shape installed");
     restored.close(true).unwrap();
+    let mut closed = restore(&dir);
+    assert!(closed.take_open_stroke().is_none(), "the next op closed it");
+    closed.close(false).unwrap();
 
     // Found in another project: refused there.
-    let mut first = restore(&dir);
+    let other = TestDir::new();
+    let stroke = crash_landing(new_project(&other), &mut map, 49);
+    let mut first = restore(&other);
     let elsewhere = first.take_open_stroke().unwrap().unwrap();
     first.close(true).unwrap();
-    let mut second = restore(&dir);
+    let mut second = restore(&other);
+    let not_here = second.resume_stroke(elsewhere).unwrap_err();
     assert!(
-        matches!(
-            second.resume_stroke(elsewhere),
-            Err(ProjectError::NotResumable(_))
-        ),
-        "another project's"
+        matches!(not_here.error(), ProjectError::NotResumable(_)),
+        "another project's: {not_here:?}"
     );
     let own = second.take_open_stroke().unwrap().unwrap();
     let mut resumed = going_on(stroke, &own);
@@ -587,4 +610,150 @@ fn a_restored_journal_journals_on_with_its_own_dab_format() {
     written.push(batch_at(next.op, pen_down, 0..3, 0).with_dab_format(FORMAT + 2));
     assert_eq!(batches(&mut restored), written, "a new stroke's");
     restored.close(false).unwrap();
+}
+
+#[test]
+fn a_stroke_never_resumed_is_closed_by_the_next_op_and_not_offered_again() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let stroke = crash_landing(new_project(&dir), &mut map, 68);
+    let mut restored = restore(&dir);
+    // The app drops the stroke, and edits on with an op of its own, journalling nothing.
+    drop(restored.take_open_stroke().unwrap().unwrap());
+    restored.begin_stroke_and_wait().unwrap();
+    let edits = random_edits(&mesh(), TOP, 40, 69);
+    apply_dabs(restored.store(), &mut map, &edits);
+    restored.end_unrecorded_stroke().unwrap();
+    flush(&mut restored);
+    let op = stroke.op;
+    assert_eq!(
+        batches(&mut restored),
+        vec![batch_of(op, 8..20, 8), batch_of(op, 20..20, 20)],
+        "closed in the file, its dabs not landed dropped"
+    );
+    drop(restored);
+    let mut again = restore(&dir);
+    assert!(again.take_open_stroke().is_none(), "not offered again");
+    assert_tiles(&mut again, &map, "the later op's edits stand");
+    again.close(false).unwrap();
+}
+
+#[test]
+fn an_edit_of_a_later_op_closes_the_stroke_its_batches_leave_open() {
+    // Edits of a later op with no stroke begun: no closing batch, but the file's head says so.
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    crash_landing(new_project(&dir), &mut map, 70);
+    let mut restored = restore(&dir);
+    assert!(restored.take_open_stroke().is_some(), "found");
+    restored.store().begin_op().unwrap();
+    let edits = random_edits(&mesh(), TOP, 40, 71);
+    apply_dabs(restored.store(), &mut map, &edits);
+    flush(&mut restored);
+    drop(restored);
+    let mut again = restore(&dir);
+    assert!(again.take_open_stroke().is_none(), "a later op edited");
+    assert_tiles(&mut again, &map, "its edits stand");
+    again.close(false).unwrap();
+}
+
+#[test]
+fn a_save_in_the_middle_of_a_stroke_leaves_no_stroke_to_land() {
+    // Its later edits are a new op's, its batches the old one's.
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = new_project(&dir);
+    let mut saved = begin_on_top(&mut project, 20, 72);
+    saved.place(&mut project, 10);
+    saved.land(&mut project, &mut map, 10);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    saved.place(&mut project, 4);
+    saved.land(&mut project, &mut map, 2);
+    flush(&mut project);
+    let last = batches(&mut project).pop().unwrap();
+    assert_eq!(last.op(), saved.op, "the old op's batch");
+    assert!(last.landed() < last.placed(), "dabs not landed");
+    drop(project);
+    let mut restored_saved = restore(&dir);
+    assert!(
+        restored_saved.take_open_stroke().is_none(),
+        "the new op's edits are past it"
+    );
+    assert_tiles(&mut restored_saved, &map, "the tiles");
+    restored_saved.close(false).unwrap();
+}
+
+#[test]
+fn a_resume_that_fails_leaves_the_project_as_it_was() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let stroke = crash_landing(new_project(&dir), &mut map, 73);
+    let mut restored = restore(&dir);
+    let open = restored.take_open_stroke().unwrap().unwrap();
+    let written = batches(&mut restored);
+    restored.fail_next_resume = true;
+    let failed = restored.resume_stroke(open).unwrap_err();
+    assert!(
+        matches!(failed.error(), ProjectError::Cache(_)),
+        "{failed:?}"
+    );
+    assert_eq!(restored.store().current_op(), None, "no op");
+    assert_eq!(restored.store().pen_down_tiles(), 0, "no shape");
+    assert!(!restored.store().is_landing(), "no journal");
+    flush(&mut restored);
+    assert_eq!(batches(&mut restored), written, "nothing written of it");
+    // Given back, it resumes.
+    let given_back = failed.into_stroke();
+    let mut resumed = going_on(stroke, &given_back);
+    restored.resume_stroke(given_back).unwrap();
+    resumed.land(&mut restored, &mut map, 12);
+    restored.end_unrecorded_stroke().unwrap();
+    assert_tiles(&mut restored, &map, "every dab landed");
+    restored.close(false).unwrap();
+}
+
+#[test]
+fn a_damaged_pen_down_tile_record_restores_the_tiles_alone() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = new_project(&dir);
+    stroke(&mut project, &mut map, 300, 74);
+    flush(&mut project);
+    let mut landing = begin_on_top(&mut project, 20, 75);
+    let mesh = mesh();
+    let changed = keys_of(&mesh, &landing.edits[..8]);
+    let found = changed
+        .iter()
+        .find_map(|key| project.store().working().locate(key))
+        .expect("a tile the stroke changes is in the recovery file at its pen-down");
+    landing.place(&mut project, 20);
+    landing.land(&mut project, &mut map, 8);
+    flush(&mut project);
+    let path = project.recovery_path().unwrap().to_path_buf();
+    drop(project);
+    // The pen-down record: the restored state names the stroke's own since.
+    damage(&path, found);
+    assert_tiles_alone(restore(&dir), &map, &JournalUnusable::Damaged);
+}
+
+#[test]
+fn pen_down_shapes_past_the_budget_restore_the_tiles_alone() {
+    /// A restore on the tight budget, whose pools hold a few MB.
+    fn tight_config(dir: &TestDir) -> ProjectConfig {
+        ProjectConfig {
+            store: crate::fixture::tight(),
+            recovery_dir: dir.path("recovery"),
+        }
+    }
+    // The rows fit, with less room than the shapes need left beside them.
+    let mesh = mesh();
+    let edits = top_edits(&mesh, 20, 76);
+    let shapes: usize = keys_of(&mesh, &edits[..8])
+        .iter()
+        .map(|key| PenDownShape::bytes_of(key.side()))
+        .sum();
+    let pools = crate::fixture::pools(&crate::fixture::tight());
+    let rows = u32::try_from((pools - shapes / 2) / DAB_BYTES).unwrap() - 12;
+    let past = |op| vec![batch_of(op, 20..20 + rows, 8)];
+    assert_appended_unusable(76, tight_config, past, &JournalUnusable::TooLarge);
 }

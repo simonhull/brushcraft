@@ -120,7 +120,8 @@ use discover::{not_restorable, past, recovery_heads, standing};
 use place::{
     create_clean, create_placed, create_recovery, place_new, retire, scratch, scratch_in, temporary,
 };
-pub use resume::{JournalUnusable, OpenStroke};
+use resume::Unresumed;
+pub use resume::{JournalUnusable, NotResumed, OpenStroke};
 
 /// The extension of a recovery file (and of a project file).
 const EXTENSION: &str = "bcrf";
@@ -499,6 +500,13 @@ pub struct Project {
     /// What [`Project::restore`] found of a stroke still landing, until
     /// [`Project::take_open_stroke`] takes it; `None` for a project not restored, or with none.
     open_stroke: Option<Result<OpenStroke, JournalUnusable>>,
+    /// The stroke [`Project::restore`] found still landing, until it is resumed or the next op
+    /// begins: then [`Project::begin_stroke`] closes it in the file.
+    unresumed: Option<Unresumed>,
+    /// Test hook: makes the next [`Project::resume_stroke`] fail at its last step, reopening the
+    /// op, after its journal is seeded.
+    #[cfg(test)]
+    fail_next_resume: bool,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename, with an I/O error of
     /// this kind (see [`Unplaced::crash`](place::Unplaced::crash)).
@@ -631,7 +639,12 @@ impl Project {
         config: ProjectConfig,
     ) -> Result<Self, ProjectError> {
         let mut project = Self::restore_tiles(candidate, config)?;
-        project.open_stroke = resume::find(&project.store);
+        let found = resume::find(&project.store);
+        project.unresumed = found
+            .as_ref()
+            .and_then(|found| found.as_ref().ok())
+            .map(OpenStroke::unresumed);
+        project.open_stroke = found;
         Ok(project)
     }
 
@@ -780,6 +793,9 @@ impl Project {
             stroke: None,
             recorded: None,
             open_stroke: None,
+            unresumed: None,
+            #[cfg(test)]
+            fail_next_resume: false,
             #[cfg(test)]
             fail_next_recovery: None,
             #[cfg(test)]
@@ -1168,8 +1184,21 @@ impl Project {
             !self.store.is_landing(),
             "a stroke began while the last one's dabs were still landing"
         );
-        // The stroke before ends here if it hasn't, its dabs counted landed, before the cut.
+        // The stroke before ends here if it hasn't, its dabs counted landed, before the cut. So
+        // does a stroke a restore found still landing and nobody resumed: the file says so, or a
+        // second crash would offer it again over this op's edits.
         self.store.end_journal();
+        if let Some(unresumed) = self.unresumed.take()
+            && unresumed.generation == self.store.generation()
+        {
+            self.store.close_restored_journal(
+                unresumed.op,
+                unresumed.landed,
+                unresumed.placed,
+                unresumed.pen_down,
+                unresumed.dab_format,
+            );
+        }
         let pen_down = self.cut_before_op(Instant::now());
         let op = self.store.begin_op()?;
         self.store.begin_journal(op, pen_down);
@@ -1368,42 +1397,62 @@ impl Project {
     /// dab has landed, end it with [`Project::end_unrecorded_stroke`]: the journal holds no pen
     /// samples to record.
     ///
+    /// A stroke never resumed has ended once another op begins: [`Project::begin_stroke`] closes
+    /// it in the file, its dabs not landed dropped.
+    ///
     /// # Errors
     ///
+    /// [`NotResumed`], with `stroke` given back and the project as it was, for
     /// [`ProjectError::NotResumable`] if another op began since the restore (or an edit was
     /// made), the project has moved onto another recovery file (a save or a roll-over), or
-    /// `stroke` isn't this project's; [`ProjectError::Cache`] if a shape can't be installed
-    /// (evaluating a tile's parents fails). The stroke isn't resumed then, and no shape is kept.
-    pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), ProjectError> {
+    /// `stroke` isn't this project's; or for [`ProjectError::Cache`] if a shape can't be installed
+    /// (evaluating a tile's parents fails), which a call made again may get past.
+    pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), NotResumed> {
         let op = stroke.op();
         if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
-            return Err(ProjectError::NotResumable(op));
+            return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
         }
-        let resumed = stroke.into_parts();
-        for (key, corrections) in resumed.shapes {
-            if let Err(e) = self.store.install_pen_down(key, corrections) {
-                self.store.release_pen_down();
-                return Err(e.into());
-            }
-        }
-        let reopened = self
-            .store
-            .resume_journal(
-                op,
-                resumed.landed,
-                resumed.dabs,
-                resumed.pen_down,
-                resumed.dab_format,
-            )
-            .map_err(ProjectError::from)
-            .and_then(|()| Ok(self.store.resume_op(op)?));
-        if let Err(e) = reopened {
-            self.store.end_journal();
+        let installed = stroke.shapes().iter().try_for_each(|(key, corrections)| {
+            self.store.install_pen_down(*key, corrections.clone())
+        });
+        if let Err(e) = installed {
             self.store.release_pen_down();
-            return Err(e);
+            return Err(NotResumed::new(stroke, e.into()));
+        }
+        let seeded = self.store.resume_journal(
+            op,
+            stroke.landed(),
+            stroke.dabs(),
+            stroke.pen_down(),
+            stroke.dab_format(),
+        );
+        if let Err(e) = seeded {
+            self.store.release_pen_down();
+            return Err(NotResumed::new(stroke, e.into()));
+        }
+        if let Err(e) = self.resume_op(op) {
+            // Dropped, not ended: ending it would write a batch counting every dab landed.
+            self.store.discard_journal();
+            self.store.release_pen_down();
+            return Err(NotResumed::new(stroke, e.into()));
         }
         self.stroke = Some(op);
+        self.unresumed = None;
         Ok(())
+    }
+
+    /// Makes `op` the store's op again ([`TileStore::resume_op`]), the last step of
+    /// [`Project::resume_stroke`].
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::resume_op`].
+    fn resume_op(&mut self, op: OpId) -> Result<(), CacheError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_resume) {
+            return Err(CacheError::OpBegun(op));
+        }
+        self.store.resume_op(op)
     }
 
     /// The version of the layout of the rows the app journals ([`Project::journal`]): every
