@@ -1582,6 +1582,44 @@ impl Project {
         self.report()
     }
 
+    /// Asks for a flush now, at `now`, whatever [`FLUSH_INTERVAL`](crate::FLUSH_INTERVAL) says:
+    /// every edit and journal row made so far goes to the recovery file in a flush that starts
+    /// at once, or is queued behind the flush in flight (see [`RecoveryWriter::request`]).
+    /// Never blocks: the app polls ([`Project::poll`]) until [`Project::flushed`] says it is
+    /// durable. For a close that lands and saves with no window, which must know the recovery
+    /// file holds everything before it lets the window go.
+    ///
+    /// The 1 s cadence is kept: a flush started here counts as the latest start, as a tick's
+    /// does, so the next timed one comes [`FLUSH_INTERVAL`](crate::FLUSH_INTERVAL) after it. With
+    /// nothing waiting, it starts nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::tick`]: a writer that fails is replaced by a roll-over (whose fresh file
+    /// holds every edit in a durable save point), and a roll-over that can't be made pauses
+    /// protection ([`ProjectError::ProtectionPaused`]).
+    pub fn request_flush(&mut self, now: Instant) -> Result<(), ProjectError> {
+        self.with_writer(|writer, store| writer.request(store, now), Retry::Due(now))?;
+        self.report()
+    }
+
+    /// Whether every edit and journal row the project holds is in a durable save point of its
+    /// recovery file: the writer has no flush in flight or queued, hasn't failed, and owes no
+    /// work (no edit or tile not yet flushed, no dab batch due, no stroke record waiting).
+    ///
+    /// False while crash protection is paused ([`Project::protection`]) or the writer has
+    /// failed (the next call rolls over); false again after any edit or row made since, until a
+    /// flush holds it. Reads state only: the app calls [`Project::poll`] between checks to move
+    /// the flush on.
+    #[must_use]
+    pub fn flushed(&self) -> bool {
+        self.paused.is_none()
+            && self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.is_flushed(&self.store))
+    }
+
     /// Advances the recovery writer's flush in flight and installs finished prefetches,
     /// without blocking: for the app's frame loop.
     ///

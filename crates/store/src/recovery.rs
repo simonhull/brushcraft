@@ -520,6 +520,36 @@ impl RecoveryWriter {
         Ok(())
     }
 
+    /// A flush is asked for at `now`, whatever [`FLUSH_INTERVAL`] says: one starts at once if
+    /// anything waits to be flushed (edits, tiles written back, a dab batch due, a failed flush
+    /// to confirm), or is queued behind the flush in flight, which starts it as soon as that one
+    /// is durable. Advances the flush in flight first; never blocks.
+    ///
+    /// The interval is untouched otherwise: a flush that starts here is the latest to have
+    /// started, as one a tick starts is, so the next timed one comes [`FLUSH_INTERVAL`] after it
+    /// (never sooner than a second after the last start, never later than a tick would have
+    /// made it). Nothing waiting starts nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`RecoveryWriter::tick`].
+    pub fn request(&mut self, store: &mut TileStore, now: Instant) -> Result<(), RecoveryError> {
+        self.poll(store)?;
+        if self.has_work(store) {
+            self.trigger(store, now)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every edit and dab row the store holds is in a durable save point of the working
+    /// file: no flush in flight or queued, the writer not failed, and nothing a flush would
+    /// write (see [`RecoveryWriter::request`]). Edits made after a request make it false again
+    /// until a flush takes them too.
+    #[must_use]
+    pub fn is_flushed(&self, store: &TileStore) -> bool {
+        self.is_idle() && !self.is_failed() && !self.has_work(store)
+    }
+
     /// A stroke's op is about to begin, at `now`, before its first edit: says which flush's cut
     /// will hold every tile as the op finds them, its pen-down surface, starting it or queueing it
     /// if need be (see the module notes, "A stroke's first landing waits for its cut"). It

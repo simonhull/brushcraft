@@ -8,6 +8,7 @@ use crate::fixture::dab_at;
 use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS, PenDown};
 use crate::{FLUSH_INTERVAL, JournalCountError};
 
+mod flush_now;
 mod pen_down;
 mod resume;
 
