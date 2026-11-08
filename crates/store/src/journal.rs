@@ -44,8 +44,9 @@
 //! The rows are `stroke::Dab`'s bytes as the app laid them out, native-endian and unversioned,
 //! and a stroke's record (which names the engine's version) is written only at its end: a crashed
 //! stroke has none. So each batch carries the version of the rows' layout the app set
-//! (`crate::Project::set_dab_format`), and a restore reports it, for the app to refuse rows of a
-//! layout it doesn't read. The store only carries it.
+//! (`crate::Project::set_dab_format`), as it was when the stroke began, and a restore reports it,
+//! for the app to refuse rows of a layout it doesn't read. The store only carries it. **0 means
+//! unset**, the app never said: a restore must refuse rows of format 0.
 //!
 //! # Where batches live
 //!

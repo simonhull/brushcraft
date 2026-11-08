@@ -276,6 +276,15 @@ pub(crate) struct ProjectToOpen {
     config: ProjectConfig,
 }
 
+/// `project`, its dab journal told the layout of the rows the brush journals.
+///
+/// The layout is [`stroke::DAB_FORMAT`]. Every project the app opens or restores is passed
+/// through here, so no stroke's rows go unlabelled (format 0, which a restore refuses).
+fn journalling(mut project: Project) -> Project {
+    project.set_dab_format(stroke::DAB_FORMAT);
+    project
+}
+
 impl ProjectToOpen {
     /// The project `options` name, with a display layer under `options.level` and its recovery
     /// file in the app's recovery directory.
@@ -301,8 +310,9 @@ impl ProjectToOpen {
     ///
     /// If the project doesn't open (it leaves no recovery file then).
     pub(crate) fn open(self) -> Result<Project> {
-        Project::open(&self.path, self.config)
-            .with_context(|| format!("opening {}", self.path.display()))
+        let opened = Project::open(&self.path, self.config)
+            .with_context(|| format!("opening {}", self.path.display()));
+        opened.map(journalling)
     }
 
     /// Opens it as the run in `options` should: bringing back what a crash left, or not.
@@ -355,7 +365,7 @@ impl ProjectToOpen {
             candidates.find(|candidate| candidate.status == status)
         };
         if let Some(candidate) = has(CandidateStatus::Restorable) {
-            match Project::restore(candidate, self.config.clone()) {
+            match Project::restore(candidate, self.config.clone()).map(journalling) {
                 // A save by another instance came between the listing and the restore: the file is
                 // on an earlier save now, and is that note's to offer.
                 Ok(project) if project.path().is_none() => {
@@ -424,7 +434,7 @@ impl ProjectToOpen {
     ///
     /// If it can't be restored, or saved.
     fn open_copy(&self, candidate: &RecoveryCandidate) -> Result<(Project, SaveOutcome)> {
-        let restoring = Project::restore(candidate, self.config.clone());
+        let restoring = Project::restore(candidate, self.config.clone()).map(journalling);
         let mut project = restoring.context("restoring the work found")?;
         let path = copy_path(&self.path);
         match project.save_as(&path) {
@@ -824,6 +834,47 @@ mod tests {
     fn close(project: Project) {
         let keep = project.has_unsaved_edits();
         project.close(keep).expect("closed");
+    }
+
+    /// The dab formats of the batches the recovery file `path` holds, read once closed.
+    fn dab_formats(path: &Path) -> Vec<u32> {
+        let file = store::ProjectFile::open(path).expect("the recovery file opens");
+        let formats = file
+            .batches()
+            .map(|batch| batch.expect("a batch").dab_format());
+        formats.collect()
+    }
+
+    /// Journals a dab of a stroke begun on `project`, and closes it keeping its recovery file:
+    /// returns the batches' dab formats.
+    fn journalled_formats(mut project: Project) -> Vec<u32> {
+        project.begin_stroke().expect("begun");
+        project
+            .journal(&[[0; store::DAB_BYTES]])
+            .expect("journalled");
+        let recovery = project.recovery_path().expect("a recovery file").to_owned();
+        project.close(true).expect("closed");
+        dab_formats(&recovery)
+    }
+
+    #[test]
+    fn every_project_the_app_opens_journals_the_brush_s_dab_format() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let opened = opening.clone().open().expect("opened");
+        assert_eq!(
+            journalled_formats(opened),
+            vec![stroke::DAB_FORMAT],
+            "opened"
+        );
+        left_work(&opening);
+        let (restored, note) = opening.open_restoring().expect("opened");
+        assert!(matches!(note, Some(OpenNote::Restored { .. })), "{note:?}");
+        assert_eq!(
+            journalled_formats(restored),
+            vec![stroke::DAB_FORMAT],
+            "restored"
+        );
     }
 
     #[test]

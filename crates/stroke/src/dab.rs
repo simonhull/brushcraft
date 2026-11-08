@@ -3,6 +3,13 @@
 
 use crate::ACTION_SLOTS;
 
+/// The version of [`Dab`]'s layout and meaning, as the dab journal keeps a stroke's dabs: the
+/// app sets it on every project it opens, and a restore refuses rows of another format.
+///
+/// **Bump it whenever `Dab`'s layout or the meaning of a field changes.** It is never 0, which
+/// the journal reads as unset.
+pub const DAB_FORMAT: u32 = 1;
+
 /// One dab: where a brush imprint lands and everything the action needs to apply it.
 ///
 /// Plain data (`#[repr(C)]`, [`bytemuck::Pod`], 84 bytes of `f32`s and `u32`s with no padding),

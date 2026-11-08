@@ -710,25 +710,36 @@ fn an_ended_stroke_whose_cut_fails_writes_its_last_count_only_if_a_batch_is_in_t
 }
 
 #[test]
-fn every_batch_carries_the_dab_format_the_app_set() {
+fn every_batch_carries_the_dab_format_its_stroke_began_with() {
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
-    let mut stroke = Stroke::begin(&mut project, 20, 49);
-    stroke.place(&mut project, 4);
+    let mut unset = Stroke::begin(&mut project, 20, 49);
+    unset.place(&mut project, 4);
     flush(&mut project);
+    // Set in the middle of a stroke: the stroke's rows keep the format they were placed in.
     project.set_dab_format(7);
-    stroke.place(&mut project, 3);
-    stroke.land(&mut project, &mut map, 2);
+    unset.place(&mut project, 3);
+    unset.land(&mut project, &mut map, 7);
+    project.end_unrecorded_stroke().unwrap();
+    crash::poll_until_idle(&mut project);
+    let mut set = Stroke::begin(&mut project, 20, 64);
+    set.place(&mut project, 3);
+    set.land(&mut project, &mut map, 1);
     flush(&mut project);
-    let formats: Vec<u32> = batches(&mut project)
+    let formats: Vec<(OpId, u32)> = batches(&mut project)
         .iter()
-        .map(DabBatch::dab_format)
+        .map(|batch| (batch.op(), batch.dab_format()))
         .collect();
-    assert_eq!(formats, vec![0, 7], "0 until set, then the one set");
     assert_eq!(
-        batches(&mut project)[1],
-        batch(stroke.op, 4..7, 2).with_dab_format(7),
+        formats,
+        vec![(unset.op, 0), (unset.op, 0), (set.op, 7)],
+        "0 (unset) for the stroke begun before, the one set for the next"
+    );
+    let last = batches(&mut project)[2].clone();
+    assert_eq!(
+        last,
+        batch_at(set.op, last.pen_down(), 1..3, 1).with_dab_format(7),
         "the rest of the batch as ever"
     );
     project.close(false).unwrap();

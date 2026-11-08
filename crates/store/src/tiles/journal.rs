@@ -167,12 +167,17 @@ struct Journal {
     in_flight: Option<(CutId, Written)>,
     /// Where the stroke's pen-down surface is.
     pen_down: PenDownPoint,
+    /// The format of its rows, as the app set it when the stroke began (see
+    /// [`crate::journal`]): every batch of it carries it.
+    dab_format: u32,
 }
 
 impl Journal {
-    /// An empty journal of the stroke made as `op`, its pen-down surface at `pen_down`.
-    const fn new(op: OpId, pen_down: PenDownPoint) -> Self {
+    /// An empty journal of the stroke made as `op`, its pen-down surface at `pen_down`, its rows
+    /// in `dab_format`.
+    const fn new(op: OpId, pen_down: PenDownPoint, dab_format: u32) -> Self {
         Self {
+            dab_format,
             op,
             placed: 0,
             landed: 0,
@@ -269,8 +274,8 @@ impl Journal {
 
     /// The journal's cut, if a batch is due: the batches of the dabs neither written nor in
     /// flight, at most [`MAX_JOURNAL_DABS`] each (one of no dabs if only the landed count moved),
-    /// each with the landed count as it is now, the stroke's pen-down save point and the rows'
-    /// `dab_format`, and what the file holds once they are in it.
+    /// each with the landed count as it is now, the stroke's pen-down save point and its rows'
+    /// format, and what the file holds once they are in it.
     ///
     /// This copies the rows not yet written, on the calling thread.
     ///
@@ -279,7 +284,7 @@ impl Journal {
     /// [`Invariant::Journal`] if [`DabBatch::new`] refuses a batch, and
     /// [`Invariant::JournalRows`] if the rows run out before the dabs placed: never, while the
     /// journal holds its invariants.
-    fn cut(&self, dab_format: u32) -> Result<Option<(Vec<DabBatch>, Written)>, Invariant> {
+    fn cut(&self) -> Result<Option<(Vec<DabBatch>, Written)>, Invariant> {
         let Some(pen_down) = self.settled().filter(|_| self.is_due()) else {
             return Ok(None);
         };
@@ -297,7 +302,7 @@ impl Journal {
             let empty = rows.is_empty();
             let batch = DabBatch::new(self.op, first, self.landed, pen_down, rows)
                 .map_err(Invariant::Journal)?
-                .with_dab_format(dab_format);
+                .with_dab_format(self.dab_format);
             first = batch.placed();
             batches.push(batch);
             if first >= self.placed {
@@ -326,8 +331,8 @@ pub(super) struct Journals {
     ended: Vec<Journal>,
     /// The number of the next cut ([`CutId`]).
     next_cut: u64,
-    /// The version of the rows' layout the app set ([`TileStore::set_dab_format`]), which every
-    /// batch cut carries.
+    /// The version of the rows' layout the app set ([`TileStore::set_dab_format`]), which a
+    /// stroke's journal takes as it begins.
     dab_format: u32,
 }
 
@@ -378,13 +383,13 @@ impl TileStore {
     /// notes): opens its journal, closing any still open (see [`TileStore::end_journal`]).
     pub(crate) fn begin_journal(&mut self, op: OpId, pen_down: PenDownPoint) {
         self.journals.close();
-        self.journals.open = Some(Journal::new(op, pen_down));
+        self.journals.open = Some(Journal::new(op, pen_down, self.journals.dab_format));
     }
 
     /// The rows the app journals are laid out in dab format `dab_format`, the version of
-    /// `stroke::Dab`'s layout, which the store never reads: every batch cut from now on carries it
-    /// (see [`crate::journal`]). It is 0 until set, and stays across a move onto a new working
-    /// file.
+    /// `stroke::Dab`'s layout, which the store never reads: every stroke begun from now on takes
+    /// it, and every batch of the stroke carries it (see [`crate::journal`]). It is 0, unset,
+    /// until set, and stays across a move onto a new working file.
     pub(crate) const fn set_dab_format(&mut self, dab_format: u32) {
         self.journals.dab_format = dab_format;
     }
@@ -482,12 +487,11 @@ impl TileStore {
         self.journals.next_cut = self.journals.next_cut.saturating_add(1);
         let mut batches = Vec::new();
         let mut refused = None;
-        let dab_format = self.journals.dab_format;
         for journal in self.journals.all_mut() {
             if journal.pen_down == PenDownPoint::Next {
                 journal.pen_down = PenDownPoint::Flush(id);
             }
-            match journal.cut(dab_format) {
+            match journal.cut() {
                 Ok(Some((cut, reached))) => {
                     batches.extend(cut);
                     journal.in_flight = Some((id, reached));

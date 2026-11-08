@@ -51,7 +51,7 @@ mod unit;
 mod vector;
 
 pub use curve::{Curve, CurveError, CurvePoint, MAX_CURVE_POINTS, MIN_CURVE_POINTS};
-pub use dab::Dab;
+pub use dab::{DAB_FORMAT, Dab};
 pub use dynamics::{
     ACTION_SLOTS, ActionSlot, Dynamics, DynamicsError, Entry, FullScale, Input, Inputs,
     MAX_ENTRIES, Param, StrokeRandom, Values,

@@ -1291,10 +1291,12 @@ impl Project {
         self.end_stroke_at(Instant::now())
     }
 
-    /// The version of the layout of the rows the app journals ([`Project::journal`]): every dab
-    /// batch written from now on carries it ([`crate::DabBatch::dab_format`]), and a restore
-    /// reports it, so the app can refuse rows of a layout it doesn't read. The store never reads
-    /// it. It is 0 until set: the app sets it once, after opening the project.
+    /// The version of the layout of the rows the app journals ([`Project::journal`]): every
+    /// stroke begun from now on takes it, every dab batch of the stroke carries it
+    /// ([`crate::DabBatch::dab_format`]), and a restore reports it, so the app can refuse rows of
+    /// a layout it doesn't read. The store never reads it. It is 0 until set, which means unset: a
+    /// restore must refuse rows of format 0. The app sets it right after every open, new or
+    /// restore (`stroke::DAB_FORMAT`).
     pub const fn set_dab_format(&mut self, dab_format: u32) {
         self.store.set_dab_format(dab_format);
     }
