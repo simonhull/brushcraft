@@ -1121,6 +1121,50 @@ mod tests {
     }
 
     #[test]
+    fn two_detail_lines_under_a_long_title_fit_a_narrow_window() {
+        let now = Instant::now();
+        let theme = Theme::GLASS;
+        let mut ui = Ui::new(theme, Blend::Display, (640, 400), 1.0, now);
+        let title = "A title far too long for a window this narrow to hold whole, however it is \
+                     drawn, so it is cut short where the room runs out and ends in an ellipsis";
+        let bar = Bar::new(title, vec![quiet("Dismiss", 1)])
+            .with_detail("From yesterday at 16:42")
+            .with_detail("Your last stroke couldn't be finished; the rest of your work is back.");
+        ui.set_bar(Some(bar), now);
+        let frame = ui.frame(now).expect("a bar shows");
+        let glass = glass_of(&ui);
+        assert!(
+            glass.x >= 0.0 && glass.x + glass.w <= 640.0,
+            "within the window: {glass:?}"
+        );
+        let glyphs = frame.list.glyphs.iter();
+        let inside = glyphs.clone().all(|glyph| {
+            glyph.rect.x >= glass.x
+                && glyph.rect.x + glyph.rect.w <= glass.x + glass.w
+                && glyph.rect.y >= glass.y
+                && glyph.rect.y + glyph.rect.h <= glass.y + glass.h
+        });
+        assert!(inside, "every letter on the glass");
+        let title_letters = title.chars().filter(|c| !c.is_whitespace()).count();
+        // The title and the control's label are drawn in the one colour.
+        let drawn = glyphs_in(&frame.list, theme.text).len() - "Dismiss".len();
+        assert!(
+            drawn < title_letters,
+            "the title is cut: {drawn} of {title_letters}"
+        );
+        let tops: Vec<f32> = glyphs_in(&frame.list, theme.quiet_text)
+            .into_iter()
+            .map(|glyph| glyph.rect.y)
+            .collect();
+        let highest = tops.iter().copied().fold(f32::MAX, f32::min);
+        let lowest = tops.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            lowest - highest >= theme.status.1 * 0.5,
+            "two lines of detail: {highest} and {lowest}"
+        );
+    }
+
+    #[test]
     fn a_second_detail_line_goes_under_the_first_and_the_bar_grows_for_it() {
         let now = Instant::now();
         let theme = Theme::GLASS;

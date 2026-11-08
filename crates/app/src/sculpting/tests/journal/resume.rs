@@ -263,10 +263,12 @@ fn landing_in(dir: TestDir) -> (Journalling, usize) {
         brush.with_epoch(epoch)
     });
     run.project.set_dab_format(stroke::DAB_FORMAT);
-    let shown = run.frame(&stroke_from(epoch));
+    run.frame(&stroke_from(epoch));
     assert!(!run.stroke().open(), "the pen lifted");
+    // Every dab the stroke journalled: none has landed.
+    let placed = run.queued_rows().len();
     run.cut();
-    (run, shown.dabs_shown)
+    (run, placed)
 }
 
 /// The child: lands its stroke dab by dab as [`KILL_LANDING`] says, the journal cut between, then
@@ -309,10 +311,17 @@ fn kill_child(dir: &TestDir, (cut, more): (usize, usize)) {
         .env(KILL_LANDING, format!("{cut},{more}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the child starts");
     let stdout = child.stdout.take().expect("its output");
+    let mut stderr = child.stderr.take().expect("its errors");
+    // Both pipes are read on threads of their own, so neither fills up and stalls the child.
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        drop(std::io::Read::read_to_string(&mut stderr, &mut text));
+        text
+    });
     let (ready, ready_seen) = std::sync::mpsc::channel();
     // Read on a thread of its own, so a child that never gets there fails the test instead of
     // hanging it.
@@ -331,7 +340,11 @@ fn kill_child(dir: &TestDir, (cut, more): (usize, usize)) {
     child.kill().expect("killed");
     let status = child.wait().expect("reaped");
     reader.join().expect("its output read");
-    assert!(got_there.is_ok(), "the child got where it is killed");
+    let errors = errors.join().expect("its errors read");
+    assert!(
+        got_there.is_ok(),
+        "the child got where it is killed; it said:\n{errors}"
+    );
     assert_eq!(status.signal(), Some(SIGKILL), "killed: {status}");
 }
 
@@ -440,5 +453,78 @@ fn a_stroke_killed_mid_landing_comes_back_whole() {
             "killed after {cut} + {more}: {apart} steps from the run never killed"
         );
         drop(dir);
+    }
+}
+
+#[test]
+fn a_window_with_no_size_yet_takes_the_stroke_on() {
+    let crashed = crash_mid_landing(stroke::DAB_FORMAT, 2);
+    // Minimised as it opened, or not yet configured.
+    let unsized_setup = Setup {
+        size: None,
+        ..setup()
+    };
+    let mut owner = owner_of(restore_in(&crashed.dir), Sculpting::new, unsized_setup);
+    owner.resume_stroke();
+    assert!(
+        owner.brush().under_way(),
+        "taken on: {:?}",
+        owner.brush().error()
+    );
+    assert_eq!(rows_left(&owner), crashed.waiting(), "every dab not landed");
+    owner.close().expect("closed, landing it");
+}
+
+/// A crash with a stroke landing whose journal holds `rows`, none of them landed, in the
+/// brush's dab format: the crash's directory.
+fn crash_with_rows(rows: &[DabRow]) -> TestDir {
+    let mut run = Journalling::new();
+    run.project.set_dab_format(stroke::DAB_FORMAT);
+    run.project.begin_stroke_and_wait().expect("begun");
+    run.project.journal(rows).expect("journalled");
+    run.cut();
+    let Journalling { dir, project, .. } = run;
+    // A crash: nothing closes the project.
+    drop(project);
+    dir
+}
+
+#[test]
+fn a_row_that_cant_be_a_dab_of_the_model_is_not_taken_on() {
+    let crashed = crash_mid_landing(stroke::DAB_FORMAT, 0);
+    let good: Dab = bytemuck::cast(*crashed.placed.first().expect("a dab"));
+    let hostile = [
+        Dab {
+            radius: f32::NAN,
+            ..good
+        },
+        Dab {
+            radius: 1e9,
+            ..good
+        },
+        Dab {
+            position: [1e6, 0.0, 0.0],
+            ..good
+        },
+        Dab {
+            radius: -1.0,
+            ..good
+        },
+    ];
+    for dab in hostile {
+        let dir = crash_with_rows(&[row_of(good), row_of(dab)]);
+        let mut owner = resumed_in(&dir, Sculpting::new);
+        assert!(!owner.brush().stroking(), "not taken on: {dab:?}");
+        let error = owner.brush().error().expect("said").to_owned();
+        assert!(error.contains("can't be a dab of this model"), "{error}");
+        let note = OpenNote::Restored {
+            path: "recovery.bcrf".into(),
+            when: std::time::SystemTime::now(),
+        };
+        owner.note(&note, Instant::now());
+        let bar = owner.bar().expect("the note");
+        let last = bar.details().last().map(String::as_str);
+        assert_eq!(last, Some(UNFINISHED_STROKE), "the note says so");
+        owner.close().expect("closed");
     }
 }

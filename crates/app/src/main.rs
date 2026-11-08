@@ -214,6 +214,9 @@ pub(crate) enum OpenNote {
         /// What was found.
         candidate: RecoveryCandidate,
     },
+    /// Found work went to a copy, saved, and its last stroke couldn't be finished: the copy holds
+    /// the rest ([`sculpting::finish_restored`]).
+    CopyUnfinished,
 }
 
 /// Whether `one` and `other` are one file, however they are spelled: through a symbolic link, with
@@ -264,11 +267,9 @@ pub(crate) struct Reopened {
     copied: Option<SaveOutcome>,
     /// Why a copy couldn't be made, the project then open as before and `note` asking again.
     failed: Option<anyhow::Error>,
-    /// What to say about the project. A copy of found work whose last stroke couldn't be
-    /// finished says so as a restore does: the note of that work, restored.
+    /// What to say about the project, a copy of found work whose last stroke couldn't be finished
+    /// included ([`OpenNote::CopyUnfinished`]).
     note: Option<OpenNote>,
-    /// What became of the stroke the work found was still landing, for a copy of it.
-    last_stroke: LastStroke,
 }
 
 /// A project checked and ready to open, opened only once the GPU (and the window) are.
@@ -414,16 +415,11 @@ impl ProjectToOpen {
     ///
     /// As [`ProjectToOpen::open`]. A copy failing isn't an error.
     pub(crate) fn reopen(&self, reopen: Reopen) -> Result<Reopened> {
-        let mut last_stroke = LastStroke::Whole;
         let (project, kept, copied, failed, note) = match reopen {
             Reopen::LastSave { kept } => (self.clone().open()?, Some(kept), None, None, None),
             Reopen::Copy { candidate } => match self.open_copy(&candidate) {
                 Ok((project, saved, last)) => {
-                    last_stroke = last;
-                    let note = (last == LastStroke::Unfinished).then(|| OpenNote::Restored {
-                        path: candidate.path.clone(),
-                        when: candidate.modified,
-                    });
+                    let note = (last == LastStroke::Unfinished).then_some(OpenNote::CopyUnfinished);
                     (project, None, Some(saved), None, note)
                 }
                 Err(error) => {
@@ -438,7 +434,6 @@ impl ProjectToOpen {
             copied,
             failed,
             note,
-            last_stroke,
         })
     }
 
@@ -537,9 +532,6 @@ pub(crate) fn swap(
     }
     if let Some(error) = &reopened.failed {
         owner.copy_failed(error);
-    }
-    if reopened.last_stroke == LastStroke::Unfinished {
-        owner.last_stroke_unfinished();
     }
     if let Some(note) = &reopened.note {
         owner.note(note, Instant::now());
@@ -1316,20 +1308,39 @@ mod tests {
         whole: Vec<Vec<Vec3>>,
     }
 
+    /// What the stroke [`left_landing_on_an_earlier_save`] leaves is like.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rows {
+        /// Its dabs, in rows of this layout.
+        Of(u32),
+        /// Its dabs in the brush's layout, the last of them one no landing takes (a normal with
+        /// no direction): finishing it fails.
+        LastRefused,
+    }
+
     /// A crash with a stroke landing on `opening`, the project saved by a later session since.
     ///
-    /// The stroke is journalled in rows of `format`, 3 of its dabs landed.
-    fn left_landing_on_an_earlier_save(opening: &ProjectToOpen, format: u32) -> LeftLanding {
+    /// The stroke is journalled in rows as `rows` says, 3 of its dabs landed.
+    fn left_landing_on_an_earlier_save(opening: &ProjectToOpen, rows: Rows) -> LeftLanding {
         let mut crashed = opening.clone().open().expect("opened");
+        let format = match rows {
+            Rows::Of(format) => format,
+            Rows::LastRefused => stroke::DAB_FORMAT,
+        };
         crashed.set_dab_format(format);
-        let dabs = dabs_on_the_edited_tile(&mut crashed);
+        let mut dabs = dabs_on_the_edited_tile(&mut crashed);
         assert!(dabs.len() > 3, "dabs left to land: {}", dabs.len());
+        if rows == Rows::LastRefused
+            && let Some(last) = dabs.last_mut()
+        {
+            last.normal = [0.0; 3];
+        }
         let level = crashed.store().display_finest().expect("a display layer");
         let (mut index, _) = crashed.load_index(level, |_, _| {}).expect("an index");
         crashed.begin_stroke_and_wait().expect("begun");
-        let rows: Vec<[u8; store::DAB_BYTES]> =
+        let journalled: Vec<[u8; store::DAB_BYTES]> =
             dabs.iter().map(|dab| bytemuck::cast(*dab)).collect();
-        crashed.journal(&rows).expect("journalled");
+        crashed.journal(&journalled).expect("journalled");
         land(&mut crashed, &mut index, dabs.get(..3).expect("dabs"));
         crashed.journal_landed(3).expect("counted");
         crashed
@@ -1347,12 +1358,18 @@ mod tests {
         let file = crashed.recovery_path().expect("protected").to_owned();
         // A crash: nothing closes it.
         drop(crashed);
-        let mut never_killed = opening.clone().open().expect("opened");
-        let (mut whole_index, _) = never_killed.load_index(level, |_, _| {}).expect("an index");
-        never_killed.begin_stroke_and_wait().expect("begun");
-        land(&mut never_killed, &mut whole_index, &dabs);
-        let whole = every_surface(&mut never_killed);
-        never_killed.close(false).expect("closed");
+        let whole = if rows == Rows::LastRefused {
+            // No landing takes them all.
+            left.clone()
+        } else {
+            let mut never_killed = opening.clone().open().expect("opened");
+            let (mut whole_index, _) = never_killed.load_index(level, |_, _| {}).expect("an index");
+            never_killed.begin_stroke_and_wait().expect("begun");
+            land(&mut never_killed, &mut whole_index, &dabs);
+            let whole = every_surface(&mut never_killed);
+            never_killed.close(false).expect("closed");
+            whole
+        };
         let mut later = opening.clone().open().expect("opened");
         edit(&mut later);
         drop(later.save().expect("saved"));
@@ -1364,7 +1381,7 @@ mod tests {
     fn open_as_a_copy_lands_the_last_stroke_whole_first() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        let found = left_landing_on_an_earlier_save(&opening, stroke::DAB_FORMAT);
+        let found = left_landing_on_an_earlier_save(&opening, Rows::Of(stroke::DAB_FORMAT));
         assert!(
             farthest(&found.left, &found.whole) > 1e-3,
             "the dabs not landed move the surface"
@@ -1376,7 +1393,6 @@ mod tests {
         assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
         assert!(reopened.copied.is_some(), "said as a save");
         assert_eq!(reopened.note, None, "nothing more to say");
-        assert_eq!(reopened.last_stroke, LastStroke::Whole);
         let mut project = reopened.project;
         assert!(!project.has_unsaved_edits(), "it's saved");
         // Within the stored rounding of the run never killed: every dab, once.
@@ -1391,23 +1407,70 @@ mod tests {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
         // Rows of a layout this app doesn't read.
-        let found = left_landing_on_an_earlier_save(&opening, stroke::DAB_FORMAT + 1);
+        let found = left_landing_on_an_earlier_save(&opening, Rows::Of(stroke::DAB_FORMAT + 1));
         let copy = Reopen::Copy {
             candidate: candidate(&opening, &found.file),
         };
         let reopened = opening.reopen(copy).expect("reopened");
         assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
         assert!(reopened.copied.is_some(), "said as a save");
-        assert_eq!(reopened.last_stroke, LastStroke::Unfinished);
-        assert!(
-            matches!(&reopened.note, Some(OpenNote::Restored { path, .. }) if *path == found.file),
-            "the note of the work restored: {:?}",
-            reopened.note
+        let note = reopened.note.as_ref().expect("a note");
+        assert_eq!(*note, OpenNote::CopyUnfinished);
+        // The copy is saved: the bar offers no way back, and says what's missing.
+        let now = Instant::now();
+        let mut dialogs = dialogs::Dialogs::new(
+            render::surface::Size::new(640, 400),
+            1.0,
+            ui::Blend::Display,
+            now,
         );
+        dialogs.note(note, LastStroke::Whole, now);
+        let bar = dialogs.bar().expect("the note");
+        let actions: Vec<dialogs::Action> = bar.controls().iter().map(|c| c.action).collect();
+        assert_eq!(
+            actions,
+            [dialogs::Action::Dismiss],
+            "nothing but putting it away"
+        );
+        assert_eq!(bar.title(), "Your work is saved as a copy");
+        assert_eq!(bar.details(), [dialogs::UNFINISHED_STROKE]);
         let mut project = reopened.project;
         assert_eq!(every_surface(&mut project), found.left, "the tiles it left");
         project.close(false).expect("closed");
         assert!(!found.file.exists(), "in the copy, so no longer found");
+    }
+
+    #[test]
+    fn a_copy_whose_last_stroke_fails_to_land_keeps_the_work_and_opens_the_project() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let found = left_landing_on_an_earlier_save(&opening, Rows::LastRefused);
+        let candidate = candidate(&opening, &found.file);
+        let copy = Reopen::Copy {
+            candidate: candidate.clone(),
+        };
+        let reopened = opening.reopen(copy).expect("reopened");
+        let failed = reopened.failed.as_ref().expect("the copy failed");
+        assert!(
+            format!("{failed:#}").contains("finishing the last stroke"),
+            "{failed:#}"
+        );
+        assert!(reopened.copied.is_none(), "no copy saved");
+        assert_eq!(
+            reopened.note,
+            Some(OpenNote::EarlierVersion { candidate }),
+            "the note asks again"
+        );
+        let project = reopened.project;
+        assert_eq!(
+            project.path(),
+            Some(opening.path.as_path()),
+            "the project, as it was"
+        );
+        project.close(false).expect("closed");
+        assert!(found.file.exists(), "the work kept where it was found");
+        let beside = dir.path().join("first-sculpt-recovered.bcrf");
+        assert!(!beside.exists(), "and no copy left behind");
     }
 
     /// Makes `dir`'s directory read-only, or writable again.

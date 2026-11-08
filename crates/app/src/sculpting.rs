@@ -154,9 +154,12 @@
 //!   `Down` meanwhile waits behind it, as behind any landing. Once every dab has landed its op ends
 //!   unrecorded ([`Project::end_unrecorded_stroke`]): the journal holds no pen samples, and a
 //!   stroke record is history, never needed to open.
-//! - **Not taken on** with rows of another layout ([`OtherDabFormat`]), or by a project that won't
-//!   resume it: the restored tiles stand, and the project's next stroke closes it in the file. The
-//!   restore note says so.
+//! - **Not taken on** with rows of another layout ([`OtherDabFormat`]), a row that can't be a dab
+//!   of the model (a damaged or hostile file, [`HostileDab`]), or by a project that won't resume it
+//!   (asked twice if the first refusal is the cache's): the restored tiles stand, and the project's
+//!   next stroke closes it in the file. The restore note says so.
+//! - **With no window** (a copy of found work, [`finish_restored`]) it is taken on the same way and
+//!   landed whole at once, blocking, before the copy is saved.
 //!
 //! It lands close to what the live landing would have made, not bit for bit: the stroke state
 //! ([`sculpt::Stroke`]) starts each vertex it touches from the stored, rounded value, where the
@@ -200,7 +203,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::FRAC_PI_2;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use geom::TileKey;
 use input::Phase;
 use render::camera::View;
@@ -631,6 +634,63 @@ impl Source {
 struct OtherDabFormat {
     /// The layout its rows were written in.
     found: u32,
+}
+
+/// Why a stroke a restore found isn't taken on: one of its rows can't be a dab of this model, so
+/// the file holding it is damaged or hostile, and its numbers mustn't reach the index's queries.
+///
+/// A dab is placed on the surface, so its numbers are finite, its radius positive and no wider
+/// than the model (twice the radius of the sphere holding the index's tiles,
+/// [`store::Bvh::bounding_sphere`]), and its sphere reaches that sphere. The rest of what a dab
+/// must be (a normal that has a direction) is checked as it lands ([`apply_dabs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("its dab {at} can't be a dab of this model: {why}")]
+struct HostileDab {
+    /// The dab's place among those not landed.
+    at: usize,
+    /// What is wrong with it.
+    why: &'static str,
+}
+
+impl HostileDab {
+    /// Checks `dab`, the `at`th not landed, against the sphere holding the model's tiles
+    /// (`model`; `None` for an empty index, which nothing can be a dab of).
+    ///
+    /// # Errors
+    ///
+    /// Why it can't be a dab of this model.
+    fn check(at: usize, dab: &Dab, model: Option<([f64; 3], f64)>) -> Result<(), Self> {
+        let hostile = |why| Err(Self { at, why });
+        let numbers = dab
+            .position
+            .iter()
+            .chain(&dab.normal)
+            .chain(&dab.tangent)
+            .chain(&dab.params)
+            .chain([
+                &dab.radius,
+                &dab.strength,
+                &dab.angle,
+                &dab.hardness,
+                &dab.time,
+            ]);
+        if !numbers.copied().all(f32::is_finite) {
+            return hostile("a number that isn't finite");
+        }
+        let Some((centre, model_radius)) = model else {
+            return hostile("the model has no tiles");
+        };
+        let radius = f64::from(dab.radius);
+        if radius <= 0.0 || radius > 2.0 * model_radius {
+            return hostile("a radius out of the model's range");
+        }
+        let offsets = dab.position.iter().zip(centre);
+        let away: f64 = offsets.map(|(&p, c)| (f64::from(p) - c).powi(2)).sum();
+        if away.sqrt() > model_radius + radius {
+            return hostile("a sphere off the model");
+        }
+        Ok(())
+    }
 }
 
 /// What a stroke drawn with the pen keeps for its record ([`StrokeRecord`]).
@@ -1205,40 +1265,72 @@ impl Sculpting {
 
     /// Takes on `found`, the stroke a restore found still landing, through `context` (see "A
     /// stroke a restore found" in the module notes): resumed in the project, its dabs queued as
-    /// a stroke whose pen has lifted and shown at once. Returns whether it did. It doesn't with a
-    /// stroke under way or waiting (never, before any step), with no spatial index (nothing can
-    /// be brushed), or, kept as the brush's error, with rows of another layout or a project that
-    /// won't resume it.
-    fn take_on(&mut self, context: BrushContext<'_>, found: OpenStroke) -> bool {
+    /// a stroke whose pen has lifted and shown at once.
+    ///
+    /// A project that refuses it for a transient reason (the store's cache) is asked once more.
+    ///
+    /// # Errors
+    ///
+    /// Why it isn't taken on, kept as the brush's error too: a stroke under way or waiting
+    /// (never, before any step), no spatial index (nothing can be brushed), no view to land it
+    /// through, rows of another layout ([`OtherDabFormat`]), a row that can't be a dab of this
+    /// model ([`HostileDab`]), or a project that won't resume it.
+    fn take_on(&mut self, context: BrushContext<'_>, found: OpenStroke) -> Result<()> {
+        let taken = self.try_take_on(context, found);
+        if let Err(why) = &taken {
+            self.error = Some(format!("taking on the stroke a restore found: {why:#}"));
+            self.errors += 1;
+        }
+        taken
+    }
+
+    /// [`Sculpting::take_on`], its error not yet kept.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sculpting::take_on`].
+    fn try_take_on(&mut self, context: BrushContext<'_>, found: OpenStroke) -> Result<()> {
         let BrushContext {
             project,
             index,
+            camera,
+            size,
             drawn,
             ..
         } = context;
         if self.stroke.is_some() || !self.deferred.is_empty() || !self.held.is_empty() {
-            return false;
+            return Err(anyhow!("a stroke is under way"));
         }
-        let Some(index) = index else {
-            return false;
-        };
+        let index = index.ok_or_else(|| anyhow!("there is no spatial index to brush"))?;
+        // What a close or a flush lands it through if the camera goes degenerate: it has had no
+        // step to leave one ([`Scene::closing`]).
+        let projector = camera.view(size).as_ref().map(ViewProjector::new);
+        let projector = projector
+            .or(self.last_projector)
+            .ok_or_else(|| anyhow!("there is no view to land it through"))?;
         if found.dab_format() != stroke::DAB_FORMAT {
-            let other = OtherDabFormat {
+            return Err(OtherDabFormat {
                 found: found.dab_format(),
-            };
-            self.fail("taking on the stroke a restore found", &other);
-            return false;
+            }
+            .into());
         }
         // Read out first: resuming takes the stroke. A row is a dab's bytes, so any row casts.
         let rows = found.dabs().iter();
-        let dabs: VecDeque<Dab> = rows
-            .map(|row| bytemuck::cast::<DabRow, Dab>(*row))
-            .collect();
-        let (op, landed) = (found.op(), found.landed());
-        if let Err(refused) = project.resume_stroke(found) {
-            self.fail("taking on the stroke a restore found", &refused);
-            return false;
+        let dabs: VecDeque<Dab> = rows.map(|row: &DabRow| bytemuck::cast(*row)).collect();
+        let model = index.bvh().bounding_sphere();
+        let checked = dabs.iter().enumerate();
+        for (at, dab) in checked {
+            HostileDab::check(at, dab, model)?;
         }
+        let (op, landed) = (found.op(), found.landed());
+        match project.resume_stroke(found) {
+            Ok(()) => {}
+            Err(refused) if matches!(refused.error(), ProjectError::Cache(_)) => {
+                project.resume_stroke(refused.into_stroke())?;
+            }
+            Err(refused) => return Err(refused.into()),
+        }
+        self.last_projector = Some(projector);
         // No pen sample placed them: they date from now, as a lift does.
         let now = Instant::now();
         let times = SampleTimes {
@@ -1269,7 +1361,7 @@ impl Sculpting {
         self.caught_up = std::mem::take(&mut self.caught_up).then(report);
         self.note_kept(project.store());
         self.refresh_status();
-        true
+        Ok(())
     }
 
     /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing and journalling the
@@ -2046,15 +2138,16 @@ impl Sculpting {
     }
 }
 
-/// The size of the view a stroke a restore found lands through with no window
-/// ([`finish_restored`]): its dabs are placed already, so any view does.
-const UNSEEN_VIEW: (u32, u32) = (320, 200);
-
 /// Finishes the stroke a restore of `project` found still landing, with no frame loop.
 ///
 /// Taken on as [`Brush::resume`] takes it, and landed whole, its op ended, before anything else
 /// edits or saves the project (a copy of found work, [`crate::ProjectToOpen::reopen`]). It is
 /// shown nowhere: nothing draws.
+///
+/// It blocks the thread for the whole landing, the window's event loop included, with no frames
+/// and in full batches: a copy is saved in one call that holds the thread anyway (the bar says
+/// "Saving" first), the landing is at most a stroke's backlog, and a copy that lacked the stroke
+/// would lose work the user asked to keep.
 ///
 /// Returns what became of it: [`LastStroke::Whole`] if there was none or it landed, and
 /// [`LastStroke::Unfinished`] if it can't be (a journal the project can't use, rows of another
@@ -2086,9 +2179,7 @@ pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
     // Nothing draws, so nothing is shown ahead: every dab is finest work.
     brush.preview = None;
     let camera = Camera::default();
-    let (width, height) = UNSEEN_VIEW;
-    let size = render::surface::Size::new(width, height)
-        .ok_or_else(|| anyhow!("a view of {width} × {height}"))?;
+    let size = unseen_view()?;
     let taking = BrushContext {
         project: &mut *project,
         index: Some(&mut index),
@@ -2097,12 +2188,8 @@ pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
         drawn: Drawing::NONE,
         waiting: &[],
     };
-    if !brush.resume(taking, stroke) {
-        let why = brush
-            .error
-            .as_deref()
-            .unwrap_or("the brush can't take it on");
-        crate::saving::log(&format!("brushcraft: the last stroke: {why}"));
+    if let Err(why) = brush.resume(taking, stroke) {
+        crate::saving::log(&format!("brushcraft: the last stroke: {why:#}"));
         return Ok(LastStroke::Unfinished);
     }
     let landing = BrushContext {
@@ -2114,12 +2201,29 @@ pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
         waiting: &[],
     };
     brush.flush(landing)?;
+    if brush.landing() > 0 {
+        bail!("{} of the last stroke's dabs didn't land", brush.landing());
+    }
     let reports = brush.take_recovery_reports().into_iter();
     for report in reports {
         let why = anyhow::Error::new(report);
         crate::saving::log(&format!("brushcraft: landing the last stroke: {why:#}"));
     }
     Ok(LastStroke::Whole)
+}
+
+/// The size of the view a stroke a restore found is taken on through before any window has a
+/// size, or with none ([`finish_restored`]): its dabs are placed already, so any view does.
+const UNSEEN_VIEW: (u32, u32) = (320, 200);
+
+/// [`UNSEEN_VIEW`] as a size.
+///
+/// # Errors
+///
+/// Never: it isn't empty.
+pub(crate) fn unseen_view() -> Result<render::surface::Size> {
+    let (width, height) = UNSEEN_VIEW;
+    render::surface::Size::new(width, height).ok_or_else(|| anyhow!("a view of {width} × {height}"))
 }
 
 /// When `sample` was taken and when it reached the app.
@@ -2150,7 +2254,10 @@ struct Scene<'a> {
 impl<'a> Scene<'a> {
     /// `context`'s scene for a close: a degenerate camera gives `fallback`, the last good
     /// projector, as what is left to land hardly needs a view. `None` if there is no index, or
-    /// nothing ever gave a view: no stroke began then.
+    /// nothing ever gave a view: no stroke began then. A stroke a restore found begins with no
+    /// step, and so with no view of one; taking it on keeps the view it was taken on through as
+    /// that projector, and one with no view isn't taken on ([`Sculpting::take_on`]), so a stroke
+    /// under way always has one here.
     fn closing(context: BrushContext<'a>, fallback: Option<&ViewProjector>) -> Option<Self> {
         let BrushContext {
             project,
@@ -2358,7 +2465,7 @@ impl Brush for Sculpting {
         self.before_next_sample().filter(|_| self.pen_moving())
     }
 
-    fn resume(&mut self, context: BrushContext<'_>, stroke: OpenStroke) -> bool {
+    fn resume(&mut self, context: BrushContext<'_>, stroke: OpenStroke) -> Result<()> {
         self.take_on(context, stroke)
     }
 

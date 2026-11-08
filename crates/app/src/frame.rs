@@ -488,11 +488,15 @@ pub(crate) trait Brush {
 
     /// Takes on `stroke`, the stroke a restore found still landing ([`Project::take_open_stroke`]),
     /// before any step: resumed in the project ([`Project::resume_stroke`]), its dabs shown at
-    /// once and landing as a stroke whose pen has lifted, a new stroke waiting behind it. Returns
-    /// whether it did; one it doesn't is closed by the project's next stroke, its dabs not landed
-    /// lost. By default none is taken on.
-    fn resume(&mut self, _context: BrushContext<'_>, _stroke: OpenStroke) -> bool {
-        false
+    /// once and landing as a stroke whose pen has lifted, a new stroke waiting behind it. One it
+    /// doesn't take on is closed by the project's next stroke, its dabs not landed lost. The
+    /// context's size may be a stand-in's, before a window has one: the dabs are placed already.
+    ///
+    /// # Errors
+    ///
+    /// Why it isn't taken on. By default none is.
+    fn resume(&mut self, _context: BrushContext<'_>, _stroke: OpenStroke) -> Result<()> {
+        Err(anyhow!("this brush takes no stroke on"))
     }
 
     /// The window was asked to close: lifts the pen of any open stroke, and has the brush land
@@ -1762,12 +1766,6 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.scheduler.want(Reason::Overlay);
     }
 
-    /// The stroke a restore found still landing couldn't be finished, taken on elsewhere (for a
-    /// copy of found work, [`crate::sculpting::finish_restored`]): the note that follows says so.
-    pub(crate) const fn last_stroke_unfinished(&mut self) {
-        self.last_stroke = LastStroke::Unfinished;
-    }
-
     /// Hands the brush the stroke a restore found still landing, if there was one
     /// ([`Project::take_open_stroke`], [`Brush::resume`]): before any frame, so it is on screen
     /// in the first, and no stroke or edit can come before it. A journal the project can't use,
@@ -1783,14 +1781,19 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         };
         let resumed = match found {
             Ok(stroke) => {
+                // A window minimised, or not yet configured, has no size: a stand-in's does, as
+                // nothing of the stroke is placed through it.
                 let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
-                let taken = size.is_some_and(|size| {
+                let size = size.map_or_else(crate::sculpting::unseen_view, Ok);
+                let taken = size.and_then(|size| {
                     self.with_brush(size, |brush, context| brush.resume(context, stroke))
                 });
-                if !taken {
-                    saving::log("brushcraft: the last stroke couldn't be taken on to finish");
+                if let Err(why) = &taken {
+                    saving::log(&format!(
+                        "brushcraft: the last stroke can't be finished: {why:#}"
+                    ));
                 }
-                taken
+                taken.is_ok()
             }
             Err(why) => {
                 let why = anyhow::Error::new(why);

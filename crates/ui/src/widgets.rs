@@ -93,13 +93,7 @@ impl<A> Bar<A> {
         &self.title
     }
 
-    /// What it says under that, if anything: its first detail line.
-    #[must_use]
-    pub fn detail(&self) -> Option<&str> {
-        self.detail.first().map(String::as_str)
-    }
-
-    /// Every line it says under that, in order.
+    /// Every line it says under its title, in order: none, one, or more.
     #[must_use]
     pub fn details(&self) -> &[String] {
         &self.detail

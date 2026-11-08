@@ -3421,7 +3421,7 @@ fn dabs_dropped_while_a_failed_save_keeps_the_window_count_as_told() {
 /// What the bar says: its title and detail, as a test can read them whichever bar it is.
 fn bar_says<B: Brush, U: Uploads>(owner: &Owner<B, U>) -> String {
     let bar = owner.dialogs.bar().expect("a bar");
-    format!("{} / {}", bar.title(), bar.detail().unwrap_or_default())
+    format!("{} / {}", bar.title(), bar.details().join(" / "))
 }
 
 /// A full disk's error, as a save gets it.

@@ -181,6 +181,13 @@ enum Prompt {
         /// When the note goes by itself.
         until: Instant,
     },
+    /// "Your work is saved as a copy", with [`UNFINISHED_STROKE`] under it: found work went to a
+    /// copy, saved, and its last stroke couldn't be finished. The copy is saved, so nothing is
+    /// offered but putting it away.
+    CopyUnfinished {
+        /// When the note goes by itself.
+        until: Instant,
+    },
     /// "Unsaved work found from an earlier version": found, not restored, and the user's to
     /// decide, however long that takes.
     EarlierVersion {
@@ -242,6 +249,11 @@ impl Prompt {
                     LastStroke::Whole => bar,
                     LastStroke::Unfinished => bar.with_detail(UNFINISHED_STROKE),
                 })
+            }
+            Self::CopyUnfinished { .. } => {
+                let controls = vec![quiet("Dismiss", Action::Dismiss)];
+                let bar = Bar::new("Your work is saved as a copy", controls);
+                Some(bar.with_detail(UNFINISHED_STROKE))
             }
             Self::EarlierVersion { said, .. } => {
                 let copy = Control {
@@ -557,6 +569,9 @@ impl Dialogs {
                 said: said_now(candidate.modified),
                 candidate: candidate.clone(),
             },
+            OpenNote::CopyUnfinished => Prompt::CopyUnfinished {
+                until: now + Theme::GLASS.note_hold,
+            },
         };
         if self.failing() || self.says_stopped() {
             self.behind = Some(prompt);
@@ -569,7 +584,7 @@ impl Dialogs {
     /// When the note goes by itself, if one showing does.
     const fn note_until(&self) -> Option<Instant> {
         match self.prompt {
-            Prompt::Restored { until, .. } => Some(until),
+            Prompt::Restored { until, .. } | Prompt::CopyUnfinished { until } => Some(until),
             Prompt::None
             | Prompt::AskClose { .. }
             | Prompt::Finishing { .. }
@@ -584,7 +599,10 @@ impl Dialogs {
     pub(crate) const fn noting(&self) -> bool {
         matches!(
             self.prompt,
-            Prompt::Restored { .. } | Prompt::EarlierVersion { .. } | Prompt::Copying
+            Prompt::Restored { .. }
+                | Prompt::CopyUnfinished { .. }
+                | Prompt::EarlierVersion { .. }
+                | Prompt::Copying
         )
     }
 
@@ -652,7 +670,10 @@ impl Dialogs {
     /// Puts `prompt` on the bar, a note it replaces coming back after it.
     fn say_over_a_note(&mut self, prompt: Prompt, now: Instant) {
         let was = std::mem::replace(&mut self.prompt, prompt);
-        if matches!(was, Prompt::Restored { .. } | Prompt::EarlierVersion { .. }) {
+        if matches!(
+            was,
+            Prompt::Restored { .. } | Prompt::CopyUnfinished { .. } | Prompt::EarlierVersion { .. }
+        ) {
             self.behind = Some(was);
         }
         self.show_prompt(now);
@@ -669,7 +690,10 @@ impl Dialogs {
     pub(crate) const fn can_tell_of_stopping(&self) -> bool {
         matches!(
             self.prompt,
-            Prompt::None | Prompt::Restored { .. } | Prompt::EarlierVersion { .. }
+            Prompt::None
+                | Prompt::Restored { .. }
+                | Prompt::CopyUnfinished { .. }
+                | Prompt::EarlierVersion { .. }
         )
     }
 
@@ -1116,8 +1140,9 @@ mod tests {
             let frame = dialogs.frame(now).expect("it draws");
             let bar = dialogs.bar().expect("a bar");
             let labels = bar.controls().iter().map(|c| c.label.as_str());
-            let said = [bar.title(), bar.detail().unwrap_or_default()];
-            let letters = said.into_iter().chain(labels).flat_map(str::chars);
+            let details = bar.details().iter().map(String::as_str);
+            let said = std::iter::once(bar.title()).chain(details);
+            let letters = said.chain(labels).flat_map(str::chars);
             let letters = letters.filter(|letter| !letter.is_whitespace()).count();
             assert_eq!(frame.list.glyphs.len(), letters, "{}", failure.detail());
         }
@@ -1136,8 +1161,9 @@ mod tests {
         let frame = dialogs.frame(now).expect("it draws");
         let bar = dialogs.bar().expect("a bar");
         let labels = bar.controls().iter().map(|c| c.label.as_str());
-        let said = [bar.title(), bar.detail().unwrap_or_default()];
-        let letters = said.into_iter().chain(labels).flat_map(str::chars);
+        let details = bar.details().iter().map(String::as_str);
+        let said = std::iter::once(bar.title()).chain(details);
+        let letters = said.chain(labels).flat_map(str::chars);
         let letters = letters.filter(|letter| !letter.is_whitespace()).count();
         assert_eq!(frame.list.glyphs.len(), letters, "{}", bar.title());
     }
