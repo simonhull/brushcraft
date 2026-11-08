@@ -76,11 +76,39 @@
 //! flight: a trigger while one is queues the next, which starts as soon as the current one is
 //! durable and takes every edit made in the meantime.
 //!
+//! # A stroke's first landing waits for its cut
+//!
+//! A restore of a journalled stroke needs its **pen-down surface**, every tile as the stroke
+//! found them, in a save point (see [`crate::journal`]). A flush queued behind one in flight takes
+//! its snapshot only when it starts, so strokes back to back could leave no save point at the
+//! second's pen-down. So as a stroke's op begins, the owner asks
+//! [`RecoveryWriter::cut_before_op`] which flush's cut will hold it:
+//!
+//! - **No flush in flight:** if anything waits to be flushed, a flush starts now and its cut does;
+//!   otherwise the working file's latest save point does (or, before its first, the state the file
+//!   starts from).
+//! - **A flush in flight, no edit since its cut, and no valid tile left out of it:** that one's.
+//! - **Otherwise:** the next flush's, queued behind the one in flight. The stroke begins all the
+//!   same (its dabs are placed, journalled and shown ahead), but **lands nothing until that cut is
+//!   taken** ([`crate::Project::may_land`]): at most the flush in flight's syncs, and only when
+//!   strokes come back to back.
+//!
+//! One cut is in flight at a time: nothing is copied early, and the pen-down path costs nothing
+//! beyond a flush that starts. A flush whose encode left a valid tile out (a copy that failed for a
+//! reason that may pass) names that tile's older state, so it can't hold a pen-down: the next one
+//! does. And a flush holding one that leaves a valid tile out is abandoned
+//! ([`RecoveryError::Unpaired`]), as one carrying a batch is; a pen-down flush abandoned leaves the
+//! stroke's pen-down unknown, and its journal unusable for a restore (the tiles restore alone).
+//!
+//! This holds while strokes don't overlap: a stroke begins only once the last one's op has ended
+//! (every dab landed or dropped), so no edit of the last stroke follows the next one's cut.
+//!
 //! # Failure
 //!
 //! An error in any phase is returned by the call that met it, and the flush is abandoned, along
 //! with any flush queued behind it: the edits it held stay in the store's flush mark (or, if
-//! already appended, in the file waiting for a save point), and the next trigger tries again.
+//! already appended, in the file waiting for a save point), and the next trigger tries again. A
+//! stroke whose pen-down either was to hold learns it is unknown, and may land.
 //!
 //! A dab batch that doesn't encode ([`RecoveryError::Journal`]) is such an error, unlike a tile:
 //! its dabs stay in the journal for the next flush, with nothing of the flush appended. Leaving
@@ -88,8 +116,9 @@
 //! file's last batch states, and a restore would land those dabs a second time. For the same
 //! reason a tile left out for a failure that may pass, in a flush that carries a batch, abandons
 //! the flush too ([`RecoveryError::Unpaired`]): the save point would name the tile's older state
-//! beside a count that counts its dabs landed. A broken slot is lost either way, and handled as
-//! in any flush first.
+//! beside a count that counts its dabs landed. So does one in a flush holding a stroke's pen-down
+//! surface, which would name a surface the stroke never found. A broken slot is lost either way,
+//! and handled as in any flush first.
 //!
 //! So a valid tile that keeps failing to encode while a batch is due abandons every flush, with
 //! no save point, until it encodes, and its key is reported late each time
@@ -132,8 +161,9 @@ use thiserror::Error;
 
 use crate::feed::ConsumerId;
 use crate::file::{FileError, FileSyncer, FramedTile, frame_batch, frame_displacement};
-use crate::journal::DabBatch;
-use crate::tiles::{CacheError, Snapshot, TileStore};
+use crate::journal::{DabBatch, PenDown};
+use crate::stamp::Stamp;
+use crate::tiles::{CacheError, CutId, PenDownPoint, Snapshot, TileStore};
 
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -169,10 +199,12 @@ pub enum RecoveryError {
     #[error("a dab batch of the stroke's journal couldn't be encoded")]
     Journal(#[source] FileError),
     /// A tile's copy didn't encode, for a failure that may pass, in a flush that carries a dab
-    /// batch. The flush is abandoned with none of its tiles or batches appended: its save point
-    /// would name the tile's older state beside a landed count that counts its dabs. The tile
-    /// stays dirty and the dabs in the journal, for the next flush (see the module notes).
-    #[error("a tile of a flush with dab batches didn't encode")]
+    /// batch or holds a stroke's pen-down surface. The flush is abandoned with none of its tiles
+    /// or batches appended: its save point would name the tile's older state beside a landed
+    /// count that counts its dabs, or as the surface the stroke found. The tile stays dirty and
+    /// the dabs in the journal, for the next flush; the pen-down is unknown (see the module
+    /// notes).
+    #[error("a tile of a flush with dab batches or a pen-down surface didn't encode")]
     Unpaired,
     /// A reply arrived that the flush in flight wasn't waiting for: a bug in the writer.
     #[error("the recovery writer's thread replied out of step")]
@@ -200,6 +232,21 @@ enum Phase {
     /// A sync failed, or the writer thread stopped: no flush will be made into this file again
     /// (see the module notes).
     Failed,
+}
+
+/// The flush in flight's cut.
+#[derive(Debug, Clone, Copy)]
+struct Flight {
+    /// The cut's name: its journals' cut, and the flush a stroke's pen-down may wait on.
+    id: CutId,
+    /// The store's write the cut is at.
+    stamp: Stamp,
+    /// Whether a stroke's pen-down surface is to be in its save point, which must then hold every
+    /// tile at the cut (see the module notes).
+    holds_pen_down: bool,
+    /// Whether its encode left a valid tile out: its save point names that tile's older state, so
+    /// it can't hold a pen-down surface.
+    left_valid_out: bool,
 }
 
 /// What the owner asks of the writer thread.
@@ -253,11 +300,22 @@ struct Hooks {
     in_flight: std::sync::atomic::AtomicUsize,
     /// The most [`Hooks::in_flight`] has been.
     peak_in_flight: std::sync::atomic::AtomicUsize,
-    /// Holds the writer thread back while set: it takes no request until it is cleared, so a
-    /// test can act while a flush is certainly in flight, its next reply not yet sent.
-    paused: std::sync::Mutex<bool>,
+    /// Holds the writer thread back while set: it takes no request (or, see [`Pause`], no sync)
+    /// until it is cleared, so a test can act while a flush is certainly in flight, its next
+    /// reply not yet sent.
+    paused: std::sync::Mutex<Pause>,
     /// Signalled when [`Hooks::paused`] is cleared.
     unpaused: std::sync::Condvar,
+}
+
+/// Which requests the writer thread is held back from, in tests.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Pause {
+    /// Every request.
+    all: bool,
+    /// Syncs only: a flush encodes, then waits in its tile sync.
+    syncs: bool,
 }
 
 #[cfg(test)]
@@ -295,25 +353,27 @@ impl Hooks {
             .fetch_sub(Self::bytes_of(snapshots), Ordering::SeqCst);
     }
 
-    /// Holds the writer thread back, or lets it go. A poisoned lock is taken over as it is: it
-    /// guards a single flag.
-    fn pause(&self, paused: bool) {
-        *self
-            .paused
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = paused;
+    /// Holds the writer thread back from what `change` sets, or lets it go. A poisoned lock is
+    /// taken over as it is: it guards two flags.
+    fn pause(&self, change: impl FnOnce(&mut Pause)) {
+        change(
+            &mut self
+                .paused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         self.unpaused.notify_all();
     }
 
-    /// Blocks the writer thread for as long as it is held back.
-    fn wait_while_paused(&self) {
+    /// Blocks the writer thread for as long as it is held back from a request, a sync if `sync`.
+    fn wait_while_paused(&self, sync: bool) {
         let paused = self
             .paused
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(
             self.unpaused
-                .wait_while(paused, |paused| *paused)
+                .wait_while(paused, |paused| paused.all || (sync && paused.syncs))
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
     }
@@ -339,6 +399,8 @@ pub struct RecoveryWriter {
     thread: Option<JoinHandle<()>>,
     /// Where the flush in flight is.
     phase: Phase,
+    /// The flush in flight's cut; `None` while idle.
+    flight: Option<Flight>,
     /// When a trigger that met a flush in flight came: the next flush is owed, and starts as
     /// soon as the current one is durable.
     queued: Option<Instant>,
@@ -363,6 +425,9 @@ pub struct RecoveryWriter {
     /// Test hooks shared with the writer thread.
     #[cfg(test)]
     hooks: Arc<Hooks>,
+    /// Test record: the tiles each flush's snapshot copied, in the order taken.
+    #[cfg(test)]
+    copied: Vec<Vec<TileKey>>,
 }
 
 impl RecoveryWriter {
@@ -395,6 +460,7 @@ impl RecoveryWriter {
             stop,
             thread: Some(thread),
             phase: Phase::Idle,
+            flight: None,
             queued: None,
             unconfirmed: false,
             last_flush: None,
@@ -405,6 +471,8 @@ impl RecoveryWriter {
             lost: Vec::new(),
             #[cfg(test)]
             hooks,
+            #[cfg(test)]
+            copied: Vec::new(),
         })
     }
 
@@ -447,6 +515,71 @@ impl RecoveryWriter {
             .is_none_or(|last| now.saturating_duration_since(last) >= FLUSH_INTERVAL);
         if due && self.has_work(store) {
             self.trigger(store, now)?;
+        }
+        Ok(())
+    }
+
+    /// A stroke's op is about to begin, at `now`, before its first edit: says which flush's cut
+    /// will hold every tile as the op finds them, its pen-down surface, starting it or queueing it
+    /// if need be (see the module notes, "A stroke's first landing waits for its cut"). It
+    /// doesn't advance the flush in flight, and copies nothing a flush wouldn't.
+    ///
+    /// [`PenDownPoint::Next`] says the stroke must land nothing until the flush queued behind
+    /// the one in flight has taken its cut ([`TileStore::may_land`]).
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryError::NeedsNewFile`] if the writer has failed; any [`RecoveryError`] of
+    /// starting a flush, which is abandoned (see the module notes). No save point holds the
+    /// pen-down surface then.
+    pub(crate) fn cut_before_op(
+        &mut self,
+        store: &mut TileStore,
+        now: Instant,
+    ) -> Result<PenDownPoint, RecoveryError> {
+        if self.phase == Phase::Failed {
+            return Err(RecoveryError::NeedsNewFile);
+        }
+        if self.phase == Phase::Idle {
+            if self.has_work(store) {
+                self.start(store, now)?;
+            }
+            return Ok(match &mut self.flight {
+                Some(flight) => {
+                    flight.holds_pen_down = true;
+                    PenDownPoint::Flush(flight.id)
+                }
+                None => PenDownPoint::Known(latest_save_point(store)),
+            });
+        }
+        if let Some(flight) = &mut self.flight
+            && !flight.left_valid_out
+            && !store.written_since(flight.stamp)
+        {
+            flight.holds_pen_down = true;
+            return Ok(PenDownPoint::Flush(flight.id));
+        }
+        self.queued.get_or_insert(now);
+        Ok(PenDownPoint::Next)
+    }
+
+    /// Blocks until the open stroke may land ([`TileStore::may_land`]): its pen-down flush,
+    /// queued behind the one in flight, has taken its cut, or the flushes were abandoned (the
+    /// pen-down is then unknown). For a landing that can't wait for frames: a close's or a save's.
+    /// Returns at once if the stroke may land already.
+    ///
+    /// # Errors
+    ///
+    /// As [`RecoveryWriter::poll`]; the stroke may land then too, its pen-down unknown.
+    pub(crate) fn wait_for_cut(&mut self, store: &mut TileStore) -> Result<(), RecoveryError> {
+        while !store.may_land() {
+            if matches!(self.phase, Phase::Idle | Phase::Failed) {
+                // Nothing will take the cut: only a bug leaves a pen-down waiting with no flush
+                // in flight, and the stroke must not wait on it for ever.
+                store.pen_downs_abandoned();
+                return Ok(());
+            }
+            self.wait_step(store)?;
         }
         Ok(())
     }
@@ -504,6 +637,10 @@ impl RecoveryWriter {
     /// Unsubscribes from the store's change feed and stops the writer thread at once, leaving
     /// whatever isn't flushed: for a recovery file about to be removed, which nothing need reach.
     pub(crate) fn abandon(self, store: &mut TileStore) {
+        // No flush in flight will end: its cut, and the pen-down surfaces waiting on it, are given
+        // up with the file.
+        store.drop_journal_cut();
+        store.pen_downs_abandoned();
         store.unsubscribe_stream(self.consumer);
     }
 
@@ -592,7 +729,7 @@ impl RecoveryWriter {
     fn start(&mut self, store: &mut TileStore, at: Instant) -> Result<(), RecoveryError> {
         self.queued = None;
         let owed = std::mem::take(&mut self.unconfirmed);
-        store.open_cut();
+        let stamp = store.open_cut();
         self.generation = store.generation();
         let before = self.skipped.len();
         let snapshot = store
@@ -601,27 +738,40 @@ impl RecoveryWriter {
                 // The journal as of the snapshot, so its landed count is the snapshot's; the
                 // bounds of the snapshot's state, at the same cut; and the records of the strokes
                 // it ends.
-                let batches = store.cut_journal()?;
+                let (id, batches) = store.cut_journal()?;
                 store.flush_bounds(self.skipped.get(before..).unwrap_or_default())?;
                 store.flush_strokes()?;
-                Ok((snapshots, batches))
+                Ok((snapshots, id, batches))
             });
         // A dirty slot with no op is a broken one: lost, not late.
         self.lost
             .extend(self.skipped.get(before..).unwrap_or_default());
         let started = match snapshot {
-            Ok((snapshots, batches)) if !snapshots.is_empty() || !batches.is_empty() => {
+            Ok((snapshots, id, batches)) => {
                 #[cfg(test)]
-                self.hooks.sent(&snapshots);
-                self.send(Request::Encode(snapshots, batches))
-                    .map(|()| self.phase = Phase::Encoding)
-            }
-            Ok(_) if owed || store.has_unsaved_records() => self.request_tile_sync(store),
-            // Nothing to flush: the interval keeps running from the last real flush, and no
-            // save point follows the cut.
-            Ok(_) => {
-                store.drop_cut();
-                return Ok(());
+                self.copied.push(snapshots.iter().map(|s| s.key).collect());
+                let flight = Flight {
+                    id,
+                    stamp,
+                    holds_pen_down: false,
+                    left_valid_out: false,
+                };
+                if !snapshots.is_empty() || !batches.is_empty() {
+                    #[cfg(test)]
+                    self.hooks.sent(&snapshots);
+                    self.flight = Some(flight);
+                    self.send(Request::Encode(snapshots, batches))
+                        .map(|()| self.phase = Phase::Encoding)
+                } else if owed || store.has_unsaved_records() {
+                    self.flight = Some(flight);
+                    self.request_tile_sync(store)
+                } else {
+                    // Nothing to flush: the interval keeps running from the last real flush, no
+                    // save point follows the cut, and the latest holds what the cut does.
+                    store.drop_cut();
+                    store.pen_down_settled(id, latest_save_point(store));
+                    return Ok(());
+                }
             }
             Err(e) => Err(e.into()),
         };
@@ -668,6 +818,7 @@ impl RecoveryWriter {
         }
         match (self.phase, reply) {
             (Phase::Encoding, Reply::Encoded(tiles, broken, batches)) => {
+                let flight = self.flight.ok_or(RecoveryError::OutOfStep)?;
                 // A batch left out would leave the save point naming tiles past the landed
                 // count of the file's last batch: the flush is abandoned before anything of it is
                 // appended, and the journal keeps the dabs for the next.
@@ -683,15 +834,22 @@ impl RecoveryWriter {
                 self.lost.extend(lost.iter().copied());
                 store.forget_bounds_at_cut(&broken, &lost)?;
                 // A valid tile left out keeps its older state in the save point, which the
-                // batch's landed count would count past: nothing of the flush is appended, and
-                // the tile and the dabs wait for the next. A lost one is gone either way.
-                if store.has_journal_cut() && broken.len() > lost.len() {
+                // batch's landed count would count past, or a stroke would take for the surface
+                // it found: nothing of the flush is appended, and the tile and the dabs wait for
+                // the next. A lost one is gone either way.
+                let left_valid_out = broken.len() > lost.len();
+                if left_valid_out && (!batches.is_empty() || flight.holds_pen_down) {
                     return Err(RecoveryError::Unpaired);
                 }
+                // Then it can hold no pen-down a stroke begins on later.
+                if let Some(in_flight) = &mut self.flight {
+                    in_flight.left_valid_out = left_valid_out;
+                }
+                let id = flight.id;
                 store.append_streamed(self.consumer, &tiles)?;
                 // Before the sync is asked for, so it covers them and the save point holds them;
                 // the journal moves on only once they are in the file.
-                store.append_journal(&batches)?;
+                store.append_journal(id, &batches)?;
                 self.request_tile_sync(store)
             }
             (Phase::SyncingTiles { end }, Reply::Synced(synced)) => {
@@ -710,6 +868,11 @@ impl RecoveryWriter {
                 self.durable = Some(offset);
                 self.flushes += 1;
                 self.phase = Phase::Idle;
+                // Settled before the next flush cuts the journals: a stroke whose pen-down this
+                // flush holds has batches only in later flushes.
+                if let Some(flight) = self.flight.take() {
+                    store.pen_down_settled(flight.id, PenDown::At(offset));
+                }
                 match self.queued {
                     Some(at) => self.start(store, at),
                     None => Ok(()),
@@ -764,6 +927,9 @@ impl RecoveryWriter {
             // A cut whose batches were appended is noted written already: only one still in
             // flight goes, for the next flush to write again.
             store.drop_journal_cut();
+            // The flush in flight and the one queued behind it hold no pen-down surface now.
+            store.pen_downs_abandoned();
+            self.flight = None;
             self.queued = None;
             self.unconfirmed = true;
             self.phase = match (self.phase, e) {
@@ -807,14 +973,26 @@ impl RecoveryWriter {
     /// however the threads are scheduled: a trigger then meets the flush in flight and queues
     /// the next one. Dropping the writer lets the thread go.
     pub(crate) fn pause(&self, paused: bool) {
-        self.hooks.pause(paused);
+        self.hooks.pause(|pause| pause.all = paused);
+    }
+
+    /// Holds the writer thread back before it takes its next sync, or lets it go: a flush
+    /// encodes, then stays in its tile sync once the owner has appended its records, whatever
+    /// the owner polls.
+    pub(crate) fn pause_syncs(&self, paused: bool) {
+        self.hooks.pause(|pause| pause.syncs = paused);
+    }
+
+    /// The tiles each flush's snapshot so far copied, in the order taken.
+    pub(crate) fn copied(&self) -> &[Vec<TileKey>] {
+        &self.copied
     }
 
     /// Stops the writer thread as a panic would: its channel closes and the thread is joined, so
     /// the next request finds it gone.
     pub(crate) fn stop_thread(&mut self) {
         drop(self.requests.take());
-        self.hooks.pause(false);
+        self.hooks.pause(|pause| *pause = Pause::default());
         if let Some(thread) = self.thread.take() {
             drop(thread.join());
         }
@@ -870,7 +1048,7 @@ impl Drop for RecoveryWriter {
         self.stop.store(true, Ordering::Relaxed);
         drop(self.requests.take());
         #[cfg(test)]
-        self.hooks.pause(false);
+        self.hooks.pause(|pause| *pause = Pause::default());
         if let Some(thread) = self.thread.take() {
             // A thread that panicked has nothing left to clean up; its panic was reported on
             // its own thread.
@@ -898,7 +1076,8 @@ impl Worker {
     fn run(self) {
         while let Ok(request) = self.requests.recv() {
             #[cfg(test)]
-            self.hooks.wait_while_paused();
+            self.hooks
+                .wait_while_paused(matches!(request, Request::Sync(_)));
             let reply = match request {
                 Request::Encode(snapshots, batches) => {
                     let encoded = self.encode(&snapshots);
@@ -972,6 +1151,14 @@ impl Worker {
         }
         Some(Ok(framed))
     }
+}
+
+/// The working file's latest save point, as a pen-down: where a stroke's surface is when every
+/// edit is in the file and named by it, the file's base before its first.
+fn latest_save_point(store: &TileStore) -> PenDown {
+    store
+        .working_last_save_point()
+        .map_or(PenDown::Base, PenDown::At)
 }
 
 /// Syncs the file `syncer` names, or (in tests) fails if `hooks` says to.

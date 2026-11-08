@@ -155,14 +155,21 @@ mod tests {
     use super::*;
     use crate::OpId;
     use crate::fixture::{dab_at, damage, mesh, meta};
-    use crate::journal::DAB_BYTES;
+    use crate::journal::{DAB_BYTES, PenDown};
     use crate::test_dir::TestDir;
 
     /// The `k`th test batch: op 5 of site 0, `k + 1` dabs from index `10 × k`, all but the last
-    /// landed.
+    /// landed, its pen-down surface at the file's start.
     fn batch(k: u32) -> DabBatch {
         let dabs: Vec<[u8; DAB_BYTES]> = (10 * k..=11 * k).map(dab_at).collect();
-        DabBatch::new(OpId::new(0, 5).unwrap(), 10 * k, 11 * k, dabs).unwrap()
+        DabBatch::new(
+            OpId::new(0, 5).unwrap(),
+            10 * k,
+            11 * k,
+            PenDown::Base,
+            dabs,
+        )
+        .unwrap()
     }
 
     /// Appends batches `ks` to `file`, each after a tile written by its op, a flush apiece.

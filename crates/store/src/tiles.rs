@@ -165,6 +165,7 @@ pub use edit::TileEdit;
 pub use error::{CacheError, Invariant};
 pub use frames::{ParentSlots, Predictor};
 pub use journal::JournalCountError;
+pub(crate) use journal::{CutId, PenDownPoint};
 pub(crate) use layers::{Saved, Snapshot};
 pub use pen_down::{MadePenDown, PenDownMaker, PenDownShape, PenDownTaker, TakenShape};
 pub use pins::PinGuard;

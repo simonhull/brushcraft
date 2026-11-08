@@ -1,5 +1,7 @@
-//! The open stroke's dab journal on the store (see [`crate::journal`]): the dabs it placed and
-//! hasn't landed, how many have landed, and what the working file holds of them so far.
+//! The open stroke's dab journal on the store (see [`crate::journal`]).
+//!
+//! It holds the dabs the stroke placed and hasn't landed, how many have landed, what the working
+//! file holds of them so far, and where the surface the stroke began on is.
 //!
 //! # Through a flush
 //!
@@ -23,11 +25,29 @@
 //! leaves the journal as it was, and the next flush writes the same dabs, with the landed count it
 //! finds, once, never overlapping a batch in the file. A flush abandoned after its append (a failed
 //! save point) leaves its batches in the file for the next save point to hold, and the journal
-//! goes on after them.
+//! goes on after them. One flush is in flight at a time, so a journal has at most one cut in
+//! flight; each is named ([`CutId`]), so a pen-down can name the flush that holds it.
 //!
 //! A batch is due while a dab placed isn't written, or the landed count moved since the last
 //! batch: then a batch of no dabs carries the count alone. A stroke none of whose batches is in
 //! the file, or in flight, and whose dabs have all landed is due none: its tiles hold every dab.
+//!
+//! # The pen-down save point
+//!
+//! Each journal knows where its stroke's pen-down surface is ([`PenDownPoint`]), and every batch
+//! it cuts names it ([`crate::PenDown`]). [`TileStore::begin_journal`] is told which flush holds
+//! it: one started as the stroke began, or the one in flight if no edit followed its cut, or the
+//! next one to start, queued behind the one in flight; or none, with every edit already named by
+//! the working file's latest save point, which then holds it (the file's base, before its first).
+//! The next flush's cut takes it up ([`TileStore::cut_journal`]); a named flush settles it, with
+//! its save point's offset once durable ([`TileStore::pen_down_settled`]), or as unknown if it is
+//! abandoned ([`TileStore::pen_downs_abandoned`]).
+//!
+//! **The stroke lands nothing before its pen-down flush has cut** ([`TileStore::may_land`]): the
+//! cut must hold every earlier op's edits and none of the stroke's own. And **a journal cuts no
+//! batch before its pen-down settles**: its dabs wait for the flush after (they are due none
+//! until then), so every batch names a settled save point. Flushes run one at a time, so the
+//! pen-down flush is durable or abandoned before the next one cuts.
 //!
 //! # When the stroke ends
 //!
@@ -44,7 +64,7 @@
 //! about 1.4 MB at the forced landing's 16,384 dabs. Every row a landed count passes goes at once.
 //! A move onto a fresh working file (a save's rebase, or a roll-over) takes none of the batches
 //! with it ([`TileStore::rebase_journal`]), so the rows a later flush must write again are still
-//! at hand.
+//! at hand. Nor its pen-down: the new file holds no save point of the surface the stroke began on.
 //!
 //! The owner thread's cost per flush is the cut: a copy of the rows not yet written, about a
 //! second of placed dabs. Encoding, compression and syncing happen on the writer thread.
@@ -56,7 +76,27 @@ use thiserror::Error;
 use super::TileStore;
 use super::error::{CacheError, Invariant};
 use crate::OpId;
-use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS};
+use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS, PenDown};
+
+/// The name of a flush's cut of the journals ([`TileStore::cut_journal`]).
+///
+/// A journal tells its cut in flight by it, and a pen-down names the flush that holds it by it.
+/// Each cut the store takes is named by the next number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CutId(u64);
+
+/// Where a journal's pen-down surface is (see the module notes): in the save point of a flush not
+/// yet settled, or known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PenDownPoint {
+    /// The next flush to cut holds it: one is queued behind the one in flight. Its stroke lands
+    /// nothing until that cut is taken.
+    Next,
+    /// The flush whose cut this is holds it: its save point, once durable.
+    Flush(CutId),
+    /// Settled: a save point, the file's base, or unknown.
+    Known(PenDown),
+}
 
 /// Why the open stroke's journal refused what it was given. Nothing changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -97,7 +137,8 @@ struct Written {
     landed: u32,
 }
 
-/// One stroke's journal: its dabs not yet landed, the counts, and what the working file holds.
+/// One stroke's journal: its dabs not yet landed, the counts, what the working file holds, and
+/// where its pen-down surface is.
 ///
 /// Holds `landed ≤ placed` and `rows.len() == placed - landed`: the rows are exactly the dabs not
 /// landed, from index `landed`.
@@ -113,13 +154,15 @@ struct Journal {
     rows: VecDeque<[u8; DAB_BYTES]>,
     /// What the working file's batches hold; `None` while it holds none of this stroke.
     written: Option<Written>,
-    /// What the file holds once the cut in flight is appended; `None` while none is.
-    in_flight: Option<Written>,
+    /// The cut in flight, and what the file holds once it is appended; `None` while none is.
+    in_flight: Option<(CutId, Written)>,
+    /// Where the stroke's pen-down surface is.
+    pen_down: PenDownPoint,
 }
 
 impl Journal {
-    /// An empty journal of the stroke made as `op`.
-    const fn new(op: OpId) -> Self {
+    /// An empty journal of the stroke made as `op`, its pen-down surface at `pen_down`.
+    const fn new(op: OpId, pen_down: PenDownPoint) -> Self {
         Self {
             op,
             placed: 0,
@@ -127,6 +170,7 @@ impl Journal {
             rows: VecDeque::new(),
             written: None,
             in_flight: None,
+            pen_down,
         }
     }
 
@@ -177,11 +221,8 @@ impl Journal {
 
     /// What the file will hold once everything up to now is appended: the cut in flight's, else
     /// the batches written.
-    const fn reached(&self) -> Option<Written> {
-        match self.in_flight {
-            Some(in_flight) => Some(in_flight),
-            None => self.written,
-        }
+    fn reached(&self) -> Option<Written> {
+        self.in_flight.map(|(_, reached)| reached).or(self.written)
     }
 
     /// The index of the first dab the next batch holds: the later of the dabs written (or in
@@ -192,23 +233,35 @@ impl Journal {
             .max(self.landed)
     }
 
-    /// Whether a batch is due (see the module notes): a dab placed and neither written nor
-    /// landed, or a landed count that moved since the last batch written.
-    fn is_due(&self) -> bool {
-        self.unwritten_from() < self.placed
-            || self
-                .reached()
-                .is_some_and(|reached| reached.landed != self.landed)
+    /// The settled pen-down, if it is: a batch names it.
+    const fn settled(&self) -> Option<PenDown> {
+        match self.pen_down {
+            PenDownPoint::Known(pen_down) => Some(pen_down),
+            PenDownPoint::Next | PenDownPoint::Flush(_) => None,
+        }
     }
 
-    /// Whether the journal has anything left to write: a batch due, or a cut in flight.
+    /// Whether a batch is due (see the module notes): with its pen-down settled, a dab placed and
+    /// neither written nor landed, or a landed count that moved since the last batch written.
+    fn is_due(&self) -> bool {
+        self.settled().is_some()
+            && (self.unwritten_from() < self.placed
+                || self
+                    .reached()
+                    .is_some_and(|reached| reached.landed != self.landed))
+    }
+
+    /// Whether the journal has anything left to write: a batch due, or a cut in flight. An ended
+    /// one whose pen-down hasn't settled has neither: nothing of it was cut, and every dab of it
+    /// counts landed, so the tiles hold them all.
     fn is_pending(&self) -> bool {
         self.is_due() || self.in_flight.is_some()
     }
 
-    /// The journal's cut, if a batch is due: the batches of the dabs not yet written, at most
-    /// [`MAX_JOURNAL_DABS`] each (one of no dabs if only the landed count moved), each with the
-    /// landed count as it is now, and what the file holds once they are in it.
+    /// The journal's cut, if a batch is due: the batches of the dabs neither written nor in
+    /// flight, at most [`MAX_JOURNAL_DABS`] each (one of no dabs if only the landed count moved),
+    /// each with the landed count as it is now and the stroke's pen-down save point, and what the
+    /// file holds once they are in it.
     ///
     /// This copies the rows not yet written, on the calling thread.
     ///
@@ -218,9 +271,9 @@ impl Journal {
     /// [`Invariant::JournalRows`] if the rows run out before the dabs placed: never, while the
     /// journal holds its invariants.
     fn cut(&self) -> Result<Option<(Vec<DabBatch>, Written)>, Invariant> {
-        if !self.is_due() {
+        let Some(pen_down) = self.settled().filter(|_| self.is_due()) else {
             return Ok(None);
-        }
+        };
         let from = self.unwritten_from();
         let skip = usize::try_from(from - self.landed).unwrap_or(usize::MAX);
         let mut unwritten = self.rows.iter().skip(skip).copied();
@@ -233,8 +286,8 @@ impl Journal {
             // Every pass takes rows, but a batch of none (the count alone) can only be the
             // first and the last: so the loop ends however the rows and counts disagree.
             let empty = rows.is_empty();
-            let batch =
-                DabBatch::new(self.op, first, self.landed, rows).map_err(Invariant::Journal)?;
+            let batch = DabBatch::new(self.op, first, self.landed, pen_down, rows)
+                .map_err(Invariant::Journal)?;
             first = batch.placed();
             batches.push(batch);
             if first >= self.placed {
@@ -261,6 +314,8 @@ pub(super) struct Journals {
     /// Journals of strokes that have ended, each waiting for a flush to write its last batch, in
     /// the order they ended.
     ended: Vec<Journal>,
+    /// The number of the next cut ([`CutId`]).
+    next_cut: u64,
 }
 
 impl Journals {
@@ -277,7 +332,8 @@ impl Journals {
     }
 
     /// Closes the open journal, if any, counting every dab landed: it waits for its last batch
-    /// if one is due or a cut of it is in flight, else goes.
+    /// if one is due (or will be once its pen-down settles) or a cut of it is in flight, else
+    /// goes.
     fn close(&mut self) {
         if let Some(mut journal) = self.open.take() {
             journal.rows.clear();
@@ -297,14 +353,19 @@ impl Journals {
     fn all_mut(&mut self) -> impl Iterator<Item = &mut Journal> {
         self.ended.iter_mut().chain(&mut self.open)
     }
+
+    /// Ended journals that have nothing left to write go.
+    fn forget_written(&mut self) {
+        self.ended.retain(Journal::is_pending);
+    }
 }
 
 impl TileStore {
-    /// The stroke made as `op` begins: opens its journal, closing any still open (see
-    /// [`TileStore::end_journal`]).
-    pub(crate) fn begin_journal(&mut self, op: OpId) {
+    /// The stroke made as `op` begins, its pen-down surface at `pen_down` (see the module
+    /// notes): opens its journal, closing any still open (see [`TileStore::end_journal`]).
+    pub(crate) fn begin_journal(&mut self, op: OpId, pen_down: PenDownPoint) {
         self.journals.close();
-        self.journals.open = Some(Journal::new(op));
+        self.journals.open = Some(Journal::new(op, pen_down));
     }
 
     /// Adds `placed`, the next dabs the stroke made as `op` placed, to its journal: kept for the
@@ -352,22 +413,36 @@ impl TileStore {
         self.journals.open.as_ref().is_some_and(Journal::is_landing)
     }
 
+    /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut
+    /// (see the module notes). True with no stroke open.
+    pub(crate) fn may_land(&self) -> bool {
+        self.journals
+            .open
+            .as_ref()
+            .is_none_or(|journal| journal.pen_down != PenDownPoint::Next)
+    }
+
+    /// Whether the open stroke made as `op` waits for its pen-down flush's cut before it may land
+    /// ([`TileStore::may_land`]): an edit of `op` now would be a bug.
+    pub(super) fn waits_to_land(&self, op: OpId) -> bool {
+        self.journals
+            .open
+            .as_ref()
+            .is_some_and(|journal| journal.op == op && journal.pen_down == PenDownPoint::Next)
+    }
+
     /// Whether a flush now would write a batch.
     pub(crate) fn has_journal_work(&self) -> bool {
         self.journals.all().any(Journal::is_due)
     }
 
-    /// Whether a cut of the journals is in flight: a flush that carries batches.
-    pub(crate) fn has_journal_cut(&self) -> bool {
-        self.journals
-            .all()
-            .any(|journal| journal.in_flight.is_some())
-    }
-
-    /// The journals' cut, for the flush taking its snapshot now: every batch due, the ended
-    /// strokes' first. Each journal cut holds the cut in flight until
-    /// [`TileStore::append_journal`] appends it or [`TileStore::drop_journal_cut`] drops it; a
-    /// cut left over from a flush that never ended (its writer gone) is dropped first.
+    /// The journals' cut, for the flush taking its snapshot now: the cut's name, and every batch
+    /// due, the ended strokes' first. Each journal cut holds the cut in flight until
+    /// [`TileStore::append_journal`] appends it or [`TileStore::drop_journal_cut`] drops it. A
+    /// pen-down waiting for the next flush is this one's from now on.
+    ///
+    /// A cut left over from a flush that never ended (its writer gone) is dropped first, and a
+    /// pen-down waiting on such a flush is unknown: it settles no more.
     ///
     /// The cost is a copy of the rows not yet written, on the owner thread.
     ///
@@ -375,15 +450,25 @@ impl TileStore {
     ///
     /// [`CacheError::Internal`] with [`Invariant::Journal`] or [`Invariant::JournalRows`] if a
     /// batch can't be made: a bug. No cut is in flight then.
-    pub(crate) fn cut_journal(&mut self) -> Result<Vec<DabBatch>, CacheError> {
+    pub(crate) fn cut_journal(&mut self) -> Result<(CutId, Vec<DabBatch>), CacheError> {
         self.drop_journal_cut();
+        for journal in self.journals.all_mut() {
+            if matches!(journal.pen_down, PenDownPoint::Flush(_)) {
+                journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
+            }
+        }
+        let id = CutId(self.journals.next_cut);
+        self.journals.next_cut = self.journals.next_cut.saturating_add(1);
         let mut batches = Vec::new();
         let mut refused = None;
         for journal in self.journals.all_mut() {
+            if journal.pen_down == PenDownPoint::Next {
+                journal.pen_down = PenDownPoint::Flush(id);
+            }
             match journal.cut() {
                 Ok(Some((cut, reached))) => {
                     batches.extend(cut);
-                    journal.in_flight = Some(reached);
+                    journal.in_flight = Some((id, reached));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -397,11 +482,11 @@ impl TileStore {
             self.drop_journal_cut();
             return Err(e.into());
         }
-        Ok(batches)
+        Ok((id, batches))
     }
 
-    /// Appends `framed`, the batches of the cut in flight as the writer thread framed them, to the
-    /// working file with one write, then notes each journal written up to its cut.
+    /// Appends `framed`, the batches of the cut `id` as the writer thread framed them, to the
+    /// working file with one write, then notes each journal written up to that cut.
     ///
     /// Noting them only once the write is done is what keeps a batch from being written twice:
     /// if it fails, the cut is dropped and the journals are as they were, so the next flush writes
@@ -410,17 +495,24 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::WriteBack`] if the append fails.
-    pub(crate) fn append_journal(&mut self, framed: &[Vec<u8>]) -> Result<(), CacheError> {
+    pub(crate) fn append_journal(
+        &mut self,
+        id: CutId,
+        framed: &[Vec<u8>],
+    ) -> Result<(), CacheError> {
         if let Err(e) = self.file.append_batches(framed) {
             self.drop_journal_cut();
             return Err(CacheError::WriteBack(e));
         }
         for journal in self.journals.all_mut() {
-            if let Some(reached) = journal.in_flight.take() {
+            if let Some((cut, reached)) = journal.in_flight
+                && cut == id
+            {
+                journal.in_flight = None;
                 journal.written = Some(reached);
             }
         }
-        self.journals.ended.retain(Journal::is_pending);
+        self.journals.forget_written();
         Ok(())
     }
 
@@ -430,7 +522,37 @@ impl TileStore {
         for journal in self.journals.all_mut() {
             journal.in_flight = None;
         }
-        self.journals.ended.retain(Journal::is_pending);
+        self.journals.forget_written();
+    }
+
+    /// The flush whose cut is `id` settled the pen-down surface it holds, which is where
+    /// `pen_down` says: its save point, made durable, or (a flush that found nothing to write)
+    /// the working file's latest. Every journal waiting on it learns it.
+    pub(crate) fn pen_down_settled(&mut self, id: CutId, pen_down: PenDown) {
+        for journal in self.journals.all_mut() {
+            if journal.pen_down == PenDownPoint::Flush(id) {
+                journal.pen_down = PenDownPoint::Known(pen_down);
+            }
+        }
+        self.journals.forget_written();
+    }
+
+    /// The flush in flight was abandoned, and any queued behind it, or a writer is gone: a
+    /// journal waiting on one of them for its pen-down surface finds it in no save point, and its
+    /// stroke may land.
+    pub(crate) fn pen_downs_abandoned(&mut self) {
+        for journal in self.journals.all_mut() {
+            if journal.settled().is_none() {
+                journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
+            }
+        }
+        self.journals.forget_written();
+    }
+
+    /// The open journal's pen-down save point, if a journal is open: for tests.
+    #[cfg(test)]
+    pub(crate) fn open_pen_down(&self) -> Option<PenDownPoint> {
+        self.journals.open.as_ref().map(|journal| journal.pen_down)
     }
 
     /// Test hook: makes the working file's next save point fail before anything is written, as
@@ -443,11 +565,18 @@ impl TileStore {
     /// The store moved onto a fresh working file (a save's rebase, or a roll-over), which holds
     /// no batch: the ended journals go (no batch in the new file is behind its tiles), and the
     /// open one writes its dabs not landed again, from its landed count, with the next flush.
+    ///
+    /// The new file holds no save point of the surface the open stroke began on, so its pen-down
+    /// is unknown from then on, and its journal can't be restored from the new file. A save
+    /// costs a restore nothing: it refuses while dabs are landing, so the saved state holds every
+    /// dab placed by then. A roll-over can leave a stroke landing; it is to write the pen-down
+    /// surface into the new file and name that save point instead (the dab journal's next step).
     pub(super) fn rebase_journal(&mut self) {
         self.journals.ended.clear();
         if let Some(journal) = &mut self.journals.open {
             journal.written = None;
             journal.in_flight = None;
+            journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
         }
     }
 }

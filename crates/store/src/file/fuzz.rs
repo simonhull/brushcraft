@@ -21,7 +21,7 @@ use super::*;
 use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN, parse_bounds_payload};
 use crate::codec::decode_displacement_into;
 use crate::display::{DisplayRecord, StoredDisplay, display_body, display_header, parse_display};
-use crate::journal::{DAB_BYTES, DabBatch};
+use crate::journal::{DAB_BYTES, DabBatch, PenDown};
 use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
 use crate::record::{HEAD, TAIL};
@@ -477,23 +477,33 @@ fn stroke_payloads_never_panic_and_round_trip() {
     });
 }
 
-/// What generates a dab batch: the op's site and sequence, the first index, the landed count, and
-/// the dabs' bytes, cut into rows of [`DAB_BYTES`] (a part row left over is dropped).
-type BatchParts = ((u16, u64), u32, u32, Vec<u8>);
+/// What generates a dab batch.
+///
+/// The op's site and sequence, the first index, the landed count, the pen-down's kind and offset,
+/// and the dabs' bytes, cut into rows of [`DAB_BYTES`] (a part row left over is dropped).
+type BatchParts = ((u16, u64), u32, u32, (u8, u64), Vec<u8>);
 
 /// The most dabs a generator makes: enough for every plane to be long.
 const FUZZ_DABS: usize = 200;
 
-/// The batch `parts` describe, its dabs cut at [`FUZZ_DABS`], the first index moved down so they
-/// end within a `u32`, and the landed count wrapped to at most the dabs placed.
-fn batch_of((op, first, landed, bytes): &BatchParts) -> DabBatch {
+/// The batch `parts` describe, made to be one a writer makes.
+///
+/// Its dabs are cut at [`FUZZ_DABS`], the first index moved down so they end within a `u32`, the
+/// landed count wrapped to at most the dabs placed, and the pen-down's kind taken modulo three
+/// (an offset only where it takes one).
+fn batch_of((op, first, landed, (kind, offset), bytes): &BatchParts) -> DabBatch {
     let (rows, _) = bytes.as_chunks::<DAB_BYTES>();
     let dabs: Vec<[u8; DAB_BYTES]> = rows.iter().take(FUZZ_DABS).copied().collect();
     let count = u32::try_from(dabs.len()).unwrap();
     let first = (*first).min(u32::MAX - count);
     let placed = u64::from(first + count);
     let landed = u32::try_from(u64::from(*landed) % (placed + 1)).unwrap();
-    DabBatch::new(op_of(op.0, op.1), first, landed, dabs).unwrap()
+    let pen_down = match kind % 3 {
+        0 => PenDown::Base,
+        1 => PenDown::At(*offset),
+        _ => PenDown::Unknown,
+    };
+    DabBatch::new(op_of(op.0, op.1), first, landed, pen_down, dabs).unwrap()
 }
 
 /// The dab batch parser takes any bytes without panicking, and reads back what was written.
@@ -527,10 +537,12 @@ fn journal_decode() {
 /// unknown bound, and an unsaved tile after the last save point. The first and third tiles'
 /// strokes leave records, and so does the unsaved tile's. A recovery file holds a journal too:
 /// the third tile's stroke journals two batches before its save point (some dabs, then only its
-/// landed count moving), and the unsaved tile's one after it.
+/// landed count moving), and the unsaved tile's one after it, each naming the save point before
+/// it as its stroke's pen-down.
 fn seed_file(path: &Path, meta: Meta) {
     let journal = matches!(meta.role(), Role::Recovery { .. });
     let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
+    let mut last_save = None;
     for (seq, level) in (1..).zip(1..=3_u8) {
         let face = FaceId::new(level.into());
         let key = TileKey::displacement(face, Level::new(level).unwrap(), 0, 0).unwrap();
@@ -551,10 +563,11 @@ fn seed_file(path: &Path, meta: Meta) {
             seed_stroke(&mut file, op_of(0, seq));
         }
         if journal && seq == 3 {
-            seed_batch(&mut file, op_of(0, seq), (0, 6), 2);
-            seed_batch(&mut file, op_of(0, seq), (6, 0), 5);
+            let pen_down = last_save.map_or(PenDown::Base, PenDown::At);
+            seed_batch(&mut file, op_of(0, seq), (0, 6), 2, pen_down);
+            seed_batch(&mut file, op_of(0, seq), (6, 0), 5, pen_down);
         }
-        file.save().unwrap();
+        last_save = Some(file.save().unwrap());
     }
     // Display records, named by a save point: two known, one unknown.
     let display = small_display_tiles();
@@ -573,21 +586,27 @@ fn seed_file(path: &Path, meta: Meta) {
         Stamp::ZERO,
     )
     .unwrap();
-    file.save().unwrap();
+    let displayed = file.save().unwrap();
     let key = TileKey::displacement(FaceId::new(4), Level::new(1).unwrap(), 0, 0).unwrap();
     let tile = CorrectionTile::from_values(3, &[Vec3::ZERO; 9]).unwrap();
     file.write_displacement(key, op_of(0, 4), &tile).unwrap();
     seed_stroke(&mut file, op_of(0, 4));
     if journal {
-        seed_batch(&mut file, op_of(0, 4), (0, 4), 1);
+        seed_batch(&mut file, op_of(0, 4), (0, 4), 1, PenDown::At(displayed));
     }
 }
 
 /// Appends a batch of `op` to `file`: `count` of the tests' realistic dabs from index `first`,
-/// `landed` of them landed.
-fn seed_batch(file: &mut ProjectFile, op: OpId, (first, count): (u32, u32), landed: u32) {
+/// `landed` of them landed, the stroke's pen-down surface at `pen_down`.
+fn seed_batch(
+    file: &mut ProjectFile,
+    op: OpId,
+    (first, count): (u32, u32),
+    landed: u32,
+    pen_down: PenDown,
+) {
     let dabs: Vec<[u8; DAB_BYTES]> = (first..first + count).map(fixture::dab_at).collect();
-    let batch = DabBatch::new(op, first, landed, dabs).unwrap();
+    let batch = DabBatch::new(op, first, landed, pen_down, dabs).unwrap();
     file.append_batches(&[frame_batch(&batch).unwrap()])
         .unwrap();
 }

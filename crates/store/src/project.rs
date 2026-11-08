@@ -101,11 +101,11 @@ use thiserror::Error;
 use crate::OpId;
 use crate::file::{FileError, PRIVATE_MODE, ProjectFile, SHARED_MODE, sync_parent};
 use crate::index::{IndexError, LoadStats, SpatialIndex};
-use crate::journal::DAB_BYTES;
+use crate::journal::{DAB_BYTES, PenDown};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::stroke_record::StrokeRecord;
-use crate::tiles::{CacheError, JournalCountError, Saved, StoreConfig, TileStore};
+use crate::tiles::{CacheError, JournalCountError, PenDownPoint, Saved, StoreConfig, TileStore};
 
 mod discover;
 mod place;
@@ -455,6 +455,10 @@ pub struct Project {
     /// Tiles a flush left out with their slots valid, waiting to be reported the same way, unless
     /// a save writes them first.
     left_out: BTreeSet<geom::TileKey>,
+    /// An old recovery file a roll-over in [`Project::begin_stroke`] couldn't delete: that call
+    /// begins its stroke whatever happens, so it is reported by the next call that reports
+    /// ([`Project::report`]).
+    kept: Option<ProjectError>,
     /// Why crash protection is paused, if it is: the error of the last try to put a recovery
     /// file in place. `None` while protection runs.
     paused: Option<Arc<ProjectError>>,
@@ -732,6 +736,7 @@ impl Project {
             recovery_dir: config.recovery_dir,
             unreported: BTreeSet::new(),
             left_out: BTreeSet::new(),
+            kept: None,
             paused: None,
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
@@ -1073,18 +1078,148 @@ impl Project {
         self.store.working().meta().project()
     }
 
+    /// A stroke begins, and may land at once: [`Project::begin_stroke_ahead`], then
+    /// [`Project::wait_to_land`] if its pen-down cut is still to be taken, which blocks for at
+    /// most the flush in flight's syncs, and only when strokes come back to back. For tools,
+    /// tests and benches that land a stroke's dabs as they make them; the app begins strokes ahead
+    /// and lands once it may, so no frame waits.
+    ///
+    /// A failure of the flushes on the way is reported as [`Project::begin_stroke_ahead`] says;
+    /// the stroke may land then all the same, its pen-down unknown.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::begin_stroke_ahead`].
+    pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
+        let op = self.begin_stroke_ahead()?;
+        if !self.store.may_land() {
+            let waited = self.drive_to_land();
+            self.keep_report(waited);
+        }
+        Ok(op)
+    }
+
     /// A stroke begins: starts a new op in the store ([`TileStore::begin_op`]), which every
     /// edit of the stroke is part of, however many dabs it takes, and returns it: the op the
     /// stroke's record is made with ([`Project::end_stroke`]).
     ///
+    /// The stroke's journal learns which save point will hold every tile as the stroke finds
+    /// them, its pen-down surface (see [`crate::DabBatch`]): a flush starts now if edits before it
+    /// wait, or the one in flight holds it, or the latest save point does. When strokes come back
+    /// to back, with edits since the cut in flight, it is the flush queued behind that one, and the
+    /// stroke **lands nothing until that cut is taken** ([`Project::may_land`]); it begins at once
+    /// all the same, its dabs placed, journalled and shown ahead. Nothing is copied here that a
+    /// flush wouldn't copy anyway. A stroke still open ends here first, its dabs counted landed.
+    ///
+    /// The stroke begins whatever the cut meets: crash protection never stops one. A failed cut
+    /// abandons its flush, which leaves the pen-down unknown (the journal can't be restored) and
+    /// the edits for the next trigger, which meets the failure again and reports it. A writer that
+    /// failed for good is replaced, as for any call; an old file it couldn't delete is reported by
+    /// the next call that reports ([`ProjectError::OldRecoveryKept`]), and so are tiles found lost.
+    ///
     /// # Errors
     ///
     /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
-    pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
+    pub fn begin_stroke_ahead(&mut self) -> Result<OpId, ProjectError> {
+        // Strokes don't overlap (see `crate::recovery`, "A stroke's first landing waits for its
+        // cut"): a stroke landing while the next begins would edit past the next one's cut. A
+        // stroke beginning while the last one lands is the next roadmap item, which must revisit
+        // this.
+        debug_assert!(
+            !self.store.is_landing(),
+            "a stroke began while the last one's dabs were still landing"
+        );
+        // The stroke before ends here if it hasn't, its dabs counted landed, before the cut.
+        self.store.end_journal();
+        let pen_down = self.cut_before_op(Instant::now());
         let op = self.store.begin_op()?;
-        self.store.begin_journal(op);
+        self.store.begin_journal(op, pen_down);
         self.stroke = Some(op);
         Ok(op)
+    }
+
+    /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut (see
+    /// [`Project::begin_stroke_ahead`]). While it may not, the app places, journals and shows its
+    /// dabs ahead, but applies none; the frame loop's [`Project::tick`] and [`Project::poll`] drive
+    /// the flushes, so it may within the flush in flight's syncs, or at once with
+    /// [`Project::wait_to_land`]. True with no stroke open.
+    ///
+    /// A store edit of the stroke's op before then is a bug (a debug assertion says so): no save
+    /// point would hold the surface the stroke found.
+    #[must_use]
+    pub fn may_land(&self) -> bool {
+        self.store.may_land()
+    }
+
+    /// Blocks until the open stroke may land ([`Project::may_land`]): the flush in flight is
+    /// driven to its end, and the one behind it, holding the stroke's pen-down surface, takes its
+    /// cut. For a landing that can't wait for frames, a close's or a save's. At once if it may
+    /// already.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::poll`]. The stroke may land then all the same: a flush abandoned leaves its
+    /// pen-down unknown.
+    pub fn wait_to_land(&mut self) -> Result<(), ProjectError> {
+        self.drive_to_land()?;
+        self.report()
+    }
+
+    /// [`Project::wait_to_land`] without the report.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::with_writer`].
+    fn drive_to_land(&mut self) -> Result<(), ProjectError> {
+        if self.store.may_land() {
+            return Ok(());
+        }
+        let driven = self.with_writer(RecoveryWriter::wait_for_cut, Retry::Now);
+        if !self.store.may_land() {
+            // No writer is left to take the cut.
+            self.store.pen_downs_abandoned();
+        }
+        driven
+    }
+
+    /// What a call that must go on met of crash protection: an old recovery file left undeleted
+    /// is kept for the next call that reports ([`Project::report`]); anything else is the
+    /// writer's to meet again with its next trigger, and to report then (see
+    /// [`Project::begin_stroke_ahead`]).
+    fn keep_report(&mut self, outcome: Result<(), ProjectError>) {
+        if let Err(kept @ ProjectError::OldRecoveryKept { .. }) = outcome {
+            self.kept = Some(kept);
+        }
+    }
+
+    /// The cut a stroke's op takes as it begins, at `now` (see [`Project::begin_stroke_ahead`]):
+    /// where its pen-down surface will be. Unknown with no writer (crash protection paused), or
+    /// if the cut fails.
+    ///
+    /// A writer that failed for good is replaced on the way, as for any call; the fresh file's
+    /// save point then holds every edit, and the cut is asked of the new writer, which names it.
+    fn cut_before_op(&mut self, now: Instant) -> PenDownPoint {
+        let generation = self.store.generation();
+        let mut pen_down = PenDownPoint::Known(PenDown::Unknown);
+        let cut = self.with_writer(
+            |writer, store| {
+                pen_down = writer.cut_before_op(store, now)?;
+                Ok(())
+            },
+            Retry::Due(now),
+        );
+        // The stroke begins whatever the cut met.
+        self.keep_report(cut);
+        if self.store.generation() != generation
+            && let Some(writer) = self.writer.as_mut()
+        {
+            // Rolled over: the new file holds every edit in its save point, and nothing was
+            // edited since.
+            pen_down = writer
+                .cut_before_op(&mut self.store, now)
+                .unwrap_or(PenDownPoint::Known(PenDown::Unknown));
+        }
+        pen_down
     }
 
     /// A stroke ended, leaving `record`: flushes its edits to the recovery file in the
@@ -1305,6 +1440,9 @@ impl Project {
     /// [`ProjectError::Lost`] with the tiles gone, in key order; with none, and tiles left out,
     /// [`ProjectError::Unprotected`] with those.
     fn report(&mut self) -> Result<(), ProjectError> {
+        if let Some(kept) = self.kept.take() {
+            return Err(kept);
+        }
         if !self.unreported.is_empty() {
             let tiles = std::mem::take(&mut self.unreported);
             return Err(ProjectError::Lost(tiles.into_iter().collect()));

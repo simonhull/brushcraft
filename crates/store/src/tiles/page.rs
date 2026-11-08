@@ -777,6 +777,12 @@ impl TileStore {
         id: SlotId<CorrectionSlot>,
         op: OpId,
     ) -> Result<(), CacheError> {
+        // A stroke's first landing waits for its pen-down flush's cut (see the journal notes,
+        // `TileStore::may_land`): an edit before it would leave no save point at its pen-down.
+        debug_assert!(
+            !self.waits_to_land(op),
+            "a stroke edited the store before its pen-down cut was taken"
+        );
         self.corrections_changed();
         self.last_write = self.last_write.next();
         self.unsaved.insert(

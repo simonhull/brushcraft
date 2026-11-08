@@ -5,7 +5,9 @@
 //! one [`DabBatch`]: the dabs placed since the last batch (none, if only the landed count moved)
 //! and how many of the stroke's dabs had landed at the flush's cut. The batches of an op, in file
 //! order, hold every dab the stroke placed, so restoring needs only them and the tiles as the
-//! stroke found them, never the stroke engine. A dab (`stroke::Dab`) is [`DAB_BYTES`] bytes of
+//! stroke found them, never the stroke engine. Each batch names where those tiles are: the
+//! stroke's pen-down save point ([`PenDown`]), which a restore reads them through, never guessing
+//! it from the order of ops. A dab (`stroke::Dab`) is [`DAB_BYTES`] bytes of
 //! plain data, which the store keeps as opaque rows and never reads, as it keeps a stroke's
 //! settings.
 //!
@@ -22,11 +24,15 @@
 //!   symmetry copies included;
 //! - how many of the stroke's dabs had landed at the flush's cut, a `u32`;
 //! - the dabs' count, a `u32`, at most [`MAX_JOURNAL_DABS`];
+//! - the stroke's pen-down save point ([`PenDown`]): a `u8` tag, `0` for [`PenDown::Base`], `1` for
+//!   [`PenDown::At`] and `2` for [`PenDown::Unknown`], then a `u64`, the save point's offset for
+//!   `At` and `0` otherwise;
 //! - a zstd frame of the dabs transposed into [`DAB_BYTES`] byte planes (byte `j` of dab `i` at `j
 //!   × count + i`): `DAB_BYTES × count` bytes once decompressed, exactly.
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a count past
-//! its limit, anything but exactly one zstd frame after the fixed fields (a skippable frame, or
+//! its limit, a pen-down tag it doesn't know or an offset beside a tag that takes none, anything
+//! but exactly one zstd frame after the fixed fields (a skippable frame, or
 //! bytes after the frame), a frame that doesn't decompress to the stated size, a batch whose dabs
 //! run past the last `u32` index, and a landed count past the dabs placed: the first index plus
 //! the count.
@@ -37,6 +43,17 @@
 //! stroke records (see `crate::file::journal_io`), so the save point that names a flush's tiles
 //! holds its batch, and the batch's landed count describes exactly that cut. Opening a file only
 //! steps over their heads.
+//!
+//! # The pen-down save point
+//!
+//! A stroke's dabs are placed on its pen-down surface, the tiles as the stroke found them, so a
+//! restore needs that surface besides the dabs. Each batch names the save point that holds it
+//! ([`PenDown`]): the store makes sure one does, as a stroke's first landing waits until a
+//! flush's cut holds every earlier op's edits and none of its own (see `crate::recovery`, and
+//! `crate::Project::may_land`). The save point is
+//! named, never found from the order of ops, because the save point just before a stroke's op may
+//! have been cut midway through the stroke before it. A batch whose pen-down is
+//! [`PenDown::Unknown`] can't be restored: the tiles restore alone.
 
 use thiserror::Error;
 
@@ -54,8 +71,8 @@ pub const MAX_JOURNAL_DABS: usize = 65_536;
 const VERSION: u8 = 1;
 
 /// Payload bytes before the compressed frame: version and reserved bytes, op, first index,
-/// landed count and dab count.
-const FIXED: usize = 4 + 8 + 4 + 4 + 4;
+/// landed count, dab count, and the pen-down's tag and offset.
+const FIXED: usize = 4 + 8 + 4 + 4 + 4 + 1 + 8;
 
 /// The longest payload a writer makes: the fixed fields, then a zstd frame of the most dabs,
 /// which zstd never expands by more than 1/128 plus a small constant.
@@ -63,6 +80,51 @@ pub(crate) const MAX_JOURNAL_PAYLOAD: usize = {
     let raw = DAB_BYTES * MAX_JOURNAL_DABS;
     FIXED + raw + raw / 128 + 1024
 };
+
+/// Where a journalled stroke's pen-down surface is: the save point of the recovery file whose
+/// state is every tile as the stroke found them (see the module notes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PenDown {
+    /// The stroke began on a recovery file with no save point of its own yet: its pen-down
+    /// surface is the state the file starts from, the project file's save point its meta names,
+    /// or, for a project never saved, the base mesh with no sculpting.
+    Base,
+    /// The save point (Index) at this offset in the recovery file holds it.
+    At(u64),
+    /// No save point holds it: the flush that was to was abandoned, or the stroke began before
+    /// the recovery file's own start (a save, or a roll-over, in the middle of the stroke). The
+    /// stroke's journal can't be restored.
+    Unknown,
+}
+
+impl PenDown {
+    /// The payload's tag of [`PenDown::At`].
+    const AT: u8 = 1;
+    /// The payload's tag of [`PenDown::Base`].
+    const BASE: u8 = 0;
+    /// The payload's tag of [`PenDown::Unknown`].
+    const UNKNOWN: u8 = 2;
+
+    /// The payload's tag and offset (see the module notes).
+    const fn to_parts(self) -> (u8, u64) {
+        match self {
+            Self::Base => (Self::BASE, 0),
+            Self::At(offset) => (Self::AT, offset),
+            Self::Unknown => (Self::UNKNOWN, 0),
+        }
+    }
+
+    /// The pen-down a payload's `tag` and `offset` state; `None` for a tag this build doesn't
+    /// know, or an offset beside a tag that takes none.
+    const fn from_parts(tag: u8, offset: u64) -> Option<Self> {
+        match (tag, offset) {
+            (Self::BASE, 0) => Some(Self::Base),
+            (Self::AT, offset) => Some(Self::At(offset)),
+            (Self::UNKNOWN, 0) => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
 
 /// Why a [`DabBatch`] can't be made, or a payload isn't one this build reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -94,14 +156,20 @@ pub enum JournalError {
     /// The op is of the reserved site, which has none.
     #[error("the dab batch's op is of the reserved site")]
     ReservedSite,
+    /// The pen-down's tag isn't one this build knows, or an offset stands beside a tag that
+    /// takes none.
+    #[error("the dab batch's pen-down save point isn't one this build reads")]
+    PenDown,
     /// The frame doesn't decompress to exactly the stated dabs.
     #[error("the dab batch's frame doesn't hold its dabs")]
     Frame,
 }
 
-/// One flush's part of an open stroke's journal (record kind 7): the dabs the stroke placed since
-/// the batch before, from index [`DabBatch::first`], and how many of its dabs had landed at the
-/// flush's cut.
+/// One flush's part of an open stroke's journal (record kind 7).
+///
+/// It holds the dabs the stroke placed since the batch before, from index [`DabBatch::first`],
+/// how many of its dabs had landed at the flush's cut, and where its pen-down surface is
+/// ([`DabBatch::pen_down`]).
 ///
 /// Made by [`DabBatch::new`], which holds it to what a reader of the record takes, so every batch
 /// the store writes reads back as the same batch.
@@ -114,6 +182,8 @@ pub struct DabBatch {
     first: u32,
     /// How many of the stroke's dabs had landed at the flush's cut; at most `first + dabs.len()`.
     landed: u32,
+    /// The save point holding the stroke's pen-down surface.
+    pen_down: PenDown,
     /// Opaque rows of [`DAB_BYTES`], at most [`MAX_JOURNAL_DABS`], ending at or before the last
     /// `u32` index.
     dabs: Vec<[u8; DAB_BYTES]>,
@@ -121,7 +191,7 @@ pub struct DabBatch {
 
 impl DabBatch {
     /// The batch of the stroke made as `op` holding `dabs` (each a `stroke::Dab`'s bytes) from
-    /// its index `first`, with `landed` of its dabs landed.
+    /// its index `first`, with `landed` of its dabs landed, its pen-down surface at `pen_down`.
     ///
     /// # Errors
     ///
@@ -132,6 +202,7 @@ impl DabBatch {
         op: OpId,
         first: u32,
         landed: u32,
+        pen_down: PenDown,
         dabs: Vec<[u8; DAB_BYTES]>,
     ) -> Result<Self, JournalError> {
         if dabs.len() > MAX_JOURNAL_DABS {
@@ -148,6 +219,7 @@ impl DabBatch {
             op,
             first,
             landed,
+            pen_down,
             dabs,
         })
     }
@@ -168,6 +240,12 @@ impl DabBatch {
     #[must_use]
     pub const fn landed(&self) -> u32 {
         self.landed
+    }
+
+    /// The save point holding the stroke's pen-down surface (see the module notes).
+    #[must_use]
+    pub const fn pen_down(&self) -> PenDown {
+        self.pen_down
     }
 
     /// How many dabs the stroke had placed by the batch's last: its first index plus its count,
@@ -203,6 +281,9 @@ impl DabBatch {
         out.extend_from_slice(&self.first.to_le_bytes());
         out.extend_from_slice(&self.landed.to_le_bytes());
         out.extend_from_slice(&self.count().to_le_bytes());
+        let (tag, offset) = self.pen_down.to_parts();
+        out.push(tag);
+        out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(&packed);
         Ok(out)
     }
@@ -213,8 +294,9 @@ impl DabBatch {
     ///
     /// The [`JournalError`] of the first thing refused (see the module notes):
     /// [`JournalError::Short`], [`JournalError::Version`], [`JournalError::Reserved`],
-    /// [`JournalError::ReservedSite`], [`JournalError::TooManyDabs`], [`JournalError::Frame`],
-    /// [`JournalError::PastLastIndex`] or [`JournalError::LandedPastPlaced`].
+    /// [`JournalError::ReservedSite`], [`JournalError::TooManyDabs`], [`JournalError::PenDown`],
+    /// [`JournalError::Frame`], [`JournalError::PastLastIndex`] or
+    /// [`JournalError::LandedPastPlaced`].
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, JournalError> {
         let mut reader = Reader::new(payload);
         let fixed = reader.take(FIXED).ok_or(JournalError::Short)?;
@@ -234,12 +316,15 @@ impl DabBatch {
         if count > MAX_JOURNAL_DABS {
             return Err(JournalError::TooManyDabs(count));
         }
+        let tag = fields.u8().ok_or(JournalError::Short)?;
+        let offset = fields.u64().ok_or(JournalError::Short)?;
+        let pen_down = PenDown::from_parts(tag, offset).ok_or(JournalError::PenDown)?;
         let planes =
             decompress_frame(reader.rest(), count * DAB_BYTES).or(Err(JournalError::Frame))?;
         let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count)
             .ok_or(JournalError::Frame)?
             .collect();
-        Self::new(op, first, landed, dabs)
+        Self::new(op, first, landed, pen_down, dabs)
     }
 }
 
@@ -250,12 +335,12 @@ mod tests {
     use crate::fixture::dab_at;
 
     /// The tests' batch: op 9 of site 2, three dabs of distinct bytes from index 37, 12 of the
-    /// stroke's dabs landed.
+    /// stroke's dabs landed, its pen-down surface at offset 4,096.
     fn batch() -> DabBatch {
         let dabs: Vec<[u8; DAB_BYTES]> = (1..=3_u8)
             .map(|k| std::array::from_fn(|j| u8::try_from(j).unwrap().wrapping_mul(k) ^ k))
             .collect();
-        DabBatch::new(OpId::new(2, 9).unwrap(), 37, 12, dabs).unwrap()
+        DabBatch::new(OpId::new(2, 9).unwrap(), 37, 12, PenDown::At(4_096), dabs).unwrap()
     }
 
     #[test]
@@ -265,6 +350,7 @@ mod tests {
         assert_eq!(batch.landed(), 12, "landed");
         assert_eq!(batch.placed(), 40, "placed");
         assert_eq!(batch.dabs().len(), 3, "dabs");
+        assert_eq!(batch.pen_down(), PenDown::At(4_096), "pen-down");
         let payload = batch.encode().unwrap();
         assert_eq!(DabBatch::decode(&payload), Ok(batch), "round trip");
     }
@@ -274,7 +360,8 @@ mod tests {
 
     #[test]
     fn an_empty_batch_s_frame_is_a_real_one() {
-        let empty = DabBatch::new(OpId::new(0, 4).unwrap(), 3, 3, Vec::new()).unwrap();
+        let empty =
+            DabBatch::new(OpId::new(0, 4).unwrap(), 3, 3, PenDown::Base, Vec::new()).unwrap();
         let mut payload = empty.encode().unwrap();
         payload.truncate(FIXED);
         payload.extend_from_slice(&SKIPPABLE);
@@ -288,7 +375,7 @@ mod tests {
     #[test]
     fn an_empty_batch_round_trips() {
         let op = OpId::new(0, 4).unwrap();
-        let batch = DabBatch::new(op, 500, 480, Vec::new()).unwrap();
+        let batch = DabBatch::new(op, 500, 480, PenDown::Unknown, Vec::new()).unwrap();
         let payload = batch.encode().unwrap();
         assert_eq!(
             DabBatch::decode(&payload),
@@ -301,12 +388,18 @@ mod tests {
     fn a_batch_a_reader_would_refuse_is_never_made() {
         let op = OpId::new(0, 1).unwrap();
         assert_eq!(
-            DabBatch::new(op, 0, 0, vec![[0; DAB_BYTES]; MAX_JOURNAL_DABS + 1]),
+            DabBatch::new(
+                op,
+                0,
+                0,
+                PenDown::Base,
+                vec![[0; DAB_BYTES]; MAX_JOURNAL_DABS + 1]
+            ),
             Err(JournalError::TooManyDabs(MAX_JOURNAL_DABS + 1)),
             "too many dabs"
         );
         assert_eq!(
-            DabBatch::new(op, 10, 13, vec![[0; DAB_BYTES]; 2]),
+            DabBatch::new(op, 10, 13, PenDown::Base, vec![[0; DAB_BYTES]; 2]),
             Err(JournalError::LandedPastPlaced {
                 landed: 13,
                 placed: 12
@@ -314,12 +407,12 @@ mod tests {
             "more landed than placed"
         );
         assert_eq!(
-            DabBatch::new(op, u32::MAX, 0, vec![[0; DAB_BYTES]; 1]),
+            DabBatch::new(op, u32::MAX, 0, PenDown::Base, vec![[0; DAB_BYTES]; 1]),
             Err(JournalError::PastLastIndex),
             "an index past u32"
         );
         assert!(
-            DabBatch::new(op, u32::MAX, u32::MAX, Vec::new()).is_ok(),
+            DabBatch::new(op, u32::MAX, u32::MAX, PenDown::Base, Vec::new()).is_ok(),
             "the last index itself"
         );
     }
@@ -367,12 +460,59 @@ mod tests {
             JournalError::PastLastIndex,
         );
         refused(&|p| p.truncate(FIXED - 1), JournalError::Short);
+        refused(&|p| p[24] = 3, JournalError::PenDown);
+        refused(&|p| p[24] = u8::MAX, JournalError::PenDown);
+        // The tests' batch is at an offset, which neither of the others takes.
+        refused(&|p| p[24] = 0, JournalError::PenDown);
+        refused(&|p| p[24] = 2, JournalError::PenDown);
+        refused(
+            &|p| {
+                p[24] = 0;
+                p[25..33].copy_from_slice(&0_u64.to_le_bytes());
+                p[32] = 1;
+            },
+            JournalError::PenDown,
+        );
+    }
+
+    #[test]
+    fn every_pen_down_round_trips() {
+        let op = OpId::new(1, 3).unwrap();
+        let pen_downs = [
+            PenDown::Base,
+            PenDown::At(0),
+            PenDown::At(77),
+            PenDown::At(u64::MAX),
+            PenDown::Unknown,
+        ];
+        for pen_down in pen_downs {
+            let batch = DabBatch::new(op, 2, 1, pen_down, vec![[5; DAB_BYTES]; 2]).unwrap();
+            let payload = batch.encode().unwrap();
+            let (tag, offset) = pen_down.to_parts();
+            assert_eq!(payload[24], tag, "{pen_down:?}'s tag");
+            assert_eq!(
+                payload[25..33],
+                offset.to_le_bytes(),
+                "{pen_down:?}'s offset"
+            );
+            assert_eq!(DabBatch::decode(&payload), Ok(batch), "{pen_down:?}");
+        }
+    }
+
+    #[test]
+    fn a_pen_down_reads_only_as_written() {
+        assert_eq!(PenDown::from_parts(0, 0), Some(PenDown::Base), "base");
+        assert_eq!(PenDown::from_parts(1, 9), Some(PenDown::At(9)), "at");
+        assert_eq!(PenDown::from_parts(2, 0), Some(PenDown::Unknown), "unknown");
+        assert_eq!(PenDown::from_parts(0, 9), None, "base with an offset");
+        assert_eq!(PenDown::from_parts(2, 1), None, "unknown with an offset");
+        assert_eq!(PenDown::from_parts(3, 0), None, "another tag");
     }
 
     #[test]
     fn a_thousand_dabs_compress() {
         let dabs: Vec<[u8; DAB_BYTES]> = (0..1_000).map(dab_at).collect();
-        let batch = DabBatch::new(OpId::new(0, 7).unwrap(), 0, 0, dabs).unwrap();
+        let batch = DabBatch::new(OpId::new(0, 7).unwrap(), 0, 0, PenDown::Base, dabs).unwrap();
         let payload = batch.encode().unwrap();
         let raw = 1_000 * DAB_BYTES;
         assert!(

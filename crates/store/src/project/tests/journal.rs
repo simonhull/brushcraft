@@ -5,18 +5,36 @@ use std::ops::Range;
 
 use super::*;
 use crate::fixture::dab_at;
-use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS};
+use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS, PenDown};
 use crate::{FLUSH_INTERVAL, JournalCountError};
+
+mod pen_down;
 
 /// The tests' dabs `range`, as [`dab_at`] makes them.
 fn dabs(range: Range<u32>) -> Vec<[u8; DAB_BYTES]> {
     range.map(dab_at).collect()
 }
 
-/// The batch of `op` the tests expect: the dabs `range`, with `landed` of the stroke's landed.
+/// The batch of `op` the tests expect: the dabs `range`, with `landed` of the stroke's landed,
+/// of a stroke begun on a recovery file with no save point yet.
 fn batch(op: OpId, range: Range<u32>, landed: u32) -> DabBatch {
+    batch_at(op, PenDown::Base, range, landed)
+}
+
+/// [`batch`] of a stroke whose pen-down surface is at `pen_down`.
+fn batch_at(op: OpId, pen_down: PenDown, range: Range<u32>, landed: u32) -> DabBatch {
     let first = range.start;
-    DabBatch::new(op, first, landed, dabs(range)).unwrap()
+    DabBatch::new(op, first, landed, pen_down, dabs(range)).unwrap()
+}
+
+/// Where the working file's latest save point puts a pen-down surface: what a stroke begun with
+/// every edit in it names.
+fn latest(project: &Project) -> PenDown {
+    project
+        .store
+        .working()
+        .last_save_point()
+        .map_or(PenDown::Base, PenDown::At)
 }
 
 /// Every batch of the project's recovery file, its working file, read back.
@@ -46,7 +64,8 @@ impl Stroke {
     /// Begins a stroke on `project` with room for `count` dabs, their edits from `seed`.
     fn begin(project: &mut Project, count: u32, seed: u64) -> Self {
         let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
-        let op = project.begin_stroke().unwrap();
+        // Ahead: a test lands only once it may, as the app does.
+        let op = project.begin_stroke_ahead().unwrap();
         Self {
             op,
             edits,
@@ -192,7 +211,9 @@ fn a_stroke_that_has_landed_writes_no_more() {
     assert_eq!(batches(&mut project), written, "nothing more");
 
     // A stroke that ends right after its last dabs land writes its last count with the flush
-    // its end makes: no batch in the file is behind its tiles.
+    // its end makes: no batch in the file is behind its tiles. Begun with every edit in the
+    // latest save point, it names that one.
+    let pen_down = latest(&project);
     let mut quick = Stroke::begin(&mut project, 20, 6);
     quick.place(&mut project, 8);
     flush(&mut project);
@@ -200,7 +221,10 @@ fn a_stroke_that_has_landed_writes_no_more() {
     project.end_unrecorded_stroke().unwrap();
     crash::poll_until_idle(&mut project);
     let mut ended = written;
-    ended.extend([batch(quick.op, 0..8, 0), batch(quick.op, 8..8, 8)]);
+    ended.extend([
+        batch_at(quick.op, pen_down, 0..8, 0),
+        batch_at(quick.op, pen_down, 8..8, 8),
+    ]);
     assert_eq!(batches(&mut project), ended, "its end's flush");
     flush(&mut project);
     assert_eq!(batches(&mut project), ended, "and no more");
@@ -285,8 +309,8 @@ fn a_save_waits_for_the_dabs_to_land() {
     flush(&mut project);
     assert_eq!(
         batches(&mut project),
-        vec![batch(stroke.op, 10..12, 10)],
-        "the journal goes on in the fresh file"
+        vec![batch_at(stroke.op, PenDown::Unknown, 10..12, 10)],
+        "the journal goes on in the fresh file, which doesn't hold the stroke's pen-down surface"
     );
     stroke.land(&mut project, &mut map, 2);
     assert_saved(project.save());
@@ -321,11 +345,12 @@ fn the_journal_goes_when_the_stroke_ends_or_is_discarded() {
     assert_eq!(batches(&mut project), written, "nothing after the end");
 
     // The next stroke's journal is its own.
+    let pen_down = latest(&project);
     let mut next = Stroke::begin(&mut project, 20, 11);
     next.place(&mut project, 3);
     flush(&mut project);
     let mut both = written;
-    both.push(batch(next.op, 0..3, 0));
+    both.push(batch_at(next.op, pen_down, 0..3, 0));
     assert_eq!(batches(&mut project), both, "a new journal");
     next.place(&mut project, 3);
     let recovery = project.recovery_path().unwrap().to_path_buf();
@@ -531,12 +556,20 @@ fn a_stroke_begun_while_the_last_one_waits_writes_after_it() {
     new.place(&mut project, 3);
     let_go(&mut project);
     flush(&mut project);
+    // The old stroke's landing came after the held flush's cut: the new stroke's op took the
+    // queued flush's cut early, and its save point, the second, holds the new pen-down surface.
+    let points = project.store().working().save_points().unwrap();
+    assert_eq!(
+        points.len(),
+        3,
+        "the held flush's, the queued one's, and the last"
+    );
     assert_eq!(
         batches(&mut project),
         vec![
             batch(old.op, 0..10, 0),
             batch(old.op, 10..10, 10),
-            batch(new.op, 0..3, 0)
+            batch_at(new.op, PenDown::At(points[1]), 0..3, 0)
         ],
         "the old stroke's last count first"
     );
@@ -559,8 +592,8 @@ fn after_a_roll_over_the_next_flush_journals_the_dabs_not_landed_into_the_fresh_
     flush(&mut project);
     assert_eq!(
         batches(&mut project),
-        vec![batch(stroke.op, 4..10, 4)],
-        "from the landed count, with no gap"
+        vec![batch_at(stroke.op, PenDown::Unknown, 4..10, 4)],
+        "from the landed count, with no gap, the pen-down surface not yet in the fresh file"
     );
     project.close(false).unwrap();
 }
@@ -640,6 +673,7 @@ fn an_ended_stroke_whose_cut_fails_writes_its_last_count_only_if_a_batch_is_in_t
     assert_eq!(batches(&mut project), Vec::new(), "no batch, then or later");
 
     // A batch of it in the file: its last count waits for the next flush.
+    let pen_down = latest(&project);
     let mut written = Stroke::begin(&mut project, 20, 23);
     written.place(&mut project, 4);
     flush(&mut project);
@@ -661,13 +695,14 @@ fn an_ended_stroke_whose_cut_fails_writes_its_last_count_only_if_a_batch_is_in_t
         "the stroke end's flush dropped"
     );
     let op = written.op;
-    assert_eq!(batches(&mut project), vec![batch(op, 0..4, 0)], "not yet");
+    let first = batch_at(op, pen_down, 0..4, 0);
+    assert_eq!(batches(&mut project), vec![first.clone()], "not yet");
     assert!(project.store().has_journal_work(), "the last count waits");
     project
         .tick(Instant::now() + FLUSH_INTERVAL * 1_000)
         .unwrap();
     crash::poll_until_idle(&mut project);
-    let last = vec![batch(op, 0..4, 0), batch(op, 10..10, 10)];
+    let last = vec![first, batch_at(op, pen_down, 10..10, 10)];
     assert_eq!(batches(&mut project), last, "the next tick writes it");
     flush(&mut project);
     assert_eq!(batches(&mut project), last, "once");

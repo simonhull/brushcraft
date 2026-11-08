@@ -985,6 +985,12 @@ impl ProjectFile {
         self.cut = None;
     }
 
+    /// The offset of the latest save point's Index, the parent of the next; `None` before the
+    /// file's first.
+    pub(crate) fn last_save_point(&self) -> Option<u64> {
+        self.last_index()
+    }
+
     /// Where the last record the next save point names ends: with a cut open, the end of the
     /// last record at or before it (see [`Cut`]), else the file's end. A sync that covers it
     /// covers every record the save point names; records past the cut beyond it need none.

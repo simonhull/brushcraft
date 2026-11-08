@@ -33,6 +33,7 @@ use super::layers::{Dirty, Snapshot};
 use crate::feed::ConsumerId;
 use crate::file::{FileSyncer, FramedTile};
 use crate::slot::CorrectionSlot;
+use crate::stamp::Stamp;
 
 impl TileStore {
     /// Subscribes a streaming consumer (the recovery writer) to the change feed, with an empty
@@ -196,11 +197,23 @@ impl TileStore {
     /// Opens a cut in the working file at the latest write so far: the next save point the
     /// recovery writer writes names the state as of now, whatever is written back meanwhile
     /// (see [`ProjectFile::open_cut`](crate::file::ProjectFile::open_cut)). Called as a flush takes
-    /// its snapshot.
+    /// its snapshot. Returns the write the cut is at.
     ///
     /// The cut is at a write stamp, not an op, so it falls between two dabs of one stroke.
-    pub(crate) fn open_cut(&mut self) {
+    pub(crate) fn open_cut(&mut self) -> Stamp {
         self.file.open_cut(self.last_write);
+        self.last_write
+    }
+
+    /// Whether a correction slot took a write after `stamp`: an edit a cut at `stamp` doesn't
+    /// hold.
+    pub(crate) fn written_since(&self, stamp: Stamp) -> bool {
+        self.last_write > stamp
+    }
+
+    /// The offset of the working file's latest save point; `None` before its first.
+    pub(crate) fn working_last_save_point(&self) -> Option<u64> {
+        self.file.last_save_point()
     }
 
     /// Drops the cut open in the working file, if any: the flush that opened it was abandoned,
