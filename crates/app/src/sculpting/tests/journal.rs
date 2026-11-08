@@ -440,3 +440,62 @@ fn dabs_landed_as_they_are_placed_are_counted_by_what_each_step_applied() {
 fn symmetry_copies_are_journalled_and_counted_landed_as_dabs_of_their_own() {
     landed_at_once_is_counted_as_applied(Symmetry::mirror(MirrorPlanes::X));
 }
+
+#[test]
+fn a_stroke_shows_its_dabs_and_lands_none_until_its_cut_is_taken() {
+    let mut run = Journalling::new();
+    // A stroke of the project's own, before the brush's: a tick cuts it midway, and it goes on
+    // editing after that cut, the flush still in flight (nothing polls the project between).
+    let level = Level::new(LEVEL).expect("a level");
+    let face = geom::FaceId::new(0);
+    let before = run.project.begin_stroke().expect("a stroke");
+    let edit = |project: &mut Project, i: u32, z: f32| {
+        project
+            .store()
+            .set_correction(face, level, i, 9, geom::Vec3::new(0.0, 0.0, z))
+            .expect("an edit");
+    };
+    edit(&mut run.project, 9, 1e-3);
+    run.ticked = run.ticked.max(Instant::now()) + FLUSH_INTERVAL * 2;
+    run.project.tick(run.ticked).expect("ticked");
+    edit(&mut run.project, 11, -1e-3);
+    assert!(
+        run.project.may_land(),
+        "the project's own stroke edits freely"
+    );
+
+    let shown = run.frame(&pen_left_down());
+    let op = run.stroke().op;
+    assert_ne!(op, before, "the brush's own stroke");
+    assert!(
+        !run.project.may_land(),
+        "back to back: it waits for its cut"
+    );
+    assert!(shown.dabs_shown > 1, "its dabs shown ahead: {shown:?}");
+    let waiting = run.land_one();
+    assert_eq!(waiting.dabs_applied, 0, "none lands before its cut");
+    assert_eq!(run.brush.catching_up(), shown.dabs_shown, "all still shown");
+
+    // As the frame loop does between steps, until the flush queued behind has cut.
+    let began = Instant::now();
+    while !run.project.may_land() {
+        run.project.tick(Instant::now()).expect("ticked");
+        run.project.poll().expect("polled");
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "it may land within the flush's syncs"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let landed = run.land_one();
+    assert_eq!(landed.dabs_applied, 1, "then it lands: {landed:?}");
+    run.cut();
+    let batches = run.close(op);
+    assert!(!batches.is_empty(), "journalled");
+    assert!(
+        batches
+            .iter()
+            .all(|batch| matches!(batch.pen_down(), store::PenDown::At(_))),
+        "naming the save point its cut made: {batches:?}"
+    );
+}

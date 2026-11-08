@@ -123,6 +123,14 @@
 //!   lands them. The dabs of a push that failed never join the queue, so they are never journalled.
 //! - A journal call that fails means the brush's bookkeeping broke: it ends the stroke as a store
 //!   error does ("Errors" below).
+//! - **The first landing waits for its cut.** A stroke's op begins ahead
+//!   ([`Project::begin_stroke_ahead`]): when strokes come back to back, a save point at the
+//!   stroke's pen-down surface is the flush's queued behind the one in flight, and until that flush
+//!   has taken its cut the stroke may not land ([`Project::may_land`]). Its dabs are placed,
+//!   journalled and shown ahead meanwhile, as when the budget doesn't fit, and none is applied; the
+//!   frame loop's ticks and polls drive the flushes ([`Project::tick`]), so it may land within the
+//!   flush in flight's syncs, and lands then. A close's or a save's landing, which has no frames to
+//!   wait for, waits for the cut ([`Project::wait_to_land`]).
 //!
 //! # Warming under a hovering pen
 //!
@@ -152,7 +160,7 @@
 //!   engine stroke; one that refuses a landed count drops the stroke's dabs left after the batch
 //!   applied, so the stroke ends in that call, its journal closed by the store before any cut could
 //!   pair the batch's edits with the count before it;
-//! - an op that can't begin ([`Project::begin_stroke`]) starts no stroke;
+//! - an op that can't begin ([`Project::begin_stroke_ahead`]) starts no stroke;
 //! - a record [`Project::end_stroke`] refuses ([`ProjectError::Cache`],
 //!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
 //!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
@@ -1072,8 +1080,9 @@ impl Sculpting {
     }
 
     /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it,
-    /// and begins its op ([`Project::begin_stroke`]): with none under way ([`Sculpting::admit`]
-    /// holds a `Down` back until then).
+    /// and begins its op ahead ([`Project::begin_stroke_ahead`]): with none under way
+    /// ([`Sculpting::admit`] holds a `Down` back until then). It lands once it may (see "The
+    /// journal" in the module notes).
     fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
         self.warm = Warm::default();
         let routed = self.routed.take();
@@ -1097,7 +1106,7 @@ impl Sculpting {
             return;
         };
         // Before its first dab: the op's journal takes every dab it places.
-        let op = match scene.project.begin_stroke() {
+        let op = match scene.project.begin_stroke_ahead() {
             Ok(op) => op,
             Err(error) => {
                 // No op, so nothing of it can be applied: it is dropped.
@@ -1303,6 +1312,9 @@ impl Sculpting {
         if self.landing == Landing::InSteps {
             return;
         }
+        if !self.may_land(scene) {
+            return;
+        }
         let moving = self.landing == Landing::InFrames && self.pen_moving();
         // While the pen is down, resting or not, the catch-up never holds up its next sample:
         // a dab is forced, and long batches taken, only once it has lifted.
@@ -1401,6 +1413,24 @@ impl Sculpting {
         if let Some(over) = self.stroke.take() {
             self.end(scene.project, &over);
         }
+    }
+
+    /// Whether the stroke may land now ([`Project::may_land`]): its pen-down flush has taken its
+    /// cut. A frame's step goes on without landing until it has (what it would land is shown
+    /// ahead); a close's or a save's step, which has no frames to wait for, waits for the cut
+    /// ([`Project::wait_to_land`]), at most the flush in flight's syncs. What waiting meets of the
+    /// recovery file is reported as a stroke end's is; the stroke may land then all the same.
+    fn may_land(&mut self, scene: &mut Scene<'_>) -> bool {
+        if scene.project.may_land() {
+            return true;
+        }
+        if self.landing != Landing::Stepping {
+            return false;
+        }
+        if let Err(error) = scene.project.wait_to_land() {
+            self.ended_with(error);
+        }
+        scene.project.may_land()
     }
 
     /// Applies the stroke's first `count` queued dabs in one [`apply_dabs`], adding to
