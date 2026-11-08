@@ -307,7 +307,7 @@ fn edit_and_refit(store: &mut TileStore, index: &mut SpatialIndex, count: u32, s
 /// Asserts what [`assert_loads_as_built`] does of `store`'s index over [`top`], and that it holds
 /// no display tile older (or newer) than its corrections ([`assert_display_current`]); returns
 /// the index load's stats.
-fn assert_restored_derived(store: &mut TileStore, what: &str) -> LoadStats {
+pub(super) fn assert_restored_derived(store: &mut TileStore, what: &str) -> LoadStats {
     let loaded = assert_loads_as_built(store, top(), what);
     assert_display_current(store, what);
     loaded

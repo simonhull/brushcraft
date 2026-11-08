@@ -291,7 +291,9 @@ pub enum JournalUnusable {
 /// only among one site's ([`OpId`]'s ordering puts a greater site after every op of a lesser,
 /// whenever it was made): so it is compared only when it is of the stroke's site. An op of
 /// another site says nothing either way, and the closing batch alone says whether the stroke
-/// ended.
+/// ended. The head is the greatest op over every site, so a greater site's op hides a later op
+/// of the stroke's own: that can't happen while every edit comes from one site, as now. When
+/// edits of several sites are merged, the file must keep its head per site for this check.
 pub(super) fn find(store: &TileStore) -> Option<Result<OpenStroke, JournalUnusable>> {
     let file = store.working();
     let locations: Vec<Loc> = file.batch_locations().collect();

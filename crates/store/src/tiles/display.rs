@@ -896,6 +896,26 @@ impl TileStore {
         .map_err(CacheError::Save)
     }
 
+    /// Every display tile [`TileStore::carry_display`] writes into a roll-over's new file, with
+    /// the book settled first: the old working file's records, and every change the book keeps
+    /// that a flush or the old file holds. For the pen-down cut, which holds each of them as
+    /// unknown before the fill writes them (see `TileStore::write_pen_down_cut`).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] if settling the book does.
+    pub(super) fn display_to_carry(&mut self) -> Result<BTreeSet<TileKey>, CacheError> {
+        self.display.settle(&self.mesh, &self.deps)?;
+        let carried: BTreeSet<TileKey> = self.file.display_keys().copied().collect();
+        let book = &self.display;
+        let changed = book
+            .all_kept()
+            .filter(|(key, _)| carried.contains(key) || book.is_unflushed(key))
+            .map(|(key, _)| *key);
+        let all: BTreeSet<TileKey> = changed.chain(carried.iter().copied()).collect();
+        Ok(all)
+    }
+
     /// Carries the display layer into `fresh`, a new working file (a roll-over): every record
     /// of the old working file the store hasn't changed since, copied, and every change a flush
     /// or the old file holds.

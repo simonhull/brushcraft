@@ -5,6 +5,8 @@
 //! the stroke as a crash before it would have.
 
 use super::*;
+use crate::fixture::display_layer;
+use crate::project::tests::{bounds, crash};
 use crate::tiles::PenDownPoint;
 
 /// Fails the writer's next sync and drives the flushes until the project has rolled over onto a
@@ -137,6 +139,67 @@ fn a_roll_over_before_the_next_flush_still_restores_the_stroke() {
     );
     assert_eq!(head_at(&path, fill), Some(landing.op), "the fill's is its");
     assert_resumes_as_live(restore(&dir), landing, &mut map, &live, PenDown::At(cut), 9);
+}
+
+/// Flips a byte of the file at `path`, `at` bytes in: a record there no longer verifies.
+fn flip_byte(path: &Path, at: u64) {
+    let mut bytes = fs::read(path).unwrap();
+    let at = usize::try_from(at).unwrap();
+    bytes[at] ^= 0x40;
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_damaged_fill_save_point_restores_the_pen_down_cut_consistently() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let displayed = |at: &TestDir| ProjectConfig {
+        store: roomy().with_display(crate::fixture::level(TOP)),
+        recovery_dir: at.path("recovery"),
+    };
+    let mut project = Project::new((*mesh).clone(), displayed(&dir)).unwrap();
+    project.set_dab_format(FORMAT);
+    let (mut index, _) = project.load_index(bounds::top(), |_, _| {}).unwrap();
+    // A stroke saved into the project file with its bounds and display tiles, and one since in
+    // the recovery file alone: the project file's are stale for the tiles the recovery file holds.
+    for (seed, saved) in [(98, true), (99, false)] {
+        let layer = display_layer(project.store());
+        project.store().record_display(&layer).unwrap();
+        stroke(&mut project, &mut map, 300, seed);
+        index
+            .update(project.store(), &tiles(&mesh, TOP, TOP))
+            .unwrap();
+        if saved {
+            assert_saved(project.save_as(&dir.path("p.bcrf")));
+        } else {
+            flush(&mut project);
+        }
+    }
+    let found = map.clone();
+    let mut landing = begin_on_top(&mut project, 30, 100);
+    live_shapes(&mut project, &landing);
+    landing.place(&mut project, 30);
+    landing.land(&mut project, &mut map, 6);
+    let points = fail_and_roll_over(&mut project);
+    let [cut, fill] = points[..] else {
+        panic!("the pen-down cut and the fill's own: {points:?}");
+    };
+    let path = project.recovery_path().unwrap().to_path_buf();
+    crash_now(project);
+    flip_byte(&path, fill + 24);
+    let candidate = candidate(&dir);
+    assert_eq!(candidate.status, CandidateStatus::Restorable, "restorable");
+    let mut restored = Project::restore(&candidate, displayed(&dir)).unwrap();
+    assert_eq!(
+        restored.store().working().last_save_point(),
+        Some(cut),
+        "opened at the pen-down cut"
+    );
+    assert!(restored.take_open_stroke().is_none(), "no batch: no stroke");
+    assert_tiles(&mut restored, &found, "the pen-down surface");
+    crash::assert_restored_derived(restored.store(), "nothing stale");
+    restored.close(false).unwrap();
 }
 
 #[test]

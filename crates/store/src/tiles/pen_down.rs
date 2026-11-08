@@ -116,8 +116,10 @@ pub struct PenDownShape {
     corrections: CorrectionTile,
     /// The op of the record, or of the write not yet in one, those corrections are: the label a
     /// roll-over gives the record it writes of the shape (see `TileStore::fill_roll_over`), an
-    /// op from before the stroke's. `None` for a tile no record or write held: it read as zero,
-    /// and a roll-over writes no record of it.
+    /// op from before the stroke's, if the shape was kept before the stroke's first write as it
+    /// must be. A shape kept after it holds the stroke's own edit, and its op is the stroke's: a
+    /// roll-over checks that, and doesn't carry the stroke then. `None` for a tile no record or
+    /// write held: it read as zero, and a roll-over writes no record of it.
     op: Option<OpId>,
     /// The box of the tile's finite positions at pen-down; `None` for none.
     bounds: Option<Aabb>,
