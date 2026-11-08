@@ -9,6 +9,7 @@ use super::*;
 use crate::index::SpatialIndex;
 use crate::index::tests::{assert_loads_as_built, wave_now};
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
+use crate::tiles::PenDownPoint;
 
 /// Blocks until the writer has no flush in flight or queued, advancing it reply by reply.
 fn settle(writer: &mut RecoveryWriter, store: &mut TileStore) {
@@ -1646,4 +1647,95 @@ fn a_flush_without_a_save_point_leaves_no_cut_open() {
     }
     assert!(failed, "the sync fails");
     assert_eq!(store.file.cut_at(), None, "abandoned: no cut left");
+}
+
+/// A pen-down left waiting on a flush of a writer gone mid-flush is unknown once the next
+/// writer's flush cuts: it would settle no more, and the stroke must not wait on it.
+#[test]
+fn a_pen_down_waiting_on_a_gone_writer_is_unknown_at_the_next_cut() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let top = tiles(&mesh, TOP, TOP);
+    let mut map = CorrectionMap::new();
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    edit_interior(&mut store, &mut map, top[3], Vec3::new(0.0, 0.0, 0.25));
+    let pen_down = writer.cut_before_op(&mut store, Instant::now()).unwrap();
+    assert!(matches!(pen_down, PenDownPoint::Flush(_)), "{pen_down:?}");
+    let op = store.begin_op().unwrap();
+    store.begin_journal(op, pen_down);
+    // Gone with its flush in flight, unsettled.
+    drop(writer);
+    let mut next = RecoveryWriter::new(&mut store).unwrap();
+    edit_interior(&mut store, &mut map, top[9], Vec3::new(0.0, 0.25, 0.0));
+    next.end_stroke(&mut store, Instant::now()).unwrap();
+    assert_eq!(
+        store.open_pen_down(),
+        Some(PenDownPoint::Known(crate::PenDown::Unknown)),
+        "unknown at the next writer's cut"
+    );
+    settle(&mut next, &mut store);
+}
+
+/// A stroke left waiting for the next flush's cut with no flush in flight to take it (a bug) is
+/// let land by [`RecoveryWriter::wait_for_cut`], its pen-down unknown, rather than wait for ever.
+#[test]
+fn waiting_for_a_cut_no_flush_will_take_gives_up_on_the_pen_down() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let op = store.begin_op().unwrap();
+    store.begin_journal(op, PenDownPoint::Next);
+    assert!(!store.may_land(), "waiting");
+    writer.wait_for_cut(&mut store).unwrap();
+    assert!(store.may_land(), "let land");
+    assert_eq!(
+        store.open_pen_down(),
+        Some(PenDownPoint::Known(crate::PenDown::Unknown)),
+        "in no save point"
+    );
+}
+
+/// A writer abandoned while a stroke waits for its queued flush's cut lets the stroke land, its
+/// pen-down unknown.
+#[test]
+fn abandoning_the_writer_lets_a_waiting_stroke_land() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let mut map = CorrectionMap::new();
+    edit_interior(&mut store, &mut map, top[3], Vec3::new(0.0, 0.0, 0.25));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert_eq!(writer.phase(), "encoding", "a flush in flight");
+    dab_interior(&mut store, &mut map, top[4], Vec3::new(0.25, 0.0, 0.0));
+    let pen_down = writer.cut_before_op(&mut store, Instant::now()).unwrap();
+    assert_eq!(pen_down, PenDownPoint::Next, "behind the flush in flight");
+    let op = store.begin_op().unwrap();
+    store.begin_journal(op, pen_down);
+    assert!(!store.may_land(), "waiting");
+    writer.abandon(&mut store);
+    assert!(store.may_land(), "let land");
+    assert_eq!(
+        store.open_pen_down(),
+        Some(PenDownPoint::Known(crate::PenDown::Unknown)),
+        "in no save point"
+    );
+}
+
+/// An edit of a stroke still waiting for its pen-down cut is a bug, which a debug build says.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a stroke edited the store before its pen-down cut was taken")]
+fn an_edit_before_the_pen_down_cut_is_a_bug() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let top = tiles(&mesh, TOP, TOP);
+    let mut map = CorrectionMap::new();
+    let op = store.begin_op().unwrap();
+    store.begin_journal(op, PenDownPoint::Next);
+    dab_interior(&mut store, &mut map, top[3], Vec3::new(0.0, 0.0, 0.25));
 }

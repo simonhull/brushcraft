@@ -478,3 +478,128 @@ fn a_flush_failing_while_the_next_stroke_waits_leaves_no_gap_or_overlap() {
         project.close(false).unwrap();
     }
 }
+
+#[test]
+fn a_queued_pen_down_flush_that_leaves_a_valid_tile_out_names_none() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 56));
+    hold_in_tile_sync(&mut project);
+    // Edits after the cut in flight, by an op that journals nothing.
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 57));
+    let mut b = Stroke::begin(&mut project, 20, 58);
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Next),
+        "the flush queued holds it"
+    );
+    b.place(&mut project, 10);
+    // The queued flush, its pen-down's, leaves its first copy out; it carries no batch (the
+    // stroke's waits for its pen-down to settle).
+    project.writer.as_ref().unwrap().fail_encodes(1);
+    project.writer.as_ref().unwrap().pause_syncs(false);
+    let began = Instant::now();
+    while !project.writer.as_ref().unwrap().is_idle() {
+        drop(project.poll());
+        assert!(began.elapsed() < Duration::from_secs(30), "the flushes end");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "a save point lacking a tile's copy holds no pen-down"
+    );
+    assert!(project.may_land(), "the stroke lands all the same");
+    b.land(&mut project, &mut map, 6);
+    let flushed = project.finish_flushes();
+    assert!(
+        flushed.is_ok() || matches!(flushed, Err(ProjectError::Unprotected(_))),
+        "{flushed:?}"
+    );
+    assert_eq!(
+        pen_down_of(&mut project, b.op),
+        PenDown::Unknown,
+        "named so"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_roll_over_as_a_stroke_begins_names_the_fresh_file_and_reports_the_old_one_kept() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 59));
+    flush(&mut project);
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 60));
+    let old = project.recovery_path().unwrap().to_path_buf();
+    // The working file stays open, unlinked; a directory takes its name, so it can't be deleted.
+    fs::remove_file(&old).unwrap();
+    fs::create_dir_all(&old).unwrap();
+    project.writer.as_mut().unwrap().stop_thread();
+    let mut b = Stroke::begin(&mut project, 20, 61);
+    assert_ne!(project.recovery_path().unwrap(), old, "rolled over");
+    let fresh = project.store().working().last_save_point();
+    assert!(
+        fresh.is_some(),
+        "the fresh file's save point holds every edit"
+    );
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::At(fresh.unwrap()))),
+        "the new writer names the fresh file's save point"
+    );
+    assert!(project.may_land(), "it lands at once");
+    let reported = project.poll();
+    assert!(
+        matches!(&reported, Err(ProjectError::OldRecoveryKept { path, .. }) if *path == old),
+        "the next call reports the old file kept: {reported:?}"
+    );
+    b.place(&mut project, 4);
+    b.land(&mut project, &mut map, 2);
+    flush(&mut project);
+    assert_eq!(
+        pen_down_of(&mut project, b.op),
+        PenDown::At(fresh.unwrap()),
+        "its batches name it"
+    );
+    fs::remove_dir(&old).unwrap();
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_save_before_a_stroke_lands_anything_makes_the_new_file_s_base_its_pen_down() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 62));
+    flush(&mut project);
+    let mut stroke = Stroke::begin(&mut project, 20, 63);
+    assert_saved(project.save_as(&path));
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Base)),
+        "nothing landed: the saved state is the surface it found"
+    );
+    stroke.place(&mut project, 5);
+    stroke.land(&mut project, &mut map, 2);
+    flush(&mut project);
+    assert_eq!(
+        pen_down_of(&mut project, stroke.op),
+        PenDown::Base,
+        "named so"
+    );
+    stroke.land(&mut project, &mut map, 3);
+    assert_saved(project.save());
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "landed, then saved: the new file holds no surface it found"
+    );
+    project.close(false).unwrap();
+}

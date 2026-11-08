@@ -31,6 +31,7 @@ use super::TestHooks;
 use super::config::{Headroom, StoreConfig, reserved_shares};
 use super::display::display_book_of;
 use super::error::{CacheError, Invariant};
+use super::journal::Rebase;
 use super::layers::{
     Dirty, Filled, Saved, book_of, check_layers, first_op, saved_base, write_slot,
 };
@@ -506,7 +507,7 @@ impl TileStore {
         self.since_rebase.clear();
         self.forget_copied_ahead();
         self.forget_saved_strokes(strokes);
-        self.rebase_journal();
+        self.rebase_journal(Rebase::Save);
         self.bounds.rebased();
         self.display.rebased();
         self.generation += 1;
@@ -763,7 +764,7 @@ impl TileStore {
         // The new file holds every bound as it is now, and every stroke record waiting, but no
         // dab batch: the open stroke's journal writes its dabs not landed again.
         self.forget_saved_strokes(strokes);
-        self.rebase_journal();
+        self.rebase_journal(Rebase::RollOver);
         self.bounds.all_flushed();
         self.display.all_flushed();
         self.generation += 1;

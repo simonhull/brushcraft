@@ -98,6 +98,15 @@ pub(crate) enum PenDownPoint {
     Known(PenDown),
 }
 
+/// How the store moved onto a fresh working file ([`TileStore::rebase_journal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rebase {
+    /// A save: the new file's base is the saved state.
+    Save,
+    /// A roll-over after the old file failed: the new file holds every edit in a save point.
+    RollOver,
+}
+
 /// Why the open stroke's journal refused what it was given. Nothing changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -550,6 +559,14 @@ impl TileStore {
         self.journals.forget_written();
     }
 
+    /// Whether a stroke's pen-down surface waits on the flush whose cut is `id`: its save point
+    /// must then hold every tile at the cut (see `crate::recovery`).
+    pub(crate) fn pen_down_on(&self, id: CutId) -> bool {
+        self.journals
+            .all()
+            .any(|journal| journal.pen_down == PenDownPoint::Flush(id))
+    }
+
     /// The flush in flight was abandoned, and any queued behind it, or a writer is gone: a
     /// journal waiting on one of them for its pen-down surface finds it in no save point, and its
     /// stroke may land.
@@ -575,21 +592,32 @@ impl TileStore {
         self.file.fail_next_save();
     }
 
-    /// The store moved onto a fresh working file (a save's rebase, or a roll-over), which holds
-    /// no batch: the ended journals go (no batch in the new file is behind its tiles), and the
-    /// open one writes its dabs not landed again, from its landed count, with the next flush.
+    /// The store moved onto a fresh working file, by `how`, which holds no batch: the ended
+    /// journals go (no batch in the new file is behind its tiles), and the open one writes its dabs
+    /// not landed again, from its landed count, with the next flush.
     ///
-    /// The new file holds no save point of the surface the open stroke began on, so its pen-down
-    /// is unknown from then on, and its journal can't be restored from the new file. A save
-    /// costs a restore nothing: it refuses while dabs are landing, so the saved state holds every
-    /// dab placed by then. A roll-over can leave a stroke landing; it is to write the pen-down
-    /// surface into the new file and name that save point instead (the dab journal's next step).
-    pub(super) fn rebase_journal(&mut self) {
+    /// The open stroke's pen-down surface:
+    ///
+    /// - **After a save**, if the stroke has landed nothing, the saved state is its surface, and
+    ///   the new file's base: [`PenDown::Base`]. Otherwise the new file holds no save point of the
+    ///   surface it began on, and its pen-down is unknown from then on (its journal can't be
+    ///   restored from the new file). A save refuses while dabs are landing, and the app saves only
+    ///   after the pen lifts, so the app never meets that; a store-level save in the middle of a
+    ///   stroke whose dabs have all landed leaves the rest of the stroke's dabs unrestorable.
+    /// - **After a roll-over**, unknown for now: a roll-over can leave a stroke landing, and is to
+    ///   write the pen-down surface into the new file and name that save point instead (the dab
+    ///   journal's next step).
+    pub(super) fn rebase_journal(&mut self, how: Rebase) {
         self.journals.ended.clear();
         if let Some(journal) = &mut self.journals.open {
             journal.written = None;
             journal.in_flight = None;
-            journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
+            let found = how == Rebase::Save && journal.landed == 0;
+            journal.pen_down = PenDownPoint::Known(if found {
+                PenDown::Base
+            } else {
+                PenDown::Unknown
+            });
         }
     }
 }

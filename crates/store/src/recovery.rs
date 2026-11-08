@@ -241,9 +241,6 @@ struct Flight {
     id: CutId,
     /// The store's write the cut is at.
     stamp: Stamp,
-    /// Whether a stroke's pen-down surface is to be in its save point, which must then hold every
-    /// tile at the cut (see the module notes).
-    holds_pen_down: bool,
     /// Whether its encode left a valid tile out: its save point names that tile's older state, so
     /// it can't hold a pen-down surface.
     left_valid_out: bool,
@@ -544,19 +541,15 @@ impl RecoveryWriter {
             if self.has_work(store) {
                 self.start(store, now)?;
             }
-            return Ok(match &mut self.flight {
-                Some(flight) => {
-                    flight.holds_pen_down = true;
-                    PenDownPoint::Flush(flight.id)
-                }
-                None => PenDownPoint::Known(latest_save_point(store)),
-            });
+            return Ok(self.flight.map_or_else(
+                || PenDownPoint::Known(latest_save_point(store)),
+                |flight| PenDownPoint::Flush(flight.id),
+            ));
         }
-        if let Some(flight) = &mut self.flight
+        if let Some(flight) = self.flight
             && !flight.left_valid_out
             && !store.written_since(flight.stamp)
         {
-            flight.holds_pen_down = true;
             return Ok(PenDownPoint::Flush(flight.id));
         }
         self.queued.get_or_insert(now);
@@ -753,7 +746,6 @@ impl RecoveryWriter {
                 let flight = Flight {
                     id,
                     stamp,
-                    holds_pen_down: false,
                     left_valid_out: false,
                 };
                 if !snapshots.is_empty() || !batches.is_empty() {
@@ -838,7 +830,9 @@ impl RecoveryWriter {
                 // it found: nothing of the flush is appended, and the tile and the dabs wait for
                 // the next. A lost one is gone either way.
                 let left_valid_out = broken.len() > lost.len();
-                if left_valid_out && (!batches.is_empty() || flight.holds_pen_down) {
+                // Whether a stroke's pen-down waits on it is the store's to say: a journal begun
+                // on it, or one queued for the next flush, which its cut took up.
+                if left_valid_out && (!batches.is_empty() || store.pen_down_on(flight.id)) {
                     return Err(RecoveryError::Unpaired);
                 }
                 // Then it can hold no pen-down a stroke begins on later.
