@@ -1,7 +1,8 @@
 //! The brush on a small generated sphere, with no GPU.
 //!
 //! Routing on and off the surface, strokes into the store and their records, the dab budget,
-//! warming under a hovering pen, the keys, and a scripted run's record.
+//! warming under a hovering pen, the keys, a scripted run's record, and (in `journal`) the dab
+//! journal.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use crate::render_thread::Presented;
 use crate::script::{Script, Speed};
 use crate::test_dir::TestDir;
 
+mod journal;
 mod lifecycle;
 mod navigation;
 mod saving;

@@ -1,0 +1,320 @@
+//! The dab journal from the brush's side, read back from the recovery file's batches.
+//!
+//! Every dab placed goes to its stroke's journal once, in order, from the stroke's first; the
+//! landed count follows the finest work, never the dabs shown; dabs an error drops are never
+//! replayed; and a journal that refuses ends the stroke cleanly.
+
+use store::{DabBatch, FLUSH_INTERVAL, SaveAhead};
+
+use super::*;
+
+/// Waits until `project`'s recovery writer has no flush under way: every cut taken so far is in
+/// the recovery file, durable. A saved project's [`Project::save_ahead`] says so, and copies
+/// nothing a reader sees.
+fn settle(project: &mut Project) {
+    let began = Instant::now();
+    while matches!(
+        project.save_ahead(Instant::now()).expect("a slice"),
+        SaveAhead::Flushing
+    ) {
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(began.elapsed() < Duration::from_secs(60), "the flush ends");
+    }
+}
+
+/// Has `project` cut its journal now, between brush calls as the frame loop does.
+///
+/// Ticks it at `at`, moved a flush interval past every tick before (so the tick starts a flush),
+/// with no flush under way first (so it starts now, not queued behind one), and waits until that
+/// flush is durable.
+fn cut(project: &mut Project, at: &mut Instant) {
+    settle(project);
+    *at = (*at).max(Instant::now()) + FLUSH_INTERVAL * 2;
+    project.tick(*at).expect("ticked");
+    settle(project);
+}
+
+/// The batches of the stroke made as `op` in the recovery file at `path`, closed, in the order
+/// they were written.
+fn batches_at(path: &std::path::Path, op: OpId) -> Vec<DabBatch> {
+    let file = ProjectFile::open(path).expect("the recovery file opens");
+    let batches = file.batches().map(|batch| batch.expect("a batch"));
+    let of_op = batches.filter(|batch| batch.op() == op);
+    of_op.collect()
+}
+
+/// A brush stepped directly over a project saved in a directory of its own.
+///
+/// A dab at a time is too dear for any time ([`DabCost::one_at_a_time`]): a frame's step shows
+/// every dab it can't fit and lands none, and the tests land them one by one
+/// ([`Journalling::land_one`]).
+struct Journalling {
+    /// The project's directory, kept until the batches are read.
+    dir: TestDir,
+    /// The project, saved: a saved project says when its flushes are done ([`settle`]).
+    project: Project,
+    /// Its spatial index.
+    picker: Picker,
+    /// The brush.
+    brush: Sculpting,
+    /// The camera, the default one.
+    camera: Camera,
+    /// When the last cut was ticked at ([`cut`]).
+    ticked: Instant,
+}
+
+impl Journalling {
+    /// The brush over a fresh project, saved.
+    fn new() -> Self {
+        let dir = TestDir::new();
+        let mut project = project(&dir);
+        drop(
+            project
+                .save_as(&dir.path().join("journal.bcrf"))
+                .expect("saved"),
+        );
+        let picker = Picker::load(&mut project)
+            .expect("the index loads")
+            .expect("a display layer");
+        let brush = Sculpting::new(&mut project).with_cost(DabCost::one_at_a_time());
+        Self {
+            dir,
+            project,
+            picker,
+            brush,
+            camera: Camera::default(),
+            ticked: Instant::now(),
+        }
+    }
+
+    /// A frame's step of the brush given `samples`, all routed to it: no dab fits, and none lands.
+    fn frame(&mut self, samples: &[PenSample]) -> BrushReport {
+        let mut pen = PenFrame::default();
+        for sample in samples {
+            pen.push(*sample, Some(Route::Brush));
+        }
+        let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
+        let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush.step(context, &pen, &budget).expect("a step")
+    }
+
+    /// A step that lands one dab of the stroke under way, however dear: the pen (down or lifted)
+    /// quiet for long, and the catch-up starved, so a step that must make progress takes one.
+    fn land_one(&mut self) -> BrushReport {
+        let long_ago = Instant::now()
+            .checked_sub(RESTING_QUIET * 2)
+            .expect("after the epoch");
+        self.brush.landed_at = long_ago;
+        self.brush.unframed = false;
+        if let Some(stroke) = &mut self.brush.stroke {
+            stroke.placed_at = long_ago;
+            stroke.last.received = long_ago;
+        }
+        let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        let budget = BrushBudget::unlimited();
+        self.brush
+            .step(context, &PenFrame::default(), &budget)
+            .expect("a step")
+    }
+
+    /// The stroke under way.
+    fn stroke(&self) -> &Pending {
+        self.brush.stroke.as_ref().expect("a stroke under way")
+    }
+
+    /// The rows of the stroke's dabs not yet landed, in order.
+    fn queued_rows(&self) -> Vec<DabRow> {
+        let rows = self.stroke().dabs.iter().copied().map(row_of);
+        rows.collect()
+    }
+
+    /// Cuts the project's journal now ([`cut`]).
+    fn cut(&mut self) {
+        cut(&mut self.project, &mut self.ticked);
+    }
+
+    /// Closes the project, keeping its recovery file, and reads back the batches of the stroke
+    /// made as `op`.
+    fn close(self, op: OpId) -> Vec<DabBatch> {
+        let Self { dir, project, .. } = self;
+        let path = project.recovery_path().expect("a recovery file").to_owned();
+        project.close(true).expect("closed");
+        let batches = batches_at(&path, op);
+        drop(dir);
+        batches
+    }
+}
+
+/// [`stroke()`] along [`ACROSS`] in 12 drags, without its `Up`: the pen stays down.
+fn pen_left_down() -> Vec<PenSample> {
+    let mut samples = stroke(ACROSS, 12);
+    samples.pop();
+    samples
+}
+
+#[test]
+fn every_dab_placed_is_journalled_in_order() {
+    let mut run = Journalling::new();
+    let mut samples = stroke(ACROSS, 12);
+    let later = samples.split_off(7);
+    let (drags, up) = later.split_at(later.len() - 1);
+    // Three pushes' worth, each cut apart: the Down and six drags, six more, then the pen's lift.
+    let first = run.frame(&samples);
+    assert!(first.dabs_shown > 0, "{first:?}");
+    let op = run.stroke().op;
+    run.cut();
+    run.frame(drags);
+    run.cut();
+    run.frame(up);
+    let placed = run.queued_rows();
+    assert!(placed.len() > first.dabs_shown, "the tail placed dabs");
+    assert!(!run.stroke().open(), "the pen lifted");
+    let batches = run.close(op);
+    assert_eq!(batches.len(), 3, "a batch a cut, and the close's");
+    let mut next = 0;
+    for batch in &batches {
+        assert_eq!(batch.first(), next, "each from where the last left off");
+        assert!(!batch.dabs().is_empty(), "each with the dabs since");
+        assert_eq!(batch.landed(), 0, "none landed");
+        next = batch.placed();
+    }
+    let rows = batches
+        .iter()
+        .flat_map(|batch| batch.dabs().iter().copied());
+    let journalled: Vec<DabRow> = rows.collect();
+    assert_eq!(journalled, placed, "every dab placed, once, in order");
+}
+
+#[test]
+fn the_landed_count_follows_the_finest_work() {
+    let mut run = Journalling::new();
+    let shown = run.frame(&pen_left_down());
+    assert!(shown.dabs_shown > 3, "{shown:?}");
+    assert_eq!(shown.dabs_applied, 0, "a frame lands none of them");
+    let op = run.stroke().op;
+    run.cut();
+    let mut applied = 0;
+    for landing in [1, 2] {
+        for _ in 0..landing {
+            let landed = run.land_one();
+            assert_eq!(landed.dabs_applied, 1, "{landed:?}");
+            applied += landed.dabs_applied;
+        }
+        assert_eq!(
+            run.brush.catching_up(),
+            shown.dabs_shown - applied,
+            "the rest still shown"
+        );
+        run.cut();
+    }
+    assert_eq!(run.brush.queued(), shown.dabs_shown - applied);
+    let batches = run.close(op);
+    let landed: Vec<u32> = batches.iter().map(DabBatch::landed).collect();
+    assert_eq!(
+        landed,
+        [0, 1, 3],
+        "at each cut, the dabs applied and none of those only shown"
+    );
+    let placed = u32::try_from(shown.dabs_shown).expect("a few");
+    let all_placed = batches.iter().all(|batch| batch.placed() == placed);
+    assert!(all_placed, "every dab written by the first cut");
+}
+
+#[test]
+fn a_stroke_shown_ahead_is_journalled_before_any_dab_lands() {
+    let mut run = Journalling::new();
+    let samples = pen_left_down();
+    let (down, drags) = samples.split_at(1);
+    // The op begins at the `Down`, before its first dab: the journal is open for it.
+    run.frame(down);
+    let op = run.stroke().op;
+    // Frame after frame of a big brush: every dab shown at once, none landed.
+    let mut shown = 0;
+    let frames = drags.chunks(3);
+    for frame in frames {
+        let report = run.frame(frame);
+        assert_eq!(report.dabs_applied, 0, "{report:?}");
+        shown += report.dabs_shown;
+    }
+    assert!(shown > 3, "{shown} dabs shown");
+    assert!(!run.project.has_unsaved_edits(), "no dab has landed");
+    let placed = run.queued_rows();
+    assert_eq!(placed.len(), shown);
+    run.cut();
+    let batches = run.close(op);
+    let [batch] = batches.as_slice() else {
+        panic!("one batch, the cut's: {batches:?}");
+    };
+    assert_eq!((batch.first(), batch.landed()), (0, 0));
+    assert_eq!(batch.dabs(), placed.as_slice(), "every dab shown, in order");
+}
+
+#[test]
+fn dabs_dropped_after_an_error_are_never_replayed() {
+    let (dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
+    let op = owner.brush().stroke.as_ref().expect("its pen down").op;
+    // Held from landing while they are placed, shown and cut: the journal holds them unlanded.
+    owner.brush_mut().landing = Landing::InSteps;
+    queue(&mut owner, heavy);
+    run(&mut owner, 1);
+    let stroke = owner.brush().stroke.as_ref().expect("its dabs wait");
+    let landed = stroke.landed;
+    let placed = landed + u32::try_from(stroke.dabs.len()).expect("a few");
+    assert!(placed > landed, "the heavy dabs wait to land");
+    cut(owner.project(), &mut Instant::now());
+    owner.brush_mut().landing = Landing::InFrames;
+    run(&mut owner, 10_000);
+    let error = owner.brush().error().map(str::to_owned);
+    let error = error.expect("the heavy dabs don't fit the least budget the light ones do");
+    assert!(error.contains("applying dabs"), "{error}");
+    assert!(!owner.brush().stroking(), "the stroke ended");
+    let project = owner.project();
+    let path = project.recovery_path().expect("a recovery file").to_owned();
+    owner.close().expect("closed");
+    let batches = batches_at(&path, op);
+    let counts: Vec<(u32, u32)> = batches
+        .iter()
+        .map(|batch| (batch.placed(), batch.landed()))
+        .collect();
+    assert!(
+        counts.contains(&(placed, landed)),
+        "the cut journalled them unlanded: {counts:?}"
+    );
+    assert_eq!(
+        counts.last(),
+        Some(&(placed, placed)),
+        "the stroke's end counts every dab landed: a restore lands none again"
+    );
+    drop(dir);
+}
+
+#[test]
+fn a_journal_that_refuses_ends_the_stroke_cleanly_and_says_so() {
+    let mut run = Journalling::new();
+    let mut samples = stroke(ACROSS, 12);
+    samples.pop();
+    let later = samples.split_off(7);
+    run.frame(&samples);
+    let queued = run.queued_rows();
+    assert!(!queued.is_empty(), "dabs placed");
+    let drops = run.brush.drops();
+    // The project's stroke ends behind the brush's back: its journal is gone.
+    run.project.end_unrecorded_stroke().expect("ended");
+    run.frame(&later);
+    let error = run.brush.error().expect("said").to_owned();
+    assert!(error.contains("journalling the dabs placed"), "{error}");
+    assert_eq!(
+        run.queued_rows(),
+        queued,
+        "the push's dabs dropped, not queued"
+    );
+    assert!(!run.stroke().open(), "the engine stroke ended");
+    assert_eq!(run.brush.drops(), drops + 1, "dabs dropped");
+    // The dabs queued before land, and the journal refuses their count: the stroke ends there.
+    let landed = run.land_one();
+    assert_eq!(landed.dabs_applied, 1, "{landed:?}");
+    assert!(!run.brush.stroking(), "the stroke ended in that step");
+    assert_eq!(run.brush.drops(), drops + 2, "the rest dropped");
+    assert!(run.brush.error().is_some(), "said");
+    run.project.close(false).expect("closed");
+}

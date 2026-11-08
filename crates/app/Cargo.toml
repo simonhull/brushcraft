@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytemuck.workspace = true
 checkout.workspace = true
 geom.workspace = true
 input.workspace = true

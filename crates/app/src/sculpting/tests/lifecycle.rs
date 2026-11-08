@@ -323,9 +323,9 @@ fn warming_progresses_past_its_deadline_and_a_moved_pen_cancels_it() {
     project.close(false).expect("closed");
 }
 
-/// A stroke under way with no dabs left to place, standing for one whose dabs still land: what a
-/// `Down` waits behind.
-fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
+/// A stroke of `op` under way with no dabs left to place, standing for one whose dabs still land:
+/// what a `Down` waits behind.
+fn landing_stroke(camera: &Camera, brush: &Sculpting, op: OpId) -> Pending {
     let view = camera.view(size()).expect("a view");
     let down = sample(Phase::Down, (160.0, 100.0), 0.5);
     Pending {
@@ -333,7 +333,8 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
         settings: brush.settings.clone(),
         camera: stroke_camera(camera, &view),
         samples: Vec::new(),
-        op: None,
+        op,
+        landed: 0,
         dabs: VecDeque::from([Dab::default()]),
         sources: VecDeque::new(),
         last: times_of(&down),
@@ -421,7 +422,7 @@ fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
         .expect("the sphere is under the middle");
     let near = pen_down_hit(&mut project, picker.index_mut(), edge - 4.0).expect("a hit");
     // The earlier stroke raises a bump at the silhouette, its pen-down shapes kept.
-    project.begin_stroke().expect("a stroke");
+    let op = project.begin_stroke().expect("a stroke");
     let mut state = sculpt::Stroke::new(project.store());
     let centre = near.position.to_f32();
     let outward = near.normal.to_f32();
@@ -433,7 +434,7 @@ fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
         ..Dab::default()
     };
     apply_dabs(project.store(), picker.index_mut(), &mut state, &[bump]).expect("applied");
-    brush.stroke = Some(landing_stroke(&camera, &brush));
+    brush.stroke = Some(landing_stroke(&camera, &brush, op));
     // A pixel past the silhouette the stroke began on, on the bump.
     let on_bump = (1..40).map(|d| edge + f64::from(d)).find(|&x| {
         let missed = pen_down_hit(&mut project, picker.index_mut(), x).is_none();

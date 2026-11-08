@@ -19,8 +19,10 @@
 //!   their finest work ([`Preview`], "Big brushes" below) and wait for later steps. The edit closes
 //!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
 //!   frame (a step between frames: in the next).
-//! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) as its first dabs are applied, so
-//!   every edit of the store's current op is that stroke's.
+//! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) as the stroke does, at its `Down`
+//!   once the engine finds the surface under it, before it places a dab: so every edit of the
+//!   store's current op is that stroke's, and its journal is open for its first dab ("The journal"
+//!   below). A stroke whose op can't begin doesn't begin either, its samples dropped.
 //! - **A stroke begins on what the last one left:** it reads its pen-down surface (the brush-engine
 //!   spec), which is the surface once every stroke before it has landed. So a pen `Down` while an
 //!   earlier stroke still has dabs to apply (its pen lifted) waits, with every event after it, and
@@ -99,6 +101,29 @@
 //! began, never its own dabs, whether they have landed, wait in the queue or are shown ahead. So
 //! what a stroke places doesn't depend on how far its finest work has got.
 //!
+//! # The journal: what is placed and what has landed
+//!
+//! Dabs placed and not yet landed would live only in memory, so the brush journals them into the
+//! recovery file (the dab journal spec, "The journal"): a crash then loses about a second of them,
+//! and never a landed part of the stroke.
+//!
+//! - **Placed:** each dab goes to [`Project::journal`] once, as it joins the stroke's queue, in
+//!   placement order (symmetry copies included), as its 84 bytes ([`DabRow`]), through one buffer
+//!   the brush keeps, so the frame's path allocates nothing a dab for it. A dab shown ahead is
+//!   placed like any other: a big brush's stroke is journalled from its first dab, however long it
+//!   is shown before any lands.
+//! - **Landed:** the stroke counts the dabs [`apply_dabs`] has applied (shown or not: showing lands
+//!   nothing), and passes the count to [`Project::journal_landed`] right after each [`apply_dabs`]
+//!   that succeeds, in the same call on the owner thread. The brush never ticks the project
+//!   ([`Project::tick`], which can cut the journal at a flush) and the frame loop ticks only
+//!   between brush calls, so no cut ever falls between a landing's edits and its count.
+//! - **Dropped:** dabs dropped after an error are never counted landed by the brush: a failed
+//!   [`apply_dabs`] passes no count (how far it got is unknown), and its stroke ends in that same
+//!   call, where the store closes the journal counting every dab landed so that a restore never
+//!   lands them. The dabs of a push that failed never join the queue, so they are never journalled.
+//! - A journal call that fails means the brush's bookkeeping broke: it ends the stroke as a store
+//!   error does ("Errors" below).
+//!
 //! # Warming under a hovering pen
 //!
 //! A stroke's first sample finds the surface under it cold: evaluating the reach ball's tiles
@@ -123,6 +148,11 @@
 //!   one, and applying them again would count some twice), and the spatial index is rebuilt from
 //!   the bounds the project keeps (`apply_dabs` may have left it stale), retried each frame until
 //!   it loads;
+//! - a journal that refuses the dabs a push or the pen's lift placed has them dropped, and ends the
+//!   engine stroke; one that refuses a landed count drops the stroke's dabs left after the batch
+//!   applied, so the stroke ends in that call, its journal closed by the store before any cut could
+//!   pair the batch's edits with the count before it;
+//! - an op that can't begin ([`Project::begin_stroke`]) starts no stroke;
 //! - a record [`Project::end_stroke`] refuses ([`ProjectError::Cache`],
 //!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
 //!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
@@ -551,10 +581,13 @@ struct Pending {
     camera: StrokeCamera,
     /// The samples the engine read, which its record keeps.
     samples: Vec<RecordSample>,
-    /// Its op, once begun: as its first dabs are applied.
-    op: Option<OpId>,
+    /// Its op, begun with it: every edit of its dabs is part of it, and its journal is the op's.
+    op: OpId,
     /// Its dabs not yet applied, oldest first.
     dabs: VecDeque<Dab>,
+    /// How many of its dabs [`apply_dabs`] has applied, in placement order: the landed count its
+    /// journal was last given ([`Project::journal_landed`]). Placed, it has `landed + dabs.len()`.
+    landed: u32,
     /// Where each of `dabs` came from, and its cost.
     sources: VecDeque<Source>,
     /// Its last sample's times: a lost `Up`'s tail is timed from it.
@@ -570,6 +603,21 @@ struct Pending {
     down_at: Instant,
     /// Its last two dabs placed, the latest last: where it heads, for the warming ahead of it.
     heading: [Option<Dab>; 2],
+}
+
+/// A dab as the stroke's journal keeps it ([`Project::journal`]): its bytes, one opaque row of
+/// [`store::DAB_BYTES`].
+type DabRow = [u8; store::DAB_BYTES];
+
+// A dab is exactly one row, so `row_of` never meets a size it can't cast.
+const _: () = assert!(
+    size_of::<Dab>() == store::DAB_BYTES,
+    "a dab is one journal row"
+);
+
+/// `dab` as its journal row: its bytes as they are in memory, which a restore casts back.
+fn row_of(dab: Dab) -> DabRow {
+    bytemuck::cast(dab)
 }
 
 impl Pending {
@@ -593,31 +641,49 @@ impl Pending {
     fn done(&self) -> bool {
         self.engine.is_none() && self.dabs.is_empty()
     }
-}
 
-/// Queues `placed` on a stroke's `queue`: dabs placed by the sample at `times`, each with the
-/// tiles of `index` its sphere touches.
-fn enqueue(
-    (dabs, sources, heading): (
-        &mut VecDeque<Dab>,
-        &mut VecDeque<Source>,
-        &mut [Option<Dab>; 2],
-    ),
-    placed: impl Iterator<Item = Dab>,
-    times: SampleTimes,
-    index: &SpatialIndex,
-) {
-    for dab in placed {
-        *heading = [heading[1], Some(dab)];
-        let [x, y, z] = dab.position;
-        let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
-        let keys: Vec<TileKey> = touched.collect();
-        dabs.push_back(dab);
-        sources.push_back(Source {
-            times,
-            tiles: keys,
-            shown: false,
-        });
+    /// Queues `placed`, the dabs the sample at `times` placed, each with the tiles of `index` its
+    /// sphere touches, and journals them in `project` ([`Project::journal`]), in order, through
+    /// `rows`, the brush's buffer: the frame's path allocates nothing a dab for the journal.
+    /// Returns how many joined the queue.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::journal`]: none of them joins the queue then, and it is as it was.
+    fn place(
+        &mut self,
+        placed: impl Iterator<Item = Dab>,
+        times: SampleTimes,
+        index: &SpatialIndex,
+        project: &mut Project,
+        rows: &mut Vec<DabRow>,
+    ) -> Result<usize, ProjectError> {
+        let (before, heading) = (self.dabs.len(), self.heading);
+        for dab in placed {
+            self.heading = [self.heading[1], Some(dab)];
+            let [x, y, z] = dab.position;
+            let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
+            let keys: Vec<TileKey> = touched.collect();
+            self.dabs.push_back(dab);
+            self.sources.push_back(Source {
+                times,
+                tiles: keys,
+                shown: false,
+            });
+        }
+        rows.clear();
+        let new = self.dabs.range(before..).copied().map(row_of);
+        rows.extend(new);
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        if let Err(error) = project.journal(rows) {
+            self.dabs.truncate(before);
+            self.sources.truncate(before);
+            self.heading = heading;
+            return Err(error);
+        }
+        Ok(rows.len())
     }
 }
 
@@ -664,6 +730,9 @@ pub(crate) struct Sculpting {
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
+    /// The rows of the dabs a push places, as they go to the journal ([`Pending::place`]): kept
+    /// across pushes, so journalling allocates only while a push places more than any before.
+    rows: Vec<DabRow>,
     /// The stroke not over yet, if one is: its pen down, or its dabs still to apply. A stroke
     /// started meanwhile waits in `deferred`.
     stroke: Option<Pending>,
@@ -747,6 +816,7 @@ impl Sculpting {
             settings,
             strength_factor: 1.0,
             state,
+            rows: Vec::new(),
             stroke: None,
             kept: Kept::default(),
             cost: DabCost::CALIBRATED,
@@ -1005,8 +1075,9 @@ impl Sculpting {
         }
     }
 
-    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it:
-    /// with none under way ([`Sculpting::admit`] holds a `Down` back until then).
+    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it,
+    /// and begins its op ([`Project::begin_stroke`]): with none under way ([`Sculpting::admit`]
+    /// holds a `Down` back until then).
     fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
         self.warm = Warm::default();
         let routed = self.routed.take();
@@ -1029,6 +1100,15 @@ impl Sculpting {
         let Some(engine) = engine else {
             return;
         };
+        // Before its first dab: the op's journal takes every dab it places.
+        let op = match scene.project.begin_stroke() {
+            Ok(op) => op,
+            Err(error) => {
+                // No op, so nothing of it can be applied: it is dropped.
+                self.dropped("starting a stroke's op", &error);
+                return;
+            }
+        };
         if self.error.take().is_some() {
             self.errors += 1;
         }
@@ -1037,8 +1117,9 @@ impl Sculpting {
             settings: self.settings.clone(),
             camera: stroke_camera(scene.camera, &projector.view),
             samples: vec![record_sample(&first)],
-            op: None,
+            op,
             dabs: VecDeque::new(),
+            landed: 0,
             sources: VecDeque::new(),
             last: times_of(down),
             placed_at: Instant::now(),
@@ -1049,8 +1130,9 @@ impl Sculpting {
         });
     }
 
-    /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing the dabs it places;
-    /// a store error ends the stroke there, its dabs dropped.
+    /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing and journalling the
+    /// dabs it places; a store error (the journal's included) ends the stroke there, its dabs
+    /// dropped.
     fn push(&mut self, scene: &mut Scene<'_>, sample: &PenSample) {
         let Some(engine_sample) = self.engine_sample(sample) else {
             return;
@@ -1058,7 +1140,8 @@ impl Sculpting {
         let Some(pending) = self.stroke.as_mut().filter(|stroke| stroke.open()) else {
             return;
         };
-        let Some(engine) = &mut pending.engine else {
+        // Out while its dabs are queued, which borrow it; back only if they all were.
+        let Some(mut engine) = pending.engine.take() else {
             return;
         };
         let projector = scene.projector;
@@ -1072,30 +1155,27 @@ impl Sculpting {
             .saturating_duration_since(pending.last.received);
         pending.interval = smoothed_interval(pending.interval, gap);
         pending.last = times;
-        match finished {
-            Ok(()) => {
-                let queue = (
-                    &mut pending.dabs,
-                    &mut pending.sources,
-                    &mut pending.heading,
-                );
-                let before = queue.0.len();
-                enqueue(queue, placed, times, scene.index);
-                if pending.dabs.len() > before {
+        if let Err(error) = finished {
+            drop(placed);
+            self.dropped("placing dabs", &error);
+            return;
+        }
+        let queued = pending.place(placed, times, scene.index, scene.project, &mut self.rows);
+        match queued {
+            Ok(count) => {
+                pending.engine = Some(engine);
+                if count > 0 {
                     pending.placed_at = Instant::now();
                 }
                 pending.note_start(&mut self.stroke_start);
             }
-            Err(error) => {
-                drop(placed);
-                pending.engine = None;
-                self.dropped("placing dabs", &error);
-            }
+            Err(error) => self.dropped("journalling the dabs placed", &error),
         }
     }
 
-    /// Ends the open stroke's engine stroke, if there is one, queueing its tail: the pen lifted
-    /// at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last sample.
+    /// Ends the open stroke's engine stroke, if there is one, queueing and journalling its tail:
+    /// the pen lifted at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last
+    /// sample.
     fn lift(&mut self, scene: &mut Scene<'_>, up: Option<&PenSample>) {
         let Some(pending) = self.stroke.as_mut() else {
             return;
@@ -1107,20 +1187,15 @@ impl Sculpting {
         let projector = scene.projector;
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let tail = engine.end(&projector, &mut surface);
-        match surface.finish() {
-            Ok(()) => {
-                let queue = (
-                    &mut pending.dabs,
-                    &mut pending.sources,
-                    &mut pending.heading,
-                );
-                enqueue(queue, tail, times, scene.index);
-                pending.note_start(&mut self.stroke_start);
-            }
-            Err(error) => {
-                drop(tail);
-                self.dropped("placing the stroke's last dabs", &error);
-            }
+        if let Err(error) = surface.finish() {
+            drop(tail);
+            self.dropped("placing the stroke's last dabs", &error);
+            return;
+        }
+        let queued = pending.place(tail, times, scene.index, scene.project, &mut self.rows);
+        match queued {
+            Ok(_) => pending.note_start(&mut self.stroke_start),
+            Err(error) => self.dropped("journalling the stroke's last dabs", &error),
         }
     }
 
@@ -1215,9 +1290,9 @@ impl Sculpting {
     }
 
     /// Applies queued dabs while `budget` leaves time for them (all of them with none), oldest
-    /// first, beginning the stroke's op with its first and ending it once the stroke is over; at
-    /// least one dab if any is queued and the step must make progress (always for a brush that
-    /// shows nothing ahead, else as the budget says).
+    /// first, ending the stroke's op once the stroke is over (in the same call as the batch that
+    /// leaves it over, a failed one's included); at least one dab if any is queued and the step
+    /// must make progress (always for a brush that shows nothing ahead, else as the budget says).
     ///
     /// The time left is read from the clock before the batch. Dabs shown ahead keep the aim's time:
     /// a step catching up never takes the "behind" time, which is for a brush whose stroke lags
@@ -1269,17 +1344,6 @@ impl Sculpting {
         let Some(front) = self.stroke.as_mut() else {
             return;
         };
-        if front.op.is_none() {
-            match scene.project.begin_stroke() {
-                Ok(op) => front.op = Some(op),
-                Err(error) => {
-                    // No op, so nothing of it can be applied: it is dropped.
-                    self.stroke = None;
-                    self.dropped("starting a stroke's op", &error);
-                    return;
-                }
-            }
-        }
         let first = report.dabs_applied == 0;
         let waiting_stroke = self.landing != Landing::InFrames || !self.deferred.is_empty();
         // A frame shows each batch before the next starts, so the frames keep coming.
@@ -1344,8 +1408,10 @@ impl Sculpting {
     }
 
     /// Applies the stroke's first `count` queued dabs in one [`apply_dabs`], adding to
-    /// `report`, and lands those of them shown. A store error drops the stroke's dabs left, ends
-    /// its engine stroke, and has the spatial index rebuilt.
+    /// `report`, passes the stroke's landed count to its journal ([`Project::journal_landed`])
+    /// right after, and lands those of them shown. A store error drops the stroke's dabs left,
+    /// ends its engine stroke, and has the spatial index rebuilt; a count the journal refuses
+    /// drops the dabs left too.
     ///
     /// Returns how long [`apply_dabs`] took, what the cost model learns from ([`DabCost`] models
     /// the finest work alone, not the landing's previews made again); `None` if there was no
@@ -1382,6 +1448,12 @@ impl Sculpting {
                 let direct: Vec<Dab> = batch.get(landing..).unwrap_or_default().to_vec();
                 front.dabs.drain(..count);
                 front.sources.drain(..count);
+                // The count goes with the edits, in this call: nothing ticks the project between
+                // them (see "The journal" in the module notes). A count past a `u32` saturates,
+                // and the journal refuses it.
+                let batch_dabs = u32::try_from(count).unwrap_or(u32::MAX);
+                front.landed = front.landed.saturating_add(batch_dabs);
+                let counted = scene.project.journal_landed(front.landed);
                 report.dabs_applied += stats.dabs;
                 report.tiles_edited += stats.tiles_edited;
                 self.land(scene, landing, false);
@@ -1393,20 +1465,38 @@ impl Sculpting {
                 {
                     self.fail("moving the previews by dabs applied at once", &error);
                 }
+                if let Err(error) = counted {
+                    // No cut may pair the batch's edits with the count before it: the stroke
+                    // ends in this call, and its journal closes counting every dab landed.
+                    let dropped = self.drop_left("journalling the dabs landed", &error);
+                    self.land(scene, dropped, false);
+                }
             }
             Err(error) => {
-                // Every dab of the stroke left is dropped, those shown with them.
-                let dropped = front.sources.iter().filter(|s| s.shown).count();
-                front.dabs.clear();
-                front.sources.clear();
-                front.engine = None;
+                // No count: how far the batch got is unknown, and the stroke ends in this call.
+                let dropped = self.drop_left("applying dabs", &error);
                 self.index_stale = true;
-                self.dropped("applying dabs", &error);
                 self.rebuild_index(scene);
                 self.land(scene, dropped, true);
             }
         }
         Some(took)
+    }
+
+    /// Drops every dab the stroke has left to apply, those shown with them, and ends its engine
+    /// stroke, keeping `error` from `doing` as one that dropped dabs: the stroke is then over, and
+    /// [`Sculpting::apply`] ends its op in the same call. Returns how many of the dabs dropped were
+    /// shown: theirs are the previews to land ([`Sculpting::land`]).
+    fn drop_left(&mut self, doing: &str, error: &dyn std::error::Error) -> usize {
+        let shown = self.stroke.as_mut().map_or(0, |front| {
+            let shown = front.sources.iter().filter(|s| s.shown).count();
+            front.dabs.clear();
+            front.sources.clear();
+            front.engine = None;
+            shown
+        });
+        self.dropped(doing, error);
+        shown
     }
 
     /// Lands the oldest `count` dabs shown (applied, or dropped), making the previews they moved
@@ -1451,10 +1541,7 @@ impl Sculpting {
         {
             self.fail("ending the stroke's previews", &error);
         }
-        let Some(op) = over.op else {
-            return;
-        };
-        let record = match self.record_of(op, over) {
+        let record = match self.record_of(over.op, over) {
             Ok(record) => record,
             Err(error) => {
                 self.fail("recording the stroke", &error);
