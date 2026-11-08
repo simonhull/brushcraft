@@ -132,7 +132,8 @@
 //! nothing about them. So the writer stops writing to the file: it is **failed**, it never
 //! writes another save point there, and every trigger returns [`RecoveryError::NeedsNewFile`].
 //! The file stays at its last durable save point. The owner ([`crate::Project`]) rolls over to
-//! a new recovery file, copying every edit into it from the store, and starts a new writer.
+//! a new recovery file, copying every edit into it from the store (and the open stroke's
+//! pen-down surface and journal, so a stroke still landing survives it), and starts a new writer.
 //!
 //! A writer whose thread has stopped (it panicked) is failed too: no flush can be finished,
 //! and the edits a flush in flight snapshotted would never reach the file. The call that finds

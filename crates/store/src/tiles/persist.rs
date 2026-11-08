@@ -13,9 +13,10 @@
 //!   in that save point as the base and a fresh working file over it, and refuses a proof the store
 //!   was written after.
 //! - After the working file fails to sync, a roll-over is two calls too.
-//!   [`TileStore::fill_roll_over`] fills a fresh working file on the same base with every edit,
-//!   changing nothing in the store; [`TileStore::roll_over`] swaps it in once the caller has named
-//!   it, and refuses it if the store was written since.
+//!   [`TileStore::fill_roll_over`] fills a fresh working file on the same base with every edit, and
+//!   the open stroke's pen-down surface and journal, changing nothing in the store;
+//!   [`TileStore::roll_over`] swaps it in once the caller has named it, and refuses it if the store
+//!   was written since.
 //! - With no recovery writer running, it calls [`TileStore::drain_saves`] on every call that would
 //!   have advanced one, so the change feed's backlog stays bounded between saves.
 
@@ -24,14 +25,14 @@ use std::ops::Bound;
 use std::rc::Rc;
 use std::time::Instant;
 
-use geom::TileKey;
+use geom::{CorrectionTile, TileKey};
 
 #[cfg(test)]
 use super::TestHooks;
 use super::config::{Headroom, StoreConfig, reserved_shares};
 use super::display::display_book_of;
 use super::error::{CacheError, Invariant};
-use super::journal::Rebase;
+use super::journal::{Carried, Rebase};
 use super::layers::{
     Dirty, Filled, Saved, book_of, check_layers, first_op, saved_base, write_slot,
 };
@@ -40,13 +41,14 @@ use crate::activity::Activity;
 use crate::deps::DepGraph;
 use crate::display::is_display;
 use crate::feed::{ChangeFeed, ConsumerId};
-use crate::file::{BaseFile, ProjectFile, ReadScratch};
+use crate::file::{BaseFile, FileError, ProjectFile, ReadScratch, frame_batch};
 use crate::hash::TileMap;
 use crate::kept::KeptLru;
 use crate::meta::Role;
-use crate::op::RESERVED_SITE;
-use crate::pool::{Budget, Pool};
+use crate::op::{OpId, RESERVED_SITE};
+use crate::pool::{Budget, Pool, SlotId};
 use crate::prefetch::Prefetcher;
+use crate::slot::CorrectionSlot;
 use crate::stamp::Stamp;
 use crate::workers::StartWorkersError;
 
@@ -594,12 +596,53 @@ impl TileStore {
     /// every one waiting for a flush (which the roll-over forgets): a stroke whose edits the new
     /// file holds has its record there too.
     ///
+    /// # The open stroke
+    ///
+    /// A stroke open as the old file failed (its dabs still landing, waiting for its cut, or its
+    /// pen still down) is **carried**: the fresh file holds its pen-down surface and its journal,
+    /// so a crash after the roll-over restores it as a crash before would have (the dab journal
+    /// spec, "Durable"). Its pen-down surface is in no save point of the fresh file otherwise,
+    /// and is written from memory, so `fresh` holds, in order:
+    ///
+    /// 1. Every tile the stroke hasn't changed, as above, and each tile it changed as it found it:
+    ///    its pen-down shape ([`TileStore::pen_down_shape`]), written as a record labelled with the
+    ///    op of the edit the shape holds, from before the stroke's (a tile that read as zero gets
+    ///    no record, and reads so). Then a save point: the **pen-down cut**, every tile as the
+    ///    stroke found it, its head an op before the stroke's. A tile under the working file reads
+    ///    the base in both, as it did when the stroke began.
+    /// 2. The tiles the stroke changed, as they are now; the bounds, display tiles and stroke
+    ///    records, as above; the stroke's batches from its landed count, naming the pen-down cut
+    ///    ([`TileStore::carry_journal`]); and the fill's own save point, which holds them all, so
+    ///    the batches' landed count describes exactly the tiles it names.
+    ///
+    /// A restore finds the stroke's changed tiles as those whose records differ between the two
+    /// save points, and reads them at the pen-down cut, bit for bit the shapes the store keeps
+    /// (see `crate::project::resume`). A stroke that has landed nothing changed no tile: the
+    /// pen-down cut holds the current state, which is its surface.
+    ///
+    /// The tiles the stroke changed are those whose latest edit is of its op: strokes don't
+    /// overlap, so no other op wrote since it began (see [`TileStore::journal_to_carry`] for a
+    /// save in its middle, which moves its edits to a new op). It isn't carried, and its
+    /// pen-down is unknown once swapped in, if its surface can't be vouched for: a tile it changed
+    /// with no shape kept (the store's own edits keep none) or with a shape kept after its edit,
+    /// or a tile lost (which edit it held, nothing says). Then `fresh` holds one save point, as
+    /// with no stroke open.
+    ///
+    /// The pen-down cut is never a state a restore opens: the caller puts the file in place
+    /// under a recovery file's name only once it is filled ([`crate::Project`]'s roll-over), so a
+    /// crash between its two save points leaves the old file to restore. The cut is read only for
+    /// the tiles the stroke found, which is why it holds the tiles alone.
+    ///
+    /// The stroke's changed tiles are held until the pen-down cut is written: their records as
+    /// read, or their slots' copies, about the bytes of their pen-down shapes.
+    ///
     /// # Errors
     ///
     /// [`CacheError::MeshMismatch`] or [`CacheError::WrongBase`] if `fresh` isn't over the
     /// store's mesh, or doesn't name the same base as the working file; [`CacheError::WriteBack`]
     /// if writing or saving `fresh` fails; [`CacheError::Internal`] if its save point's derived
-    /// maps disagree with it ([`Invariant::SavePointMismatch`]).
+    /// maps disagree with it ([`Invariant::SavePointMismatch`]), or a batch of the stroke's can't
+    /// be made (a bug).
     pub(crate) fn fill_roll_over(&mut self, mut fresh: ProjectFile) -> Result<Filled, CacheError> {
         self.sync_pins()?;
         if fresh.meta().mesh_hash() != self.mesh_hash {
@@ -611,46 +654,11 @@ impl TileStore {
             return Err(CacheError::WrongBase);
         }
         check_layers(fresh.meta(), self.base.as_ref())?;
-        let keys: BTreeSet<TileKey> = self
-            .file
-            .keys()
-            .copied()
-            .filter(is_correction)
-            .chain(self.unsaved.keys().copied())
-            .collect();
-        let mut lost = Vec::new();
-        let mut cleaned = Vec::new();
-        for key in keys {
-            let resident = self.corrections.find(&key);
-            let dirty = resident.filter(|&id| self.corrections.is_dirty(id) == Some(true));
-            let from_slot = match dirty {
-                Some(_) => self.unsaved.get(&key).map(|write| write.op),
-                None => match self.file.read_tile_record(&key) {
-                    Ok(Some(raw)) => {
-                        fresh
-                            .append_copy(&key, &raw)
-                            .map_err(CacheError::WriteBack)?;
-                        continue;
-                    }
-                    // Unreadable (or, impossibly, gone): only the slot holds it now.
-                    Ok(None) | Err(_) if resident.is_some() => self.known_ops.get(&key).copied(),
-                    Ok(None) | Err(_) => None,
-                },
-            };
-            let tile = resident
-                .and_then(|id| self.corrections.get(id))
-                .and_then(|slot| slot.to_tile().ok());
-            let (Some(op), Some(tile)) = (from_slot, tile) else {
-                lost.push(key);
-                continue;
-            };
-            fresh
-                .write_displacement(key, op, &tile)
-                .map_err(CacheError::WriteBack)?;
-            if let Some(id) = dirty {
-                cleaned.push((key, id));
-            }
-        }
+        let FilledTiles {
+            lost,
+            cleaned,
+            pen_down_cut,
+        } = self.fill_tiles(&mut fresh)?;
         self.bounds.settle(&self.mesh, &self.deps)?;
         self.bounds
             .forget(&self.mesh, &self.deps, lost.iter().copied())?;
@@ -682,6 +690,12 @@ impl TileStore {
         // Those waiting too: their strokes' edits are all in the new file's save point, which
         // must hold their records as well.
         let strokes = self.copy_strokes(&mut fresh, CacheError::WriteBack)?;
+        // The stroke's journal from its landed count, naming the pen-down cut: in the fill's own
+        // save point, beside the tiles its landed count describes.
+        let journal = match pen_down_cut {
+            Some(at) => self.fill_journal(&mut fresh, at)?,
+            None => None,
+        };
         fresh
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?;
@@ -692,6 +706,129 @@ impl TileStore {
             stamp: self.last_write,
             bounds: self.derived_changes(),
             strokes,
+            journal,
+        })
+    }
+
+    /// The tiles of a roll-over's fill (see [`TileStore::fill_roll_over`]): writes every tile of
+    /// the working file and every dirty slot to `fresh`, as its latest edit, and, while the open
+    /// stroke can be carried, its pen-down cut in between.
+    ///
+    /// The tiles the stroke hasn't changed and the pen-down records of those it has go first;
+    /// then, if the stroke is carried, the save point of the pen-down cut; then the stroke's
+    /// changed tiles as they are now. A lost tile is left out.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::WriteBack`] if a write or the pen-down cut's save point fails;
+    /// [`CacheError::Internal`] if that save point's derived maps disagree with it.
+    fn fill_tiles(&self, fresh: &mut ProjectFile) -> Result<FilledTiles, CacheError> {
+        let keys: BTreeSet<TileKey> = self
+            .file
+            .keys()
+            .copied()
+            .filter(is_correction)
+            .chain(self.unsaved.keys().copied())
+            .collect();
+        let mut lost = Vec::new();
+        let mut cleaned = Vec::new();
+        // The open stroke, while its pen-down surface can still be written from memory.
+        let mut carrying = self.journal_to_carry();
+        // The tiles the stroke changed: their latest goes after the pen-down cut.
+        let mut changed = Vec::new();
+        for key in keys {
+            let Some(latest) = self.latest_of(&key) else {
+                // Whether the stroke changed it, nothing says: its surface can't be vouched for.
+                carrying = None;
+                lost.push(key);
+                continue;
+            };
+            let Some(stroke) = carrying.filter(|&stroke| latest.op() == stroke) else {
+                write_latest(fresh, key, latest, &mut cleaned)?;
+                continue;
+            };
+            match self.pen_down_shape(&key) {
+                // Its record in the pen-down cut, labelled with the op of the edit it holds; a
+                // tile that read as zero has none, and reads so there.
+                Some(shape) if shape.op() != Some(stroke) => {
+                    if let Some(op) = shape.op() {
+                        fresh
+                            .write_displacement(key, op, shape.corrections())
+                            .map_err(CacheError::WriteBack)?;
+                    }
+                }
+                // Changed with no shape kept, or one kept after its own edit: nothing in memory
+                // holds the surface it found.
+                Some(_) | None => carrying = None,
+            }
+            changed.push((key, latest));
+        }
+        // The pen-down cut: every tile as the stroke found it, a save point before its own edits.
+        let pen_down_cut = match carrying {
+            Some(_) => Some(
+                fresh
+                    .save()
+                    .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?,
+            ),
+            None => None,
+        };
+        for (key, latest) in changed {
+            write_latest(fresh, key, latest, &mut cleaned)?;
+        }
+        Ok(FilledTiles {
+            lost,
+            cleaned,
+            pen_down_cut,
+        })
+    }
+
+    /// Appends the open stroke's journal, as a roll-over carries it ([`TileStore::carry_journal`])
+    /// with its pen-down cut at `pen_down_cut`, to `fresh`; returns what it carried, `None` with
+    /// no stroke open.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::WriteBack`] if a batch doesn't frame or the append fails; as
+    /// [`TileStore::carry_journal`].
+    fn fill_journal(
+        &self,
+        fresh: &mut ProjectFile,
+        pen_down_cut: u64,
+    ) -> Result<Option<Carried>, CacheError> {
+        let Some((batches, carried)) = self.carry_journal(pen_down_cut)? else {
+            return Ok(None);
+        };
+        let framed: Result<Vec<Vec<u8>>, FileError> = batches.iter().map(frame_batch).collect();
+        fresh
+            .append_batches(&framed.map_err(CacheError::WriteBack)?)
+            .map_err(CacheError::WriteBack)?;
+        Ok(Some(carried))
+    }
+
+    /// Where tile `key`'s latest edit is, for a roll-over to copy (see
+    /// [`TileStore::fill_roll_over`]): a dirty slot, with the op of its latest write; else the
+    /// working file's record, checked; else, if that record no longer reads, a clean resident
+    /// slot, which holds what the record did, with the record's op as the store last knew it
+    /// ([`TileStore::known_ops`]). `None` if none of these gives it, or a slot is broken: the
+    /// tile is lost.
+    fn latest_of(&self, key: &TileKey) -> Option<Latest> {
+        let resident = self.corrections.find(key);
+        let dirty = resident.filter(|&id| self.corrections.is_dirty(id) == Some(true));
+        let op = match dirty {
+            Some(_) => self.unsaved.get(key).map(|write| write.op),
+            None => match self.file.read_tile_record_op(key) {
+                Ok(Some((raw, op))) => return Some(Latest::Record { raw, op }),
+                // Unreadable (or, impossibly, gone): only the slot holds it now.
+                Ok(None) | Err(_) => resident.and_then(|_| self.known_ops.get(key).copied()),
+            },
+        };
+        let tile = resident
+            .and_then(|id| self.corrections.get(id))
+            .and_then(|slot| slot.to_tile().ok())?;
+        Some(Latest::Slot {
+            tile,
+            op: op?,
+            dirty,
         })
     }
 
@@ -723,6 +860,7 @@ impl TileStore {
             stamp,
             bounds,
             strokes,
+            journal,
         } = filled;
         if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
@@ -761,10 +899,10 @@ impl TileStore {
                 mark.clear();
             }
         }
-        // The new file holds every bound as it is now, and every stroke record waiting, but no
-        // dab batch: the open stroke's journal writes its dabs not landed again.
+        // The new file holds every bound as it is now, every stroke record waiting, and, if the
+        // fill carried the open stroke, its pen-down cut and its journal (see `rebase_journal`).
         self.forget_saved_strokes(strokes);
-        self.rebase_journal(Rebase::RollOver);
+        self.rebase_journal(Rebase::RollOver(journal));
         self.bounds.all_flushed();
         self.display.all_flushed();
         self.generation += 1;
@@ -880,6 +1018,69 @@ impl TileStore {
         self.file
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Store))
+    }
+}
+
+/// What [`TileStore::fill_tiles`] wrote of a roll-over's tiles.
+struct FilledTiles {
+    /// The tiles that couldn't be carried across.
+    lost: Vec<TileKey>,
+    /// The dirty slots written, clean once the file is swapped in.
+    cleaned: Vec<(TileKey, SlotId<CorrectionSlot>)>,
+    /// The offset of the open stroke's pen-down cut, if it was carried.
+    pen_down_cut: Option<u64>,
+}
+
+/// Where a tile's latest edit is, for a roll-over to copy ([`TileStore::latest_of`]).
+enum Latest {
+    /// The working file's record, checked, as framed there, and the op it carries.
+    Record {
+        /// The record.
+        raw: Vec<u8>,
+        /// Its op.
+        op: OpId,
+    },
+    /// A resident slot's tile, written as a new record.
+    Slot {
+        /// The tile it holds.
+        tile: CorrectionTile,
+        /// The op its record is labelled with: its latest write's, or the record it holds.
+        op: OpId,
+        /// The slot, if it is dirty: clean once the roll-over is swapped in.
+        dirty: Option<SlotId<CorrectionSlot>>,
+    },
+}
+
+impl Latest {
+    /// The op of the edit it holds.
+    const fn op(&self) -> OpId {
+        match self {
+            Self::Record { op, .. } | Self::Slot { op, .. } => *op,
+        }
+    }
+}
+
+/// Writes `latest`, tile `key`'s latest edit, to `fresh`, a roll-over's new working file; a
+/// dirty slot it came from joins `cleaned`.
+///
+/// # Errors
+///
+/// [`CacheError::WriteBack`] if the write fails.
+fn write_latest(
+    fresh: &mut ProjectFile,
+    key: TileKey,
+    latest: Latest,
+    cleaned: &mut Vec<(TileKey, SlotId<CorrectionSlot>)>,
+) -> Result<(), CacheError> {
+    match latest {
+        Latest::Record { raw, .. } => fresh.append_copy(&key, &raw).map_err(CacheError::WriteBack),
+        Latest::Slot { tile, op, dirty } => {
+            fresh
+                .write_displacement(key, op, &tile)
+                .map_err(CacheError::WriteBack)?;
+            cleaned.extend(dirty.map(|id| (key, id)));
+            Ok(())
+        }
     }
 }
 

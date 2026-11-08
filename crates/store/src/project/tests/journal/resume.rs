@@ -13,6 +13,8 @@ use crate::fixture::Edit;
 use crate::tiles::PenDownShape;
 use crate::{JournalUnusable, OpenStroke};
 
+mod roll_over;
+
 /// The dab format the tests' app sets.
 const FORMAT: u32 = 7;
 
@@ -513,8 +515,9 @@ fn assert_pen_down_unknown(
 
 #[test]
 fn an_unknown_pen_down_restores_the_tiles_alone_and_says_why() {
-    // A roll-over in the middle of the stroke: the fresh file holds no save point of the surface
-    // it began on.
+    // A roll-over in the middle of a stroke that kept no pen-down shapes of the tiles it changed
+    // (the store's own edits keep none): nothing in memory holds the surface it began on, so
+    // the fresh file holds no save point of it.
     assert_pen_down_unknown(56, |_, project, rolled, map| {
         rolled.place(project, 10);
         flush(project);

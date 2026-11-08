@@ -678,8 +678,14 @@ fn a_crash_after_display_records_written_through_restores_a_current_layer() {
     }
 }
 
-/// The variable that makes the test binary the journal crash test's child; its value is unread.
+/// The variable that makes the test binary the journal crash test's child; its value says
+/// whether the child rolls over in the middle of its stroke ([`ROLL_OVER`]) or not (anything
+/// else).
 const JOURNAL: &str = "BRUSHCRAFT_CRASH_JOURNAL";
+
+/// [`JOURNAL`]'s value for a child whose recovery file fails a sync in the middle of its stroke,
+/// so it rolls over onto a fresh one, still landing.
+const ROLL_OVER: &str = "roll-over";
 
 /// The journal crash test's child, by its full path.
 const JOURNAL_CHILD_TEST: &str = "project::tests::crash::journal_child";
@@ -710,16 +716,19 @@ fn landed_by(placed: u32, before: u32) -> u32 {
 
 /// The journal crash test's child: one long stroke, journalled and landed until it is killed.
 ///
-/// Each step journals [`PLACE_EACH`] dabs and lands dabs some steps behind, as edits, then ticks
-/// a clock that runs a flush interval a step, so every tick is due. It prints [`READY`] once a
-/// flush is durable and goes on, until it has placed [`JOURNAL_DABS`]; then it waits for the
-/// kill. Does nothing unless [`JOURNAL`] is set.
+/// Each step journals [`PLACE_EACH`] dabs and lands dabs some steps behind, as edits, each tile's
+/// pen-down shape kept before its first edit as a brush keeps it, then ticks a clock that runs a
+/// flush interval a step, so every tick is due. It prints [`READY`] once a flush is durable (and,
+/// if [`JOURNAL`] is [`ROLL_OVER`], once the next flush's sync has failed and the project has
+/// rolled over onto a fresh recovery file) and goes on, until it has placed [`JOURNAL_DABS`];
+/// then it waits for the kill. Does nothing unless [`JOURNAL`] is set.
 #[test]
 #[ignore = "the journal crash test's child: the test runs it in a process of its own"]
 fn journal_child() {
-    let (Some(_), Some(dir)) = (std::env::var_os(JOURNAL), std::env::var_os(DIR)) else {
+    let (Some(variant), Some(dir)) = (std::env::var_os(JOURNAL), std::env::var_os(DIR)) else {
         return;
     };
+    let rolls_over = variant == ROLL_OVER;
     let dir = PathBuf::from(dir);
     let config = ProjectConfig {
         store: roomy(),
@@ -730,24 +739,32 @@ fn journal_child() {
     let mesh = project.store().working().mesh();
     project.begin_stroke_and_wait().unwrap();
     let start = Instant::now();
+    let first_file = project.recovery_path().unwrap().to_path_buf();
+    let mut failing = false;
     let mut ready = false;
     let (mut placed, mut landed) = (0, 0);
-    let mut edits = Vec::new();
+    let mut edits: Vec<crate::fixture::Edit> = Vec::new();
     for step in 0..JOURNAL_DABS / PLACE_EACH {
         let dabs: Vec<[u8; DAB_BYTES]> = (placed..placed + PLACE_EACH).map(dab_at).collect();
         project.journal(&dabs).unwrap();
         placed += PLACE_EACH;
         edits.extend(step_edits(&mesh, step));
         let target = landed_by(placed, landed);
-        apply_dabs(
-            project.store(),
-            &mut CorrectionMap::new(),
-            &edits[landed as usize..target as usize],
-        );
+        let landing = &edits[landed as usize..target as usize];
+        let changed: Vec<TileKey> = landing.iter().flat_map(|edit| edit.keys(&mesh)).collect();
+        project.store().keep_pen_down(&changed).unwrap();
+        apply_dabs(project.store(), &mut CorrectionMap::new(), landing);
         project.journal_landed(target).unwrap();
         landed = target;
+        let flushed = project.writer.as_ref().unwrap().flushes() > 0;
+        if rolls_over && flushed && !failing {
+            // The next flush's sync fails: the tick that meets it rolls over.
+            project.writer.as_ref().unwrap().fail_syncs(0, 1);
+            failing = true;
+        }
         project.tick(start + FLUSH_INTERVAL * (step + 1)).unwrap();
-        if !ready && project.writer.as_ref().unwrap().flushes() > 0 {
+        let rolled = project.recovery_path().unwrap() != first_file;
+        if !ready && flushed && (rolled || !rolls_over) {
             ready = true;
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "{READY}").unwrap();
@@ -865,12 +882,36 @@ const RESUME_KILL_WITHIN: Duration = Duration::from_millis(150);
 /// live result (see `crate::project::resume`, "What is exact").
 #[test]
 fn restoring_and_landing_the_rest_gives_the_tiles_of_every_dab_placed() {
+    assert_restores_and_lands_the_rest("1", RESUME_RUNS, "its first save point");
+}
+
+/// The rolling-over crash test's runs: kills at as many moments.
+const ROLL_OVER_RUNS: u32 = 10;
+
+/// A restore after a kill mid-landing that followed a roll-over continues the stroke exactly.
+///
+/// The child's recovery file fails a sync in the middle of its stroke's landing, so it rolls
+/// over onto a fresh file with the stroke still landing; killed at random moments after that,
+/// right after the roll-over included, a restore of the fresh file finds the stroke, with its
+/// pen-down surface in the fresh file's pen-down cut, and landing the rest gives the tiles of
+/// every dab placed (see [`restoring_and_landing_the_rest_gives_the_tiles_of_every_dab_placed`]).
+#[test]
+fn a_kill_after_a_roll_over_mid_landing_restores_and_lands_the_rest() {
+    assert_restores_and_lands_the_rest(ROLL_OVER, ROLL_OVER_RUNS, "its roll-over");
+}
+
+/// Kills the journal child at random moments and asserts its stroke restores and lands exactly.
+///
+/// The child runs as `variant` says, `runs` times, each killed at a random moment after it says
+/// it is ready (`after` names when); the stroke it was landing is restored, the rest landed, and
+/// the tiles must be those of every dab placed.
+fn assert_restores_and_lands_the_rest(variant: &str, runs: u32, after: &str) {
     let mesh = mesh();
-    for run in 0..RESUME_RUNS {
+    for run in 0..runs {
         let dir = TestDir::new();
         let delay = random_delay(RESUME_KILL_WITHIN);
-        let what = format!("run {run}, killed {delay:?} after its first save point");
-        run_and_kill(JOURNAL_CHILD_TEST, (JOURNAL, "1"), &dir, delay, &what);
+        let what = format!("run {run}, killed {delay:?} after {after}");
+        run_and_kill(JOURNAL_CHILD_TEST, (JOURNAL, variant), &dir, delay, &what);
         let candidate = find_recoveries(&dir.path("recovery"))
             .unwrap()
             .pop()

@@ -78,9 +78,9 @@ pub struct OpenStroke {
     dabs: Vec<[u8; DAB_BYTES]>,
     /// The save point its batches name, holding its pen-down surface: never unknown.
     pen_down: PenDown,
-    /// The corrections of each tile the stroke had changed by the restored save point, as the
-    /// stroke found them, in key order.
-    shapes: Vec<(TileKey, CorrectionTile)>,
+    /// Each tile the stroke had changed by the restored save point, as the stroke found it, in
+    /// key order.
+    shapes: Vec<FoundShape>,
     /// The store it was found in.
     store: StoreId,
     /// That store's working file then ([`TileStore::generation`]).
@@ -126,12 +126,12 @@ impl OpenStroke {
     /// The tiles the stroke had changed by the restored save point, in key order: those it
     /// keeps pen-down shapes of once resumed. Every other tile is its own.
     pub fn pen_down_keys(&self) -> impl Iterator<Item = &TileKey> {
-        self.shapes.iter().map(|(key, _)| key)
+        self.shapes.iter().map(|shape| &shape.key)
     }
 
-    /// Each changed tile's corrections as the stroke found them, in key order: what
+    /// Each changed tile as the stroke found it, in key order: what
     /// [`crate::Project::resume_stroke`] installs as its pen-down shapes.
-    pub(super) fn shapes(&self) -> &[(TileKey, CorrectionTile)] {
+    pub(super) fn shapes(&self) -> &[FoundShape] {
         &self.shapes
     }
 
@@ -153,6 +153,18 @@ impl OpenStroke {
     pub(super) fn found_in(&self, store: &TileStore) -> bool {
         self.store == store.id() && self.generation == store.generation()
     }
+}
+
+/// A tile a restored stroke had changed, as the stroke found it: read from the save point that
+/// holds its pen-down surface, for [`TileStore::install_pen_down`].
+pub(super) struct FoundShape {
+    /// The tile.
+    pub(super) key: TileKey,
+    /// Its corrections as the stroke found them.
+    pub(super) corrections: CorrectionTile,
+    /// The op of the record they were read from; `None` where the tile had none, and read as
+    /// zero.
+    pub(super) op: Option<OpId>,
 }
 
 /// Shows the counts, never the rows or the shapes.
@@ -422,7 +434,7 @@ fn pen_down_surface(
     store: &TileStore,
     earlier: Option<u64>,
     room: usize,
-) -> Result<Vec<(TileKey, CorrectionTile)>, JournalUnusable> {
+) -> Result<Vec<FoundShape>, JournalUnusable> {
     let file = store.working();
     let changed = match file.tiles_changed_since(earlier) {
         Ok(Some(changed)) => changed,
@@ -447,11 +459,16 @@ fn pen_down_surface(
             (None, Some((base, loc))) => base.read_at(&key, loc, &mut slot, &mut scratch).map(Some),
             (None, None) => Ok(None),
         };
-        let corrections = match read.or(Err(JournalUnusable::Damaged))? {
+        let op = read.or(Err(JournalUnusable::Damaged))?;
+        let corrections = match op {
             Some(_) => slot.to_tile(),
             None => CorrectionTile::zero(key.side()),
         };
-        shapes.push((key, corrections.or(Err(JournalUnusable::Damaged))?));
+        shapes.push(FoundShape {
+            key,
+            corrections: corrections.or(Err(JournalUnusable::Damaged))?,
+            op,
+        });
     }
     Ok(shapes)
 }

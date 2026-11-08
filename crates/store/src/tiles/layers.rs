@@ -149,6 +149,9 @@ pub(crate) struct Filled {
     /// How many of the stroke records waiting in the store were copied into it: the roll-over
     /// forgets them, as the new file holds them.
     pub(super) strokes: usize,
+    /// What it carried of the open stroke: its pen-down cut and its journal; `None` if no
+    /// stroke was carried.
+    pub(super) journal: Option<super::journal::Carried>,
 }
 
 /// The bounds book of a store over `working` and `base`.

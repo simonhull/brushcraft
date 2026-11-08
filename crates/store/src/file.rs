@@ -1315,14 +1315,27 @@ impl ProjectFile {
     /// [`FileError::Damaged`] if the record fails its checksum or isn't a tile of `key`;
     /// [`FileError::Io`].
     pub(crate) fn read_tile_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, FileError> {
+        Ok(self.read_tile_record_op(key)?.map(|(raw, _)| raw))
+    }
+
+    /// `key`'s latest record, as [`ProjectFile::read_tile_record`] gives it, with the op it
+    /// carries: for a roll-over, which tells the tiles a stroke changed by it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::read_tile_record`].
+    pub(crate) fn read_tile_record_op(
+        &self,
+        key: &TileKey,
+    ) -> Result<Option<(Vec<u8>, OpId)>, FileError> {
         let Some(Loc { offset, len }) = self.locate(key) else {
             return Ok(None);
         };
         let raw = self.read_record(offset, len)?;
-        if tile_record(&raw, key).is_none() {
-            return Err(FileError::Damaged { offset });
-        }
-        Ok(Some(raw))
+        let op = tile_record(&raw, key)
+            .ok_or(FileError::Damaged { offset })?
+            .op;
+        Ok(Some((raw, op)))
     }
 
     /// Appends a copy of every tile and every bound `base` holds, each record as it is (not

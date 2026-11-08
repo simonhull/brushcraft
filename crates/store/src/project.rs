@@ -1419,8 +1419,9 @@ impl Project {
         if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
             return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
         }
-        let installed = stroke.shapes().iter().try_for_each(|(key, corrections)| {
-            self.store.install_pen_down(*key, corrections.clone())
+        let installed = stroke.shapes().iter().try_for_each(|shape| {
+            self.store
+                .install_pen_down(shape.key, shape.corrections.clone(), shape.op)
         });
         if let Err(e) = installed {
             self.store.release_pen_down();
@@ -1728,9 +1729,10 @@ impl Project {
     /// after the move.
     ///
     /// The new file names the same save point. It is made under its temporary name, filled with
-    /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced),
-    /// and only then renamed into place, so a crash meanwhile leaves no file under a recovery
-    /// file's name that lacks the edits of the old one. Then the store swaps it in
+    /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced;
+    /// with a stroke open, its pen-down cut first, and its journal), and only then renamed into
+    /// place, so a crash meanwhile leaves no file under a recovery file's name that lacks the
+    /// edits of the old one, or holds the pen-down cut alone. Then the store swaps it in
     /// ([`TileStore::roll_over`]), the old file is deleted, and only then unlocked
     /// ([`Project::let_go`]), and a new writer streams into the new one. An old scratch file is
     /// only closed, which deletes it.

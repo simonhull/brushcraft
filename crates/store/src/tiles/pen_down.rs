@@ -24,6 +24,11 @@
 //! pen-down before the stroke first writes it and after, and every tile holding a vertex has its
 //! bits: pen-down shapes meet their neighbours, kept or not, bit for bit.
 //!
+//! A shape keeps the op of the record (or the write not yet in one) its corrections are, too: a
+//! roll-over in the middle of the stroke writes the shapes into the fresh recovery file as the
+//! stroke's pen-down surface, each a record labelled with the edit it holds, never with the
+//! stroke's (see [`TileStore::fill_roll_over`]).
+//!
 //! A shape of a tile of 65² vertices holds 63² interior vertices of three `i16` and 256 border
 //! vertices of three `f32`: 26,886 bytes and a few dozen more ([`PenDownShape::bytes`]), about
 //! half its positions in `f32`. An ordinary stroke changes 30 to 50 tiles, 1 to 2 MiB; one dab of
@@ -87,9 +92,9 @@ use geom::{
 
 use super::error::{CacheError, Invariant};
 use super::{StoreId, TileStore};
-use crate::Aabb;
 use crate::index::TileBlocks;
 use crate::tiles::config::Evaluation;
+use crate::{Aabb, OpId};
 
 /// Whether a stroke keeps a pen-down shape of tile `key` once it changes it.
 ///
@@ -103,12 +108,17 @@ pub(crate) fn keeps_pen_down(key: &TileKey) -> bool {
     key.layer() == LayerId::BASE && key.channel() == Channel::DISPLACEMENT
 }
 
-/// A tile's shape at pen-down: its corrections as they were, and the box of its positions then
-/// (see the module notes).
+/// A tile's shape at pen-down: its corrections as they were, the op that wrote them, and the box
+/// of its positions then (see the module notes).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PenDownShape {
     /// The tile's corrections before the stroke's first write.
     corrections: CorrectionTile,
+    /// The op of the record, or of the write not yet in one, those corrections are: the label a
+    /// roll-over gives the record it writes of the shape (see `TileStore::fill_roll_over`), an
+    /// op from before the stroke's. `None` for a tile no record or write held: it read as zero,
+    /// and a roll-over writes no record of it.
+    op: Option<OpId>,
     /// The box of the tile's finite positions at pen-down; `None` for none.
     bounds: Option<Aabb>,
 }
@@ -122,8 +132,20 @@ impl PenDownShape {
         let finite = positions.iter().copied().filter(|p| p.is_finite());
         Self {
             corrections,
+            op: None,
             bounds: Aabb::from_points(finite),
         }
+    }
+
+    /// The tile's corrections before the stroke's first write.
+    pub(crate) const fn corrections(&self) -> &CorrectionTile {
+        &self.corrections
+    }
+
+    /// The op of the record or write the pen-down corrections are, `None` for a tile that read
+    /// as zero (see [`PenDownShape`]'s field).
+    pub(crate) const fn op(&self) -> Option<OpId> {
+        self.op
     }
 
     /// The tile's pen-down positions, row-major: `prediction` (the tile's) with the pen-down
@@ -222,6 +244,8 @@ pub struct PenDownTaker<'a> {
     positions: &'a [Vec3],
     /// Its corrections.
     corrections: CorrectionView<'a>,
+    /// The op of the record or write they are ([`PenDownShape`]'s).
+    op: Option<OpId>,
     /// The store they were read from.
     store: StoreId,
     /// That store's count of writes ([`TileStore::edits`]) when they were read.
@@ -245,6 +269,7 @@ impl<'a> PenDownTaker<'a> {
             key: self.key,
             shape: PenDownShape {
                 corrections: self.corrections.to_tile(),
+                op: self.op,
                 bounds,
             },
             store: self.store,
@@ -435,7 +460,8 @@ impl TileStore {
     /// Keeps `corrections` as tile `key`'s pen-down shape, if the current stroke hasn't kept one
     /// for it: its corrections as the stroke found them, read from the save point that holds its
     /// pen-down surface, for a stroke restored after a crash whose dabs land on (see
-    /// [`crate::Project::resume_stroke`]). The shape's box is made from them over the tile's
+    /// [`crate::Project::resume_stroke`]); `op` is the op of the record read (`None` where the
+    /// tile had none, and read as zero). The shape's box is made from them over the tile's
     /// prediction as the store has it now, which the stroke never changed, so the shape is the one
     /// [`TileStore::keep_pen_down`] made live. It is charged as every shape is.
     ///
@@ -448,6 +474,7 @@ impl TileStore {
         &mut self,
         key: TileKey,
         corrections: CorrectionTile,
+        op: Option<OpId>,
     ) -> Result<(), CacheError> {
         if corrections.side() != key.side() || !keeps_pen_down(&key) {
             return Err(CacheError::NotATile(key));
@@ -465,6 +492,7 @@ impl TileStore {
             .ok_or(Invariant::NoPenDownShape(key))?;
         let mut shape = PenDownShape {
             corrections,
+            op,
             bounds: None,
         };
         let PositionsBox(bounds) = PositionsBox::of(&shape.positions(prediction));
@@ -488,9 +516,23 @@ impl TileStore {
             key: *key,
             positions: self.cached_positions(key)?,
             corrections: self.cached_correction(key)?,
+            op: self.held_op(key),
             store: self.id(),
             edits: self.edits(),
         })
+    }
+
+    /// The op of the record, or of the write not yet in one, resident tile `key`'s corrections
+    /// are: a dirty slot's latest write's, else the record its clean slot was filled from or
+    /// cleaned by ([`TileStore::known_ops`]); `None` for a slot no record or write holds, which
+    /// reads as zero. Only for a resident tile, which the callers make sure of: a tile that isn't
+    /// has no entry either.
+    fn held_op(&self, key: &TileKey) -> Option<OpId> {
+        let id = self.corrections.find(key)?;
+        if self.corrections.is_dirty(id) == Some(true) {
+            return self.unsaved.get(key).map(|write| write.op);
+        }
+        self.known_ops.get(key).copied()
     }
 
     /// Tile `key`'s shape as it is now, `bounds` its positions' box if at hand (else taken from
@@ -510,8 +552,11 @@ impl TileStore {
             None => PositionsBox::of(self.evaluate(key)?),
         };
         let corrections = self.correction(key)?.to_tile();
+        // Resident now: its slot was just read.
+        let op = self.held_op(&key);
         Ok(PenDownShape {
             corrections,
+            op,
             bounds,
         })
     }
