@@ -406,6 +406,12 @@ fn tiles(first: u16, n: u16) -> Vec<TileKey> {
     keys.collect()
 }
 
+/// The store journals a dab as opaque rows of its own width: a dab is exactly one of them.
+#[test]
+fn a_dab_is_the_rows_the_journal_keeps() {
+    assert_eq!(size_of::<Dab>(), store::DAB_BYTES);
+}
+
 #[test]
 fn the_time_left_takes_dabs_from_the_front_and_at_least_one() {
     // A nanosecond a dab's tile, nothing else: a dab of one tile takes 1 ns.

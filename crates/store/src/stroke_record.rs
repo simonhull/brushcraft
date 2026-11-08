@@ -50,7 +50,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use thiserror::Error;
 
 use crate::OpId;
-use crate::bytes::Reader;
+use crate::bytes::{Reader, transpose, untranspose};
 use crate::codec::{compress, decompress};
 
 /// Bytes a quantized sample takes, before delta coding and compression.
@@ -701,59 +701,53 @@ impl StrokeRecord {
     }
 }
 
-/// `samples` delta-coded and transposed into [`SAMPLE_BYTES`] byte planes: byte `j` of row `i` at
-/// `j × samples.len() + i`.
+/// `samples` delta-coded and transposed into [`SAMPLE_BYTES`] byte planes (see
+/// [`transpose`]).
 fn planes(samples: &[Quantized]) -> Vec<u8> {
-    let n = samples.len();
-    let mut out = vec![0; n * SAMPLE_BYTES];
     let mut previous = [0; 8];
-    let rows = samples.iter().enumerate();
-    for (i, sample) in rows {
-        let fields = sample.fields();
-        let mut coded = [0; 8];
-        let columns = coded
-            .iter_mut()
-            .zip(&fields)
-            .zip(&previous)
-            .zip(&FIELD_BITS);
-        for (((slot, &value), &before), &bits) in columns {
-            *slot = delta(value, before, bits);
-        }
-        previous = fields;
-        let mut row = [0; SAMPLE_BYTES];
-        put_row(&mut row, coded);
-        let targets = out.iter_mut().skip(i).step_by(n.max(1)).zip(row);
-        for (slot, byte) in targets {
-            *slot = byte;
-        }
-    }
-    out
+    let rows: Vec<[u8; SAMPLE_BYTES]> = samples
+        .iter()
+        .map(|sample| {
+            let fields = sample.fields();
+            let mut coded = [0; 8];
+            let columns = coded
+                .iter_mut()
+                .zip(&fields)
+                .zip(&previous)
+                .zip(&FIELD_BITS);
+            for (((slot, &value), &before), &bits) in columns {
+                *slot = delta(value, before, bits);
+            }
+            previous = fields;
+            let mut row = [0; SAMPLE_BYTES];
+            put_row(&mut row, coded);
+            row
+        })
+        .collect();
+    transpose(&rows)
 }
 
-/// Undoes [`planes`] for `count` samples: `None` if a sample isn't canonical.
+/// Undoes [`planes`] for `count` samples: `None` if the planes aren't `count` rows, or a sample
+/// isn't canonical.
 fn unplane(planes: &[u8], count: usize) -> Option<Vec<Quantized>> {
-    let mut samples = Vec::with_capacity(count);
+    let rows: Vec<[u8; SAMPLE_BYTES]> = untranspose(planes, count)?;
     let mut previous = [0; 8];
-    for i in 0..count {
-        let mut row = [0; SAMPLE_BYTES];
-        let sources = row.iter_mut().zip(planes.iter().skip(i).step_by(count));
-        for (slot, &byte) in sources {
-            *slot = byte;
-        }
-        let coded = read_row(&row);
-        let mut fields = [0; 8];
-        let columns = fields
-            .iter_mut()
-            .zip(&coded)
-            .zip(&previous)
-            .zip(&FIELD_BITS);
-        for (((slot, &zig), &before), &bits) in columns {
-            *slot = undelta(zig, before, bits);
-        }
-        previous = fields;
-        samples.push(Quantized::from_fields(fields)?);
-    }
-    Some(samples)
+    rows.iter()
+        .map(|row| {
+            let coded = read_row(row);
+            let mut fields = [0; 8];
+            let columns = fields
+                .iter_mut()
+                .zip(&coded)
+                .zip(&previous)
+                .zip(&FIELD_BITS);
+            for (((slot, &zig), &before), &bits) in columns {
+                *slot = undelta(zig, before, bits);
+            }
+            previous = fields;
+            Quantized::from_fields(fields)
+        })
+        .collect()
 }
 
 #[cfg(test)]

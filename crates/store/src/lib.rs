@@ -22,6 +22,7 @@ pub mod fuzzing;
 mod hash;
 mod index;
 mod jobs;
+mod journal;
 mod kept;
 mod meta;
 mod op;
@@ -53,6 +54,7 @@ pub use index::{
     TileBounds, TriangleHit, WaveBounds,
 };
 pub use jobs::JobsReport;
+pub use journal::{DAB_BYTES, DabBatch, JournalError, MAX_JOURNAL_DABS};
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use project::{

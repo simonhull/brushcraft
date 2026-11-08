@@ -16,10 +16,12 @@ use geom::{
 use super::format::{
     ENTRY_LEN, MAX_TILE_RECORD, NONE, index_payload, parse_index_payload, parse_tile_payload,
 };
+use super::journal_io::frame_batch;
 use super::*;
 use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN, parse_bounds_payload};
 use crate::codec::decode_displacement_into;
 use crate::display::{DisplayRecord, StoredDisplay, display_body, display_header, parse_display};
+use crate::journal::{DAB_BYTES, DabBatch};
 use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
 use crate::record::{HEAD, TAIL};
@@ -475,12 +477,58 @@ fn stroke_payloads_never_panic_and_round_trip() {
     });
 }
 
+/// What generates a dab batch: the op's site and sequence, the first index, the landed count, and
+/// the dabs' bytes, cut into rows of [`DAB_BYTES`] (a part row left over is dropped).
+type BatchParts = ((u16, u64), u32, u32, Vec<u8>);
+
+/// The most dabs a generator makes: enough for every plane to be long.
+const FUZZ_DABS: usize = 200;
+
+/// The batch `parts` describe, its dabs cut at [`FUZZ_DABS`], the first index moved down so they
+/// end within a `u32`, and the landed count wrapped to at most the dabs placed.
+fn batch_of((op, first, landed, bytes): &BatchParts) -> DabBatch {
+    let (rows, _) = bytes.as_chunks::<DAB_BYTES>();
+    let dabs: Vec<[u8; DAB_BYTES]> = rows.iter().take(FUZZ_DABS).copied().collect();
+    let count = u32::try_from(dabs.len()).unwrap();
+    let first = (*first).min(u32::MAX - count);
+    let placed = u64::from(first + count);
+    let landed = u32::try_from(u64::from(*landed) % (placed + 1)).unwrap();
+    DabBatch::new(op_of(op.0, op.1), first, landed, dabs).unwrap()
+}
+
+/// The dab batch parser takes any bytes without panicking, and reads back what was written.
+///
+/// It is given a writer's payload with any one byte changed, and random bytes. Whatever it
+/// accepts writes a payload it reads back as the same batch.
+#[test]
+fn journal_decode() {
+    bolero::check!()
+        .with_type::<(BatchParts, Flip)>()
+        .for_each(|(parts, flip)| {
+            let batch = batch_of(parts);
+            let payload = batch.encode().unwrap();
+            assert_eq!(DabBatch::decode(&payload), Ok(batch), "a writer's payload");
+            if let Ok(changed) = DabBatch::decode(&flipped(payload, *flip)) {
+                let again = DabBatch::decode(&changed.encode().unwrap());
+                assert_eq!(again, Ok(changed), "an accepted batch's rewrite");
+            }
+        });
+    bolero::check!().for_each(|bytes: &[u8]| {
+        if let Ok(batch) = DabBatch::decode(bytes) {
+            let again = DabBatch::decode(&batch.encode().unwrap());
+            assert_eq!(again, Ok(batch), "an accepted batch's rewrite");
+        }
+    });
+}
+
 /// A small project file at `path` with `meta`, of every kind of record.
 ///
 /// Three save points (one full Index, two deltas) of a tile each at levels 1 to 3, a known and an
 /// unknown bound, and an unsaved tile after the last save point. The first and third tiles'
-/// strokes leave records, and so does the unsaved tile's.
-fn seed_file(path: &Path, meta: Meta) {
+/// strokes leave records, and so does the unsaved tile's. With `journal`, as a recovery file
+/// holds one, the third tile's stroke also journals two batches before its save point (some dabs,
+/// then only its landed count moving), and the unsaved tile's one after it.
+fn seed_file(path: &Path, meta: Meta, journal: bool) {
     let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
     for (seq, level) in (1..).zip(1..=3_u8) {
         let face = FaceId::new(level.into());
@@ -500,6 +548,10 @@ fn seed_file(path: &Path, meta: Meta) {
             .unwrap();
         if seq != 2 {
             seed_stroke(&mut file, op_of(0, seq));
+        }
+        if journal && seq == 3 {
+            seed_batch(&mut file, op_of(0, seq), (0, 6), 2);
+            seed_batch(&mut file, op_of(0, seq), (6, 0), 5);
         }
         file.save().unwrap();
     }
@@ -525,6 +577,20 @@ fn seed_file(path: &Path, meta: Meta) {
     let tile = CorrectionTile::from_values(3, &[Vec3::ZERO; 9]).unwrap();
     file.write_displacement(key, op_of(0, 4), &tile).unwrap();
     seed_stroke(&mut file, op_of(0, 4));
+    if journal {
+        seed_batch(&mut file, op_of(0, 4), (0, 4), 1);
+    }
+}
+
+/// Appends a batch of `op` to `file`: `count` of the tests' realistic dabs from index `first`,
+/// `landed` of them landed.
+fn seed_batch(file: &mut ProjectFile, op: OpId, (first, count): (u32, u32), landed: u32) {
+    let dabs: Vec<[u8; DAB_BYTES]> = (first..first + count)
+        .map(crate::journal::tests::dab_at)
+        .collect();
+    let batch = DabBatch::new(op, first, landed, dabs).unwrap();
+    file.append_batches(&[frame_batch(&batch).unwrap()])
+        .unwrap();
 }
 
 /// Appends a short stroke record of `op` to `file`: a few samples, every field moving.
@@ -659,7 +725,7 @@ fn write_fuzz_seeds() {
     std::fs::write(corpus.join("mesh_from_bytes/seed-cube"), mesh).unwrap();
     let dir = TestDir::new();
     let project = dir.path("project");
-    seed_file(&project, fixture::meta());
+    seed_file(&project, fixture::meta(), false);
     let point = ProjectFile::open(&project)
         .unwrap()
         .base()
@@ -669,7 +735,7 @@ fn write_fuzz_seeds() {
         .with_role(Role::Recovery { base: Some(point) })
         .on_save_point(point, Path::new("/home/someone/sculpts/head.project"));
     let recovery_path = dir.path("recovery");
-    seed_file(&recovery_path, recovery);
+    seed_file(&recovery_path, recovery, true);
     let seeds = corpus.join("project_open");
     for (from, name) in [(project, "seed-project"), (recovery_path, "seed-recovery")] {
         let bytes = std::fs::read(from).unwrap();

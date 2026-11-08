@@ -25,6 +25,12 @@ pub(crate) const KIND_BOUNDS: u8 = 5;
 /// Never read on open (see `stroke_record`). No Index names one: a save point holds every stroke
 /// record before it in the file.
 pub(crate) const KIND_STROKE: u8 = 6;
+/// A dab-batch record: dabs an open stroke placed and hadn't landed at a flush, in a recovery
+/// file only.
+///
+/// Never read on open (see `journal`). No Index names one: a save point holds every batch before
+/// it in the file.
+pub(crate) const KIND_JOURNAL: u8 = 7;
 
 /// A record's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

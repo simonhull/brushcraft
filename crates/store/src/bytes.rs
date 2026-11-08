@@ -15,6 +15,41 @@ pub(crate) fn put_key(out: &mut Vec<u8>, key: &TileKey) {
     out.extend_from_slice(&key.ty().to_le_bytes());
 }
 
+/// `rows` of `W` bytes transposed into `W` byte planes: byte `j` of row `i` at `j × rows.len() +
+/// i`.
+///
+/// Rows of numbers that change little from one to the next become long runs of alike bytes,
+/// which compress well (the stroke record's samples, the journal's dabs).
+pub(crate) fn transpose<const W: usize>(rows: &[[u8; W]]) -> Vec<u8> {
+    let n = rows.len();
+    let mut out = vec![0; n * W];
+    let numbered = rows.iter().enumerate();
+    for (i, row) in numbered {
+        let targets = out.iter_mut().skip(i).step_by(n.max(1)).zip(row);
+        for (slot, &byte) in targets {
+            *slot = byte;
+        }
+    }
+    out
+}
+
+/// Undoes [`transpose`]: the `count` rows of `W` bytes `planes` holds; `None` unless it is
+/// exactly `W × count` bytes.
+pub(crate) fn untranspose<const W: usize>(planes: &[u8], count: usize) -> Option<Vec<[u8; W]>> {
+    if planes.len() != count.checked_mul(W)? {
+        return None;
+    }
+    let rows = (0..count).map(|i| {
+        let mut row = [0; W];
+        let sources = row.iter_mut().zip(planes.iter().skip(i).step_by(count));
+        for (slot, &byte) in sources {
+            *slot = byte;
+        }
+        row
+    });
+    Some(rows.collect())
+}
+
 /// A cursor over a byte slice; every read returns `None` past the end.
 #[derive(Debug, Clone)]
 pub(crate) struct Reader<'a> {
@@ -141,5 +176,17 @@ mod tests {
         let mut bad = out.clone();
         bad[7] = 13; // level 13 > MAX_LEVEL
         assert_eq!(Reader::new(&bad).key(), None, "invalid level rejected");
+    }
+
+    #[test]
+    fn rows_transpose_into_planes_and_back() {
+        let rows: Vec<[u8; 3]> = vec![[1, 2, 3], [4, 5, 6]];
+        let planes = transpose(&rows);
+        assert_eq!(planes, [1, 4, 2, 5, 3, 6], "byte j of row i at j × n + i");
+        assert_eq!(untranspose(&planes, 2), Some(rows), "and back");
+        assert_eq!(untranspose::<3>(&planes, 3), None, "too few bytes");
+        assert_eq!(untranspose::<3>(&planes[..5], 2), None, "a short plane");
+        assert_eq!(transpose::<3>(&[]), Vec::<u8>::new(), "no rows");
+        assert_eq!(untranspose::<3>(&[], 0), Some(Vec::new()), "no rows back");
     }
 }

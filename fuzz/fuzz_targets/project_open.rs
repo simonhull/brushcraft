@@ -39,7 +39,7 @@ fn open_and_read(path: &std::path::Path) -> Result<(), store::FileError> {
 }
 
 /// Reads every tile of `file`, raw and decoded (correction tiles as displacement, display
-/// records as display tiles), and every stroke record it holds.
+/// records as display tiles), and every stroke record and dab batch it holds.
 ///
 /// # Errors
 ///
@@ -53,8 +53,10 @@ fn read_all(file: &ProjectFile) -> Result<(), store::FileError> {
         }
     }
     store::fuzzing::read_displays(file)?;
-    // A stroke record that doesn't read is an error in its place; the rest still read.
+    // A stroke record or dab batch that doesn't read is an error in its place; the rest still
+    // read.
     file.strokes().for_each(drop);
+    file.batches().for_each(drop);
     Ok(())
 }
 
