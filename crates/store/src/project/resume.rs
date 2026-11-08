@@ -6,11 +6,12 @@
 //! A restore opens the recovery file at its last durable save point, which holds every dab batch
 //! before it. The **last** of them gives the open stroke: its op, and its landed count, which
 //! describes exactly the tiles that save point names. If that batch's dabs have all landed (a
-//! stroke that ended writes a last batch so), no stroke is open. Nor is one if the file holds an
-//! edit of a later op ([`ProjectFile::head`]): an op began after the stroke's, so the stroke ended
-//! (dropped, or never resumed after an earlier restore, see [`crate::Project::begin_stroke`]), or
-//! a save in its middle moved its later edits to a new op; landing its rows now would land them
-//! over that op's edits. Otherwise the batches of its op,
+//! stroke that ended writes a last batch so), no stroke is open. If the file holds an edit of a
+//! later op of the stroke's site ([`ProjectFile::head`]), the stroke ended with dabs not landed
+//! and no closing batch (a save in its middle moved its later edits to a new op, or an op began
+//! with no stroke): landing its rows now would land them over that op's edits, so its journal is
+//! unusable ([`JournalUnusable::Ended`]). The head orders ops only within a site, so one of
+//! another site is never taken for later. Otherwise the batches of its op,
 //! read back from the last, give its dabs from the landed count on: each batch's first index is
 //! the later of the dabs the one before it placed and its own landed count (a batch's dabs start
 //! where the last left off, or past the dabs that landed before they were written), so the read
@@ -39,7 +40,7 @@
 //! ([`JournalUnusable`]), never an error of the restore: the restored tiles stand, as they would
 //! with no journal, and the project opens. That is a batch that doesn't read, a gap or an overlap,
 //! batches of the stroke that disagree, rows of no format, a pen-down surface no save point of
-//! the file holds, or one that doesn't read.
+//! the file holds, or one that doesn't read, or a later op's edits over the stroke.
 //!
 //! # Bounds
 //!
@@ -274,10 +275,23 @@ pub enum JournalUnusable {
     /// a restore never allocates past it for a file it can't trust (see the module notes).
     #[error("the stroke's journal is larger than the store's budget")]
     TooLarge,
+    /// A later op's edits stand over the stroke: its last batch leaves dabs not landed, but the
+    /// file holds edits of an op of its site begun after it, so the stroke ended without its
+    /// closing batch (a save in its middle moved its later edits to a new op, or an op began
+    /// with no stroke). Landing its rows now would land them over those edits.
+    #[error("a later op's edits stand over the stroke")]
+    Ended,
 }
 
-/// The stroke `store`'s working file, just restored, holds still landing (see the module notes):
-/// `None` if it holds no batch, or its last batch's dabs have all landed.
+/// The stroke `store`'s working file, just restored, holds still landing (see the module notes).
+///
+/// `None` if it holds no batch, or its last batch's dabs have all landed (its closing batch, or
+/// every dab placed landed). A last batch with dabs not landed under edits of a later op is
+/// [`JournalUnusable::Ended`]. A later op is found from the file's head, which is the newest op
+/// only among one site's ([`OpId`]'s ordering puts a greater site after every op of a lesser,
+/// whenever it was made): so it is compared only when it is of the stroke's site. An op of
+/// another site says nothing either way, and the closing batch alone says whether the stroke
+/// ended.
 pub(super) fn find(store: &TileStore) -> Option<Result<OpenStroke, JournalUnusable>> {
     let file = store.working();
     let locations: Vec<Loc> = file.batch_locations().collect();
@@ -285,9 +299,15 @@ pub(super) fn find(store: &TileStore) -> Option<Result<OpenStroke, JournalUnusab
     let Ok(last) = file.read_batch(last) else {
         return Some(Err(JournalUnusable::Damaged));
     };
-    let later_op = file.head().is_some_and(|head| head > last.op());
-    if last.landed() == last.placed() || later_op {
+    if last.landed() == last.placed() {
         return None;
+    }
+    let op = last.op();
+    let later_op = file
+        .head()
+        .is_some_and(|head| head.site() == op.site() && head > op);
+    if later_op {
+        return Some(Err(JournalUnusable::Ended));
     }
     Some(open_stroke(store, last, earlier))
 }

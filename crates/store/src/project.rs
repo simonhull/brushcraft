@@ -121,7 +121,7 @@ use discover::{not_restorable, past, recovery_heads, standing};
 use place::{
     create_clean, create_placed, create_recovery, place_new, retire, scratch, scratch_in, temporary,
 };
-use resume::Unresumed;
+use resume::{FoundShape, Unresumed};
 pub use resume::{JournalUnusable, NotResumed, OpenStroke};
 
 /// The extension of a recovery file (and of a project file).
@@ -508,6 +508,11 @@ pub struct Project {
     /// op, after its journal is seeded.
     #[cfg(test)]
     fail_next_resume: bool,
+    /// Test hook: makes [`Project::resume_stroke`] fail to install the shape of this index (0 the
+    /// first), as a tile whose parents don't evaluate would, after those before it are installed
+    /// and charged. Taken by the call that meets it.
+    #[cfg(test)]
+    fail_install_at: Option<usize>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename, with an I/O error of
     /// this kind (see [`Unplaced::crash`](place::Unplaced::crash)).
@@ -797,6 +802,8 @@ impl Project {
             unresumed: None,
             #[cfg(test)]
             fail_next_resume: false,
+            #[cfg(test)]
+            fail_install_at: None,
             #[cfg(test)]
             fail_next_recovery: None,
             #[cfg(test)]
@@ -1419,10 +1426,8 @@ impl Project {
         if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
             return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
         }
-        let installed = stroke.shapes().iter().try_for_each(|shape| {
-            self.store
-                .install_pen_down(shape.key, shape.corrections.clone(), shape.op)
-        });
+        let mut shapes = stroke.shapes().iter().enumerate();
+        let installed = shapes.try_for_each(|(nth, shape)| self.install_shape(nth, shape));
         if let Err(e) = installed {
             self.store.release_pen_down();
             return Err(NotResumed::new(stroke, e.into()));
@@ -1447,6 +1452,28 @@ impl Project {
         self.stroke = Some(op);
         self.unresumed = None;
         Ok(())
+    }
+
+    /// Installs `shape`, the `nth` of a restored stroke's ([`TileStore::install_pen_down`]), a
+    /// step of [`Project::resume_stroke`].
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::install_pen_down`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            unused_variables,
+            reason = "the test hook that fails one reads which this is"
+        )
+    )]
+    fn install_shape(&mut self, nth: usize, shape: &FoundShape) -> Result<(), CacheError> {
+        #[cfg(test)]
+        if self.fail_install_at.take_if(|at| *at == nth).is_some() {
+            return Err(CacheError::NotATile(shape.key));
+        }
+        self.store
+            .install_pen_down(shape.key, shape.corrections.clone(), shape.op)
     }
 
     /// Makes `op` the store's op again ([`TileStore::resume_op`]), the last step of

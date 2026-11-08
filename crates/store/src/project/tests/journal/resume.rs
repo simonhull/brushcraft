@@ -642,8 +642,9 @@ fn a_stroke_never_resumed_is_closed_by_the_next_op_and_not_offered_again() {
 }
 
 #[test]
-fn an_edit_of_a_later_op_closes_the_stroke_its_batches_leave_open() {
-    // Edits of a later op with no stroke begun: no closing batch, but the file's head says so.
+fn an_edit_of_a_later_op_makes_the_journal_its_batches_leave_open_unusable() {
+    // Edits of a later op with no stroke begun: no closing batch, but the file's head says the
+    // later op's edits stand over the stroke, which can't be finished.
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
     crash_landing(new_project(&dir), &mut map, 70);
@@ -654,14 +655,37 @@ fn an_edit_of_a_later_op_closes_the_stroke_its_batches_leave_open() {
     apply_dabs(restored.store(), &mut map, &edits);
     flush(&mut restored);
     drop(restored);
-    let mut again = restore(&dir);
-    assert!(again.take_open_stroke().is_none(), "a later op edited");
-    assert_tiles(&mut again, &map, "its edits stand");
-    again.close(false).unwrap();
+    assert_tiles_alone(restore(&dir), &map, &JournalUnusable::Ended);
 }
 
 #[test]
-fn a_save_in_the_middle_of_a_stroke_leaves_no_stroke_to_land() {
+fn a_later_op_of_another_site_leaves_the_stroke_open() {
+    // Ops of different sites don't order by time: the head says nothing, and with no closing
+    // batch the stroke is still open.
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let stroke = crash_landing(new_project(&dir), &mut map, 92);
+    let path = candidate(&dir).path;
+    let mut file = ProjectFile::open(&path).unwrap();
+    let key = tiles(&mesh(), 1, 1)[0];
+    let other = OpId::new(stroke.op.site() + 1, 0).unwrap();
+    assert!(other > stroke.op, "greater, as another site's");
+    let zero = geom::CorrectionTile::zero(key.side()).unwrap();
+    file.write_displacement(key, other, &zero).unwrap();
+    file.save().unwrap();
+    drop(file);
+    let mut restored = restore(&dir);
+    let open = restored.take_open_stroke().unwrap().unwrap();
+    assert_eq!(
+        (open.op(), open.landed()),
+        (stroke.op, 8),
+        "the stroke, still open"
+    );
+    restored.close(false).unwrap();
+}
+
+#[test]
+fn a_save_in_the_middle_of_a_stroke_leaves_its_journal_unusable() {
     // Its later edits are a new op's, its batches the old one's.
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
@@ -677,13 +701,8 @@ fn a_save_in_the_middle_of_a_stroke_leaves_no_stroke_to_land() {
     assert_eq!(last.op(), saved.op, "the old op's batch");
     assert!(last.landed() < last.placed(), "dabs not landed");
     drop(project);
-    let mut restored_saved = restore(&dir);
-    assert!(
-        restored_saved.take_open_stroke().is_none(),
-        "the new op's edits are past it"
-    );
-    assert_tiles(&mut restored_saved, &map, "the tiles");
-    restored_saved.close(false).unwrap();
+    // The new op's edits stand over it.
+    assert_tiles_alone(restore(&dir), &map, &JournalUnusable::Ended);
 }
 
 #[test]
@@ -706,6 +725,46 @@ fn a_resume_that_fails_leaves_the_project_as_it_was() {
     flush(&mut restored);
     assert_eq!(batches(&mut restored), written, "nothing written of it");
     // Given back, it resumes.
+    let given_back = failed.into_stroke();
+    let mut resumed = going_on(stroke, &given_back);
+    restored.resume_stroke(given_back).unwrap();
+    resumed.land(&mut restored, &mut map, 12);
+    restored.end_unrecorded_stroke().unwrap();
+    assert_tiles(&mut restored, &map, "every dab landed");
+    restored.close(false).unwrap();
+}
+
+#[test]
+fn a_resume_whose_shape_fails_to_install_gives_back_its_charge() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let stroke = crash_landing(new_project(&dir), &mut map, 93);
+    let mut restored = restore(&dir);
+    let open = restored.take_open_stroke().unwrap().unwrap();
+    assert!(open.pen_down_keys().count() > 1, "shapes to install");
+    let written = batches(&mut restored);
+    let key = *open.pen_down_keys().next().unwrap();
+    drop(restored.store().pin(&[key]).unwrap());
+    let limit = restored.store().pools_limit();
+    // The second shape fails, after the first is charged.
+    restored.fail_install_at = Some(1);
+    let failed = restored.resume_stroke(open).unwrap_err();
+    assert!(
+        matches!(failed.error(), ProjectError::Cache(_)),
+        "{failed:?}"
+    );
+    assert_eq!(restored.store().pen_down_tiles(), 0, "no shape");
+    assert_eq!(restored.store().pen_down_bytes(), 0, "none charged");
+    drop(restored.store().pin(&[key]).unwrap());
+    assert_eq!(
+        restored.store().pools_limit(),
+        limit,
+        "the pools' room as it was"
+    );
+    assert_eq!(restored.store().current_op(), None, "no op");
+    assert!(!restored.store().is_landing(), "no journal");
+    flush(&mut restored);
+    assert_eq!(batches(&mut restored), written, "nothing written of it");
     let given_back = failed.into_stroke();
     let mut resumed = going_on(stroke, &given_back);
     restored.resume_stroke(given_back).unwrap();

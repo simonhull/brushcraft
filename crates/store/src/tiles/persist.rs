@@ -970,6 +970,13 @@ impl TileStore {
         self.budget.opened()
     }
 
+    /// The bytes the pools may hold now, after what is withheld for a stroke's pen-down data:
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) const fn pools_limit(&self) -> usize {
+        self.budget.limit()
+    }
+
     /// Writes every dirty correction tile, every spatial-index bound the working file lacks and
     /// every stroke record waiting to the working file and records a save point there. Returns its
     /// offset.
