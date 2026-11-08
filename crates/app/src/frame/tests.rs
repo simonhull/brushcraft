@@ -5585,3 +5585,213 @@ fn a_copy_that_failed_says_so_in_the_title_and_the_chip_stays_quiet() {
     assert!(!owner.unsaved(), "nothing is lost, or unsaved");
     owner.close().expect("closed");
 }
+
+/// How many dabs [`dabs_facing_the_camera`] places.
+const FACING_DABS: usize = 12;
+
+/// The dabs of a stroke across the middle of `project`'s side facing the default camera.
+///
+/// Each is on the surface where a ray from the camera's eye finds it, and strong enough to move
+/// the surface by pixels in a 320 × 200 frame.
+fn dabs_facing_the_camera(project: &mut Project) -> Vec<stroke::Dab> {
+    let mut picker = Picker::load(project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let eye = Camera::default().eye();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the default eye's few units: f32 holds them"
+    )]
+    let eye = Vec3::new(eye.x as f32, eye.y as f32, eye.z as f32);
+    let steps = (0_u8..).take(FACING_DABS);
+    let across = (0..).zip(steps.map(|step| f32::from(step) * 0.05 - 0.3));
+    let dabs = across.map(|(seq, x)| {
+        let ray = store::Ray::new(eye, Vec3::new(x, 0.0, 0.0) - eye).expect("a ray");
+        let hit = picker
+            .index_mut()
+            .raycast(project.store(), &ray)
+            .expect("cast")
+            .expect("the sphere is under the camera");
+        let at = eye + (Vec3::new(x, 0.0, 0.0) - eye) * hit.t;
+        stroke::Dab {
+            position: [at.x, at.y, at.z],
+            normal: [0.0, 0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+            radius: 0.25,
+            strength: 0.15,
+            hardness: 0.5,
+            seq,
+            ..stroke::Dab::default()
+        }
+    });
+    dabs.collect()
+}
+
+/// A crash with a stroke landing, in rows of `format`, none of it landed: how to open it.
+///
+/// A saved project in `dir` whose display layer is built, and a recovery file left on it as a
+/// crash leaves it, [`dabs_facing_the_camera`] journalled as a stroke's.
+fn left_landing(dir: &TestDir, format: u32) -> ProjectConfig {
+    let mut project = project(dir);
+    build_display(&mut project);
+    drop(
+        project
+            .save_as(&dir.path().join("landing.bcrf"))
+            .expect("saved"),
+    );
+    let dabs = dabs_facing_the_camera(&mut project);
+    project.set_dab_format(format);
+    project.begin_stroke_and_wait().expect("begun");
+    let rows: Vec<[u8; store::DAB_BYTES]> = dabs.iter().map(|dab| bytemuck::cast(*dab)).collect();
+    project.journal(&rows).expect("journalled");
+    // A flush, durable, then a crash: nothing closes the project.
+    project
+        .tick(Instant::now() + store::FLUSH_INTERVAL * 2)
+        .expect("ticked");
+    let began = Instant::now();
+    while matches!(
+        project.save_ahead(Instant::now()).expect("a slice"),
+        SaveAhead::Flushing
+    ) {
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(began.elapsed() < Duration::from_secs(60), "the flush ends");
+    }
+    drop(project);
+    ProjectConfig {
+        store: StoreConfig::new(512 << 20, 1).with_display(Level::new(FINEST).expect("a level")),
+        recovery_dir: dir.path().join("recovery"),
+    }
+}
+
+/// The project the one recovery file `config` finds restores, told the brush's dab format as
+/// the app tells every project it opens.
+fn restore_left(config: &ProjectConfig) -> Project {
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let [candidate] = found.as_slice() else {
+        panic!("one recovery file: {found:?}");
+    };
+    let mut project = Project::restore(candidate, config.clone()).expect("restored");
+    project.set_dab_format(stroke::DAB_FORMAT);
+    project
+}
+
+/// The visibility buffer of the first frame of the project `config` restores, and its report.
+///
+/// Drawn on `gpu`, the stroke the restore found taken on first if `resuming`, as the app does it,
+/// and then dropped with the project; else left alone, and the project closed.
+fn first_frame_restored(
+    gpu: &Arc<Gpu>,
+    config: &ProjectConfig,
+    resuming: bool,
+) -> (Vec<u32>, BrushReport) {
+    let mut project = restore_left(config);
+    if !resuming {
+        drop(project.take_open_stroke());
+    }
+    let picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let brush = Sculpting::new(&mut project);
+    let residency = GpuResidency::new(Arc::clone(gpu), project.store()).expect("residency");
+    let mut owner =
+        Owner::new(project, brush, residency, setup(None), Instant::now()).with_picker(picker);
+    owner.resume_stroke();
+    let mut screen = Screen::new(gpu);
+    let ids = draw_when_wanted(gpu, &mut owner, &mut screen);
+    let report = owner.brush.last();
+    if resuming {
+        owner.discard().expect("discarded");
+    } else {
+        owner.close().expect("closed");
+    }
+    (ids, report)
+}
+
+#[test]
+fn the_first_frame_after_a_restore_draws_the_whole_stroke() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let config = left_landing(&dir, stroke::DAB_FORMAT);
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let left = found.first().expect("the file").path.clone();
+    let copy = dir.path().join("left.bcrf-recovery");
+    std::fs::copy(&left, &copy).expect("copied");
+    let (alone, _) = first_frame_restored(&gpu, &config, false);
+    // Nothing landed there, so closing it dropped the file: the same again for the next.
+    std::fs::copy(&copy, &left).expect("put back");
+    let (resumed, report) = first_frame_restored(&gpu, &config, true);
+    assert_eq!(
+        report.dabs_shown, FACING_DABS,
+        "every dab not landed is in the first frame: {report:?}"
+    );
+    let changed = alone.iter().zip(&resumed).filter(|(a, b)| a != b).count();
+    assert!(changed > 0, "the first frame draws the stroke's surface");
+}
+
+#[test]
+fn an_unusable_journal_says_the_last_stroke_couldn_t_be_finished() {
+    let dir = TestDir::new();
+    // Rows of no format: a restore can't read them.
+    let config = left_landing(&dir, 0);
+    let mut project = restore_left(&config);
+    let picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let brush = Sculpting::new(&mut project);
+    let mut owner =
+        Owner::new(project, brush, NoUploads, big_setup(), Instant::now()).with_picker(picker);
+    owner.resume_stroke();
+    assert!(!owner.brush.under_way(), "nothing to take on");
+    let note = OpenNote::Restored {
+        path: "recovery.bcrf".into(),
+        when: std::time::SystemTime::now(),
+    };
+    owner.note(&note, Instant::now());
+    let bar = owner.dialogs.bar().expect("the note");
+    assert_eq!(bar.title(), "Your unsaved work is back");
+    assert_eq!(
+        bar.detail(),
+        Some("Your last stroke couldn't be finished; the rest of your work is back.")
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn use_last_save_goes_while_a_restored_stroke_lands() {
+    let dir = TestDir::new();
+    let config = left_landing(&dir, stroke::DAB_FORMAT);
+    let mut project = restore_left(&config);
+    let picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    // A dab a step: the restored stroke is still landing when the user answers the note.
+    let brush = Sculpting::new(&mut project).with_cost(crate::sculpting::DabCost::one_at_a_time());
+    let mut owner =
+        Owner::new(project, brush, NoUploads, big_setup(), Instant::now()).with_picker(picker);
+    owner.resume_stroke();
+    let note = OpenNote::Restored {
+        path: "recovery.bcrf".into(),
+        when: std::time::SystemTime::now(),
+    };
+    owner.note(&note, seen_now());
+    assert_eq!(run(&mut owner, 1), 1);
+    assert!(owner.landing() > 0, "still landing");
+    owner.act(Action::UseLastSave, Instant::now());
+    let kept = owner.project.recovery_path().map(PathBuf::from);
+    let kept = kept.expect("a recovery file");
+    let asked = WindowRequest::Reopen(Reopen::LastSave { kept });
+    assert_eq!(
+        owner.take_request(),
+        Some(asked),
+        "the restored stroke is in the recovery file, which reopening it brings back"
+    );
+    drop(owner.close_for_reopen().expect("closed"));
+    // Kept with the stroke still to land: opening it again takes it on again.
+    let mut again = restore_left(&config);
+    let found = again.take_open_stroke();
+    assert!(
+        matches!(&found, Some(Ok(stroke)) if !stroke.dabs().is_empty()),
+        "{found:?}"
+    );
+    again.close(true).expect("closed");
+}

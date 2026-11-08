@@ -23,6 +23,12 @@ impl TestDir {
         Self(dir)
     }
 
+    /// Takes on `path`, a directory made by the test process that started this one (a child a
+    /// test kills), to work in: removed on drop, as one this made.
+    pub(crate) const fn adopt(path: PathBuf) -> Self {
+        Self(path)
+    }
+
     /// The directory.
     pub(crate) fn path(&self) -> &Path {
         &self.0

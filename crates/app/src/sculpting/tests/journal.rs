@@ -2,12 +2,15 @@
 //!
 //! Every dab placed goes to its stroke's journal once, in order, from the stroke's first; the
 //! landed count follows the finest work, never the dabs shown; dabs an error drops are never
-//! replayed; and a journal that refuses ends the stroke cleanly.
+//! replayed; a journal that refuses ends the stroke cleanly; and (in `resume`) a stroke a restore
+//! found still landing is taken on and finished.
 
 use store::{DabBatch, FLUSH_INTERVAL, SaveAhead};
 use stroke::{MirrorPlanes, Symmetry};
 
 use super::*;
+
+mod resume;
 
 /// Waits until `project`'s recovery writer has no flush under way: every cut taken so far is in
 /// the recovery file, durable. A saved project's [`Project::save_ahead`] says so, and copies
@@ -97,7 +100,11 @@ impl Journalling {
 
     /// The default brush as `made` makes it, over a fresh project, saved.
     fn with(made: impl FnOnce(Sculpting) -> Sculpting) -> Self {
-        let dir = TestDir::new();
+        Self::in_dir(TestDir::new(), made)
+    }
+
+    /// [`Journalling::with`], the project in `dir`.
+    fn in_dir(dir: TestDir, made: impl FnOnce(Sculpting) -> Sculpting) -> Self {
         let mut project = project(&dir);
         drop(
             project

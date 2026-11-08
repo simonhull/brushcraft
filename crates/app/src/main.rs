@@ -109,10 +109,13 @@ pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, mut setup: Setup) -> Re
             let brush = Sculpting::new(&mut project);
             let owner = Owner::new(project, brush, residency, setup, Instant::now());
             // Opening a project starts framed (a scripted run's path sets its view instead).
-            Ok(match picker {
+            let mut owner = match picker {
                 Some(picker) => owner.with_picker(picker).framed(),
                 None => owner,
-            })
+            };
+            // A stroke a restore found still landing, before any frame: on screen in the first.
+            owner.resume_stroke();
+            Ok(owner)
         }
         Err(error) => {
             let keep = project.has_unsaved_edits();

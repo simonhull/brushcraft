@@ -134,6 +134,35 @@
 //!   in flight's syncs, and lands then. A close's or a save's landing, which has no frames to wait
 //!   for, waits for the cut ([`Project::wait_to_land`]).
 //!
+//! # A stroke a restore found
+//!
+//! A crash during a landing leaves the stroke's journal in the recovery file. A restore finds it
+//! ([`Project::take_open_stroke`]), and the frame loop hands it to the brush before its first
+//! frame ([`crate::frame::Owner::resume_stroke`], [`Brush::resume`]; the dab journal spec,
+//! "Restoring a journalled stroke"):
+//!
+//! - **Taken on:** its rows are read back as dabs (each is a [`Dab`]'s bytes, in the layout
+//!   [`stroke::DAB_FORMAT`] names), and the project resumes it ([`Project::resume_stroke`]): its op
+//!   reopened, its pen-down shapes installed, its journal counting on from its landed count. The
+//!   brush holds it as a stroke whose pen has lifted, with no engine stroke and nothing to record:
+//!   its dabs queued, each with the tiles it touches, as placed dabs are, and never journalled
+//!   again (the file holds them).
+//! - **Shown at once,** every dab ahead of its finest work ([`Preview::show`], over what the
+//!   renderer draws from the start: its floor), so the whole stroke is on screen in the first
+//!   frame, which reports them shown.
+//! - **Landed as a lifted stroke:** the catch-up lands it as any stroke whose pen has lifted, and a
+//!   `Down` meanwhile waits behind it, as behind any landing. Once every dab has landed its op ends
+//!   unrecorded ([`Project::end_unrecorded_stroke`]): the journal holds no pen samples, and a
+//!   stroke record is history, never needed to open.
+//! - **Not taken on** with rows of another layout ([`OtherDabFormat`]), or by a project that won't
+//!   resume it: the restored tiles stand, and the project's next stroke closes it in the file. The
+//!   restore note says so.
+//!
+//! It lands close to what the live landing would have made, not bit for bit: the stroke state
+//! ([`sculpt::Stroke`]) starts each vertex it touches from the stored, rounded value, where the
+//! live one kept it unrounded, so each is rounded once more, by at most half its tile's
+//! quantization step.
+//!
 //! # Warming under a hovering pen
 //!
 //! A stroke's first sample finds the surface under it cold: evaluating the reach ball's tiles
@@ -177,8 +206,8 @@ use input::Phase;
 use render::camera::View;
 use sculpt::{Preview, StoreSurface, apply_dabs};
 use store::{
-    Evaluation, OpId, PenSample as RecordSample, PenTilt, Project, ProjectError, SpatialIndex,
-    StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
+    Evaluation, OpId, OpenStroke, PenSample as RecordSample, PenTilt, Project, ProjectError,
+    SpatialIndex, StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
 };
 use stroke::{
     DVec3, Dab, Hit, Projector, REACH_RADII, Radius, Ray, Sample, ScreenPoint, Strength,
@@ -577,20 +606,55 @@ struct Source {
     shown: bool,
 }
 
-/// A stroke, from its `Down` until its op ends: its engine stroke while the pen is down, what its
-/// record keeps, and its dabs not yet applied.
+impl Source {
+    /// Where `dab`, placed from the sample at `times`, came from: the tiles of `index` its sphere
+    /// touches, not shown yet.
+    fn of(dab: &Dab, times: SampleTimes, index: &SpatialIndex) -> Self {
+        let [x, y, z] = dab.position;
+        let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
+        Self {
+            times,
+            tiles: touched.collect(),
+            shown: false,
+        }
+    }
+}
+
+/// Why a stroke a restore found isn't taken on: its rows are of another dab layout than the
+/// brush's ([`stroke::DAB_FORMAT`]), so they can't be read as its dabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "its dabs are of layout {found}, and the brush reads layout {}",
+    stroke::DAB_FORMAT
+)]
+struct OtherDabFormat {
+    /// The layout its rows were written in.
+    found: u32,
+}
+
+/// What a stroke drawn with the pen keeps for its record ([`StrokeRecord`]).
+#[derive(Debug)]
+struct Recording {
+    /// The brush's settings as the stroke began (the engine holds its own copy, its radius frozen
+    /// at the first hit).
+    settings: StrokeSettings,
+    /// The camera at the stroke's start.
+    camera: StrokeCamera,
+    /// The samples the engine read.
+    samples: Vec<RecordSample>,
+}
+
+/// A stroke, from its `Down` (or its resuming, for one a restore found) until its op ends: its
+/// engine stroke while the pen is down, what its record keeps, and its dabs not yet applied.
 #[derive(Debug)]
 struct Pending {
     /// The engine's stroke; `None` once it has ended (pen up, or an error), while its queued
-    /// dabs are applied.
+    /// dabs are applied, and for a stroke a restore found, whose pen has lifted.
     engine: Option<Stroke>,
-    /// The brush's settings as the stroke began, which its record keeps (the engine holds its own
-    /// copy, its radius frozen at the first hit).
-    settings: StrokeSettings,
-    /// The camera at the stroke's start, which its record keeps.
-    camera: StrokeCamera,
-    /// The samples the engine read, which its record keeps.
-    samples: Vec<RecordSample>,
+    /// What its record keeps; `None` for a stroke a restore found ([`Sculpting::resume`]): the
+    /// journal holds no pen samples, so it ends unrecorded
+    /// ([`Project::end_unrecorded_stroke`]).
+    record: Option<Recording>,
     /// Its op, begun with it: every edit of its dabs is part of it, and its journal is the op's.
     op: OpId,
     /// Its dabs not yet applied, oldest first.
@@ -670,15 +734,8 @@ impl Pending {
         let (before, heading) = (self.dabs.len(), self.heading);
         for dab in placed {
             self.heading = [self.heading[1], Some(dab)];
-            let [x, y, z] = dab.position;
-            let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
-            let keys: Vec<TileKey> = touched.collect();
             self.dabs.push_back(dab);
-            self.sources.push_back(Source {
-                times,
-                tiles: keys,
-                shown: false,
-            });
+            self.sources.push_back(Source::of(&dab, times, index));
         }
         let queue: &[Dab] = self.dabs.make_contiguous();
         let new = queue.get(before..).unwrap_or_default();
@@ -1127,9 +1184,11 @@ impl Sculpting {
         }
         self.stroke = Some(Pending {
             engine: Some(engine),
-            settings: self.settings.clone(),
-            camera: stroke_camera(scene.camera, &projector.view),
-            samples: vec![record_sample(&first)],
+            record: Some(Recording {
+                settings: self.settings.clone(),
+                camera: stroke_camera(scene.camera, &projector.view),
+                samples: vec![record_sample(&first)],
+            }),
             op,
             dabs: VecDeque::new(),
             landed: 0,
@@ -1141,6 +1200,75 @@ impl Sculpting {
             down_at: down.received,
             heading: [None, None],
         });
+    }
+
+    /// Takes on `found`, the stroke a restore found still landing, through `context` (see "A
+    /// stroke a restore found" in the module notes): resumed in the project, its dabs queued as
+    /// a stroke whose pen has lifted and shown at once. Returns whether it did. It doesn't with a
+    /// stroke under way or waiting (never, before any step), with no spatial index (nothing can
+    /// be brushed), or, kept as the brush's error, with rows of another layout or a project that
+    /// won't resume it.
+    fn take_on(&mut self, context: BrushContext<'_>, found: OpenStroke) -> bool {
+        let BrushContext {
+            project,
+            index,
+            drawn,
+            ..
+        } = context;
+        if self.stroke.is_some() || !self.deferred.is_empty() || !self.held.is_empty() {
+            return false;
+        }
+        let Some(index) = index else {
+            return false;
+        };
+        if found.dab_format() != stroke::DAB_FORMAT {
+            let other = OtherDabFormat {
+                found: found.dab_format(),
+            };
+            self.fail("taking on the stroke a restore found", &other);
+            return false;
+        }
+        // Read out first: resuming takes the stroke. A row is a dab's bytes, so any row casts.
+        let rows = found.dabs().iter();
+        let dabs: VecDeque<Dab> = rows
+            .map(|row| bytemuck::cast::<DabRow, Dab>(*row))
+            .collect();
+        let (op, landed) = (found.op(), found.landed());
+        if let Err(refused) = project.resume_stroke(found) {
+            self.fail("taking on the stroke a restore found", &refused);
+            return false;
+        }
+        // No pen sample placed them: they date from now, as a lift does.
+        let now = Instant::now();
+        let times = SampleTimes {
+            taken: now,
+            received: now,
+        };
+        let sources = dabs.iter().map(|dab| Source::of(dab, times, index));
+        let sources: VecDeque<Source> = sources.collect();
+        self.stroke = Some(Pending {
+            engine: None,
+            record: None,
+            op,
+            dabs,
+            landed,
+            sources,
+            last: times,
+            placed_at: now,
+            interval: FIRST_INTERVAL,
+            // Its start isn't the pivot: opening frames the model.
+            start_noted: true,
+            down_at: now,
+            heading: [None, None],
+        });
+        let mut report = BrushReport::default();
+        self.show_on(project, index, drawn, &mut report);
+        // Shown before any frame, which reports them; no pen sample times a latency from them.
+        report.oldest = None;
+        self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+        self.note_kept(project.store());
+        self.refresh_status();
+        true
     }
 
     /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing and journalling the
@@ -1162,7 +1290,9 @@ impl Sculpting {
         let placed = engine.push(&projector, &mut surface, engine_sample);
         let finished = surface.finish();
         let times = times_of(sample);
-        pending.samples.push(record_sample(&engine_sample));
+        if let Some(record) = &mut pending.record {
+            record.samples.push(record_sample(&engine_sample));
+        }
         let gap = times
             .received
             .saturating_duration_since(pending.last.received);
@@ -1262,6 +1392,19 @@ impl Sculpting {
     /// `report` (their samples among those whose latency the frame carries). A preview that
     /// fails leaves the dabs it didn't show to be shown (or applied) by a later step.
     fn show(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport) {
+        self.show_on(scene.project, scene.index, scene.drawn, report);
+    }
+
+    /// [`Sculpting::show`] on `project`'s tiles, found by `index`, previews made of those `drawn`:
+    /// what showing needs of a scene, for a stroke taken on before any view
+    /// ([`Sculpting::resume`]).
+    fn show_on(
+        &mut self,
+        project: &mut Project,
+        index: &SpatialIndex,
+        drawn: Drawing<'_>,
+        report: &mut BrushReport,
+    ) {
         let Some(preview) = &mut self.preview else {
             return;
         };
@@ -1274,13 +1417,9 @@ impl Sculpting {
             return;
         }
         let before = preview.shown();
-        let drawn = scene.drawn;
-        let shown = preview.show(
-            scene.project.store(),
-            scene.index,
-            &dabs,
-            &|key: &TileKey| drawn.draws(key),
-        );
+        let shown = preview.show(project.store(), index, &dabs, &|key: &TileKey| {
+            drawn.draws(key)
+        });
         let count = preview.shown() - before;
         let sources = self
             .stroke
@@ -1579,15 +1718,19 @@ impl Sculpting {
         }
     }
 
-    /// Ends `over`'s op with its record; unrecorded if the record can't be made or the project
-    /// refuses it, so its edits are flushed all the same.
+    /// Ends `over`'s op with its record; unrecorded if it has none (a stroke a restore found), if
+    /// the record can't be made or the project refuses it, so its edits are flushed all the same.
     fn end(&mut self, project: &mut Project, over: &Pending) {
         if let Some(preview) = &mut self.preview
             && let Err(error) = preview.end_stroke(project.store())
         {
             self.fail("ending the stroke's previews", &error);
         }
-        let record = match self.record_of(over.op, over) {
+        let Some(recording) = &over.record else {
+            self.end_unrecorded(project);
+            return;
+        };
+        let record = match self.record_of(over.op, recording) {
             Ok(record) => record,
             Err(error) => {
                 self.fail("recording the stroke", &error);
@@ -1623,13 +1766,13 @@ impl Sculpting {
         }
     }
 
-    /// `over`'s record under its `op`: its samples (as many as a record holds), settings,
-    /// camera and the engine's version.
+    /// The record of the stroke `over` kept for, under its `op`: its samples (as many as a record
+    /// holds), settings, camera and the engine's version.
     ///
     /// # Errors
     ///
     /// As [`StrokeRecord::new`]: settings too long for a record.
-    fn record_of(&mut self, op: OpId, over: &Pending) -> Result<StrokeRecord, StrokeRecordError> {
+    fn record_of(&mut self, op: OpId, over: &Recording) -> Result<StrokeRecord, StrokeRecordError> {
         let mut record = StrokeRecord::new(
             op,
             stroke::ENGINE_VERSION,
@@ -2136,6 +2279,10 @@ impl Brush for Sculpting {
 
     fn next_sample_due(&self) -> Option<Instant> {
         self.before_next_sample().filter(|_| self.pen_moving())
+    }
+
+    fn resume(&mut self, context: BrushContext<'_>, stroke: OpenStroke) -> bool {
+        self.take_on(context, stroke)
     }
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {

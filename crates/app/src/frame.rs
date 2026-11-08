@@ -124,14 +124,14 @@ use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, Outcome, SceneView, aa};
 use store::{
-    CacheError, Drained, JobsReport, Project, ProjectError, Protection, RecoveryCandidate,
-    RecoveryError, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
+    CacheError, Drained, JobsReport, OpenStroke, Project, ProjectError, Protection,
+    RecoveryCandidate, RecoveryError, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
 };
 use ui::{Blend, UiFrame};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing, UPKEEP_INTERVAL};
 use crate::camera::{Arcball, Boundary, Camera, Pixel};
-use crate::dialogs::{Action, Claim, Dialogs, Facts};
+use crate::dialogs::{Action, Claim, Dialogs, Facts, LastStroke};
 use crate::navigate::{Button, Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
@@ -481,6 +481,15 @@ pub(crate) trait Brush {
     /// before it. `None` with no pen drawing.
     fn next_sample_due(&self) -> Option<Instant> {
         None
+    }
+
+    /// Takes on `stroke`, the stroke a restore found still landing ([`Project::take_open_stroke`]),
+    /// before any step: resumed in the project ([`Project::resume_stroke`]), its dabs shown at
+    /// once and landing as a stroke whose pen has lifted, a new stroke waiting behind it. Returns
+    /// whether it did; one it doesn't is closed by the project's next stroke, its dabs not landed
+    /// lost. By default none is taken on.
+    fn resume(&mut self, _context: BrushContext<'_>, _stroke: OpenStroke) -> bool {
+        false
     }
 
     /// The window was asked to close: lifts the pen of any open stroke, and has the brush land
@@ -1261,6 +1270,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// A recovery file set aside by Use last save: removed by a stroke or a save, which end the
     /// way back to it, and only then.
     kept_recovery: Option<PathBuf>,
+    /// What became of the stroke a restore found still landing ([`Owner::resume_stroke`]): the
+    /// restore note says if it can't be finished.
+    last_stroke: LastStroke,
     /// What the UI shows.
     dialogs: Dialogs,
 }
@@ -1493,6 +1505,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             copying: None,
             since_opening: SinceOpening::Untouched,
             kept_recovery: None,
+            last_stroke: LastStroke::Whole,
             dialogs,
         }
     }
@@ -1739,10 +1752,47 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         !self.pen_queued(now) && (guarded || !self.unsaved())
     }
 
-    /// Says at `now` what opening found.
+    /// Says at `now` what opening found, and of a restore, whether its last stroke can be
+    /// finished ([`Owner::resume_stroke`]).
     pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
-        self.dialogs.note(note, now);
+        self.dialogs.note(note, self.last_stroke, now);
         self.scheduler.want(Reason::Overlay);
+    }
+
+    /// Hands the brush the stroke a restore found still landing, if there was one
+    /// ([`Project::take_open_stroke`], [`Brush::resume`]): before any frame, so it is on screen
+    /// in the first, and no stroke or edit can come before it. A journal the project can't use,
+    /// or a stroke the brush doesn't take on, leaves the restored tiles standing, as without a
+    /// journal: it is said on stderr, and the restore note says the last stroke couldn't be
+    /// finished ([`LastStroke::Unfinished`]). The project's next stroke closes it in the file.
+    ///
+    /// Every project the app starts on goes through here ([`crate::start`]); one not restored has
+    /// no stroke to take.
+    pub(crate) fn resume_stroke(&mut self) {
+        let Some(found) = self.project.take_open_stroke() else {
+            return;
+        };
+        let resumed = match found {
+            Ok(stroke) => {
+                let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
+                let taken = size.is_some_and(|size| {
+                    self.with_brush(size, |brush, context| brush.resume(context, stroke))
+                });
+                if !taken {
+                    saving::log("brushcraft: the last stroke couldn't be taken on to finish");
+                }
+                taken
+            }
+            Err(why) => {
+                let why = anyhow::Error::new(why);
+                saving::log(&format!("brushcraft: the last stroke's journal: {why:#}"));
+                false
+            }
+        };
+        if !resumed {
+            self.last_stroke = LastStroke::Unfinished;
+        }
+        self.scheduler.want(Reason::Stroke);
     }
 
     /// What the window must do next, if anything. A reopen asked for is looked at again: a stroke
@@ -1762,12 +1812,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Whether the project can be swapped for another: nothing has been drawn since opening, or
     /// is about to be, and no save or close is under way. A note is up only then, as a stroke
     /// puts it away, but a sample may be waiting for its frame.
+    ///
+    /// A stroke a restore found still landing doesn't hold it back: the project closing keeps its
+    /// journal at the count landed ([`Project::close`]), so reopening the recovery file restores
+    /// it again, and the user's choice can still be undone. Nothing else lands with no stroke
+    /// since opening.
     fn may_reopen(&self) -> bool {
         let drawing = self.since_opening == SinceOpening::Stroked
             || self.stroking.queued
             || self.stroke_open()
-            || self.brush.pen_down()
-            || self.landing() > 0;
+            || self.brush.pen_down();
         !drawing && self.saving.stage().is_none() && !self.closing()
     }
 
@@ -3846,13 +3900,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Closes the project so another can take over, once the render thread has settled: the file
     /// lock goes with it. Nothing is flushed or landed, as nothing was drawn
-    /// ([`Owner::may_reopen`]), and the recovery file stays if it has edits no save holds.
+    /// ([`Owner::may_reopen`]), and the recovery file stays if it has edits no save holds, or the
+    /// journal of a stroke a restore found still landing (none of its dabs may have landed yet).
     ///
     /// # Errors
     ///
     /// As [`Project::close`]: the recovery file is kept then.
     pub(crate) fn close_for_reopen(self) -> Result<Carried<B>> {
         let pen_down = self.dialogs.pen_is_down();
+        let landing = self.landing() > 0;
         let Self {
             mut project,
             cursor,
@@ -3876,7 +3932,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ..
         } = self;
         project.store().unsubscribe_stale(cursor);
-        let keep = project.has_unsaved_edits();
+        let keep = landing || project.has_unsaved_edits();
         project.close(keep).context("closing the project")?;
         Ok(Carried {
             brush,
@@ -3963,6 +4019,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     #[cfg(test)]
     pub(crate) const fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// The bar the UI shows, if any.
+    #[cfg(test)]
+    pub(crate) fn bar(&self) -> Option<ui::Bar<Action>> {
+        self.dialogs.bar()
     }
 
     /// The brush.

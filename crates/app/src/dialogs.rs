@@ -130,6 +130,24 @@ impl Status {
     }
 }
 
+/// What became of the stroke a restore found still landing, which the restore note tells of (the
+/// dab journal spec, "Errors").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LastStroke {
+    /// None was found still landing, or one was and the brush took it on to finish: the note says
+    /// only when the work dates from.
+    #[default]
+    Whole,
+    /// One was found and can't be finished (its journal unusable, its dabs of another layout, or
+    /// the brush unable to take it on): the tiles as the restored save point holds them stand,
+    /// and the note says so ([`UNFINISHED_STROKE`]).
+    Unfinished,
+}
+
+/// The restore note's detail when the last stroke can't be finished ([`LastStroke::Unfinished`]).
+pub(crate) const UNFINISHED_STROKE: &str =
+    "Your last stroke couldn't be finished; the rest of your work is back.";
+
 /// What the bottom bar is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Prompt {
@@ -156,6 +174,9 @@ enum Prompt {
         /// When the work dates from, as [`said_when`] says it; `None` if the system clock can't
         /// say.
         said: Option<String>,
+        /// What became of the stroke the restore found still landing: one that can't be finished
+        /// is the detail in place of `said`.
+        last: LastStroke,
         /// When the note goes by itself.
         until: Instant,
     },
@@ -210,11 +231,15 @@ impl Prompt {
                 let cancel = quiet("Cancel", Action::Cancel);
                 Some(Bar::new(title, vec![cancel]).with_progress(progress(*left, *from)))
             }
-            Self::Restored { said, .. } => {
+            Self::Restored { said, last, .. } => {
                 let controls = vec![quiet("Use last save instead", Action::UseLastSave)];
+                let detail = match last {
+                    LastStroke::Whole => said.as_deref(),
+                    LastStroke::Unfinished => Some(UNFINISHED_STROKE),
+                };
                 Some(detailed(
                     Bar::new("Your unsaved work is back", controls),
-                    said.as_deref(),
+                    detail,
                 ))
             }
             Self::EarlierVersion { said, .. } => {
@@ -517,11 +542,14 @@ impl Dialogs {
         self.show_prompt(now);
     }
 
-    /// Says what opening found; with the bar saying a failure, once that is answered.
-    pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
+    /// Says what opening found, `last` what became of the stroke a restore found still landing (a
+    /// note of work not restored has none to tell of); with the bar saying a failure, once that
+    /// is answered.
+    pub(crate) fn note(&mut self, note: &OpenNote, last: LastStroke, now: Instant) {
         let prompt = match note {
             OpenNote::Restored { when, .. } => Prompt::Restored {
                 said: said_now(*when),
+                last,
                 until: now + Theme::GLASS.note_hold,
             },
             OpenNote::EarlierVersion { candidate } => Prompt::EarlierVersion {
@@ -1151,7 +1179,7 @@ mod tests {
     fn a_note_comes_back_after_crash_protection_stopping() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
         assert!(dialogs.can_tell_of_stopping(), "a note only tells");
         dialogs.protection_stopped(SaveTrouble::Other, now);
         assert!(dialogs.says_stopped());
@@ -1191,7 +1219,7 @@ mod tests {
         let mut dialogs = dialogs(now);
         let error = anyhow::anyhow!("no room");
         dialogs.failed(SaveFailure::of_copy(&error), now);
-        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
         assert!(dialogs.failing(), "the failure comes first");
         assert!(!dialogs.noting());
         dialogs.dismiss(now);
@@ -1204,7 +1232,7 @@ mod tests {
     fn a_failure_over_a_note_gives_it_back() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
         dialogs.failed(full_disk(), now);
         assert!(dialogs.failing());
         assert_eq!(dialogs.answer_failure(now), Some(full_disk()));
@@ -1216,7 +1244,7 @@ mod tests {
     fn clearing_the_bar_takes_a_note_behind_it_too() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
         dialogs.failed(full_disk(), now);
         dialogs.clear_prompt(now);
         assert!(!dialogs.routes(), "no bar");
@@ -1585,7 +1613,7 @@ mod tests {
         let now = Instant::now();
         let when = SystemTime::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(when), now);
+        dialogs.note(&restored(when), LastStroke::Whole, now);
         let last_save = Control {
             label: "Use last save instead".to_owned(),
             action: Action::UseLastSave,
@@ -1597,10 +1625,25 @@ mod tests {
     }
 
     #[test]
+    fn a_last_stroke_that_cant_be_finished_is_the_notes_detail() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Unfinished, now);
+        let last_save = Control {
+            label: "Use last save instead".to_owned(),
+            action: Action::UseLastSave,
+            emphasis: Emphasis::Quiet,
+        };
+        let bar = Bar::new("Your unsaved work is back", vec![last_save])
+            .with_detail("Your last stroke couldn't be finished; the rest of your work is back.");
+        assert_eq!(dialogs.bar(), Some(bar));
+    }
+
+    #[test]
     fn the_note_leaves_after_ten_seconds_and_says_when_to_come_back() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
         let almost = now + Duration::from_millis(9_999);
         let until = now + Duration::from_secs(10);
         assert_eq!(dialogs.next_change(), Some(until), "the idle loop wakes");
@@ -1617,7 +1660,7 @@ mod tests {
     fn a_note_and_a_saved_chip_say_the_sooner_of_the_two() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
         dialogs.saved(now);
         assert_eq!(dialogs.next_change(), Some(now + hold()), "the chip first");
     }
@@ -1626,7 +1669,7 @@ mod tests {
     fn the_close_bar_taking_over_stops_the_notes_clock() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
         dialogs.ask_close("first-sculpt", now);
         let later = now + Duration::from_secs(11);
         dialogs.update(EDITED, later);
@@ -1652,7 +1695,7 @@ mod tests {
         let now = Instant::now();
         let when = SystemTime::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&earlier(when), now);
+        dialogs.note(&earlier(when), LastStroke::Whole, now);
         let ignore = Control {
             label: "Ignore".to_owned(),
             action: Action::Ignore,
@@ -1677,11 +1720,11 @@ mod tests {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
         assert_eq!(dialogs.begin_copy(now), None, "nothing to copy");
-        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
         assert_eq!(dialogs.begin_copy(now), None, "nor with this note");
         assert!(dialogs.says_restored(), "which stays");
 
-        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
         let found = dialogs.begin_copy(now).expect("what was found");
         assert_eq!(found.path, std::path::Path::new("recovery.bcrf"));
         assert_eq!(dialogs.bar(), Some(Bar::new("Saving", Vec::new())));
@@ -1694,7 +1737,7 @@ mod tests {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
         dialogs.pen_down(now);
-        dialogs.note(&restored(SystemTime::now()), now);
+        dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
         assert!(!bar_rising(&mut dialogs, now), "nothing shows");
         dialogs.pen_up(now);
         assert!(bar_rising(&mut dialogs, now), "here it comes");
@@ -1720,10 +1763,10 @@ mod tests {
             let close = [Action::DontSave, Action::KeepSculpting, Action::Save];
             assert_controls_found(&dialogs, &close, seen, scale);
 
-            dialogs.note(&restored(SystemTime::now()), now);
+            dialogs.note(&restored(SystemTime::now()), LastStroke::Whole, now);
             assert_controls_found(&dialogs, &[Action::UseLastSave], seen, scale);
 
-            dialogs.note(&earlier(SystemTime::now()), now);
+            dialogs.note(&earlier(SystemTime::now()), LastStroke::Whole, now);
             let found = [Action::Ignore, Action::OpenCopy];
             assert_controls_found(&dialogs, &found, seen, scale);
         }

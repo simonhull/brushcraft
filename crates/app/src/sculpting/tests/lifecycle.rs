@@ -330,9 +330,11 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting, op: OpId) -> Pending {
     let down = sample(Phase::Down, (160.0, 100.0), 0.5);
     Pending {
         engine: None,
-        settings: brush.settings.clone(),
-        camera: stroke_camera(camera, &view),
-        samples: Vec::new(),
+        record: Some(Recording {
+            settings: brush.settings.clone(),
+            camera: stroke_camera(camera, &view),
+            samples: Vec::new(),
+        }),
         op,
         landed: 0,
         dabs: VecDeque::from([Dab::default()]),
