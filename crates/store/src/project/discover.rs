@@ -28,8 +28,11 @@ pub(super) fn past(
     Ok(store)
 }
 
-/// The head ops of the recovery files of `project` in `dir`, on any save point: the newest
-/// edit each would restore, which a new session's ops must be newer than.
+/// The newest ops of the recovery files of `project` in `dir`, on any save point.
+///
+/// Each is [`ProjectFile::last_op`] (the head, or a stroke still landing that has landed
+/// nothing): the newest work the file would restore, which a new session's ops must be newer
+/// than.
 ///
 /// Best effort, and read-only: a missing or unreadable `dir` has none, and a file a running
 /// instance holds, or one that can't be read, is passed over. A file that can't be read is
@@ -45,7 +48,7 @@ pub(super) fn recovery_heads(dir: &Path, project: ProjectId) -> Vec<Option<OpId>
         .filter(|entry| entry.file_name().to_str().and_then(recovery_name) == Some(project))
         .filter_map(|entry| ProjectFile::inspect(&entry.path()).ok())
         .filter(|file| file.meta().project() == project)
-        .map(|file| file.head())
+        .map(|file| file.last_op())
         .collect()
 }
 
@@ -221,7 +224,7 @@ fn candidate(path: PathBuf, named: ProjectId, modified: SystemTime) -> Option<Re
         project: named,
         base,
         base_path: meta.base_path().map(Path::to_path_buf),
-        last_edit: file.head().max(file.landing_stroke()),
+        last_edit: file.last_op(),
         modified,
         status,
         path,

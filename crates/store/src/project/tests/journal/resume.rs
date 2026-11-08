@@ -810,6 +810,56 @@ fn a_journal_with_no_dab_landed_is_unsaved_work_and_restores() {
     again.close(false).unwrap();
 }
 
+/// Crashes a saved project with a stroke of 10 dabs placed and none landed, flushed: its
+/// recovery file holds the stroke's journal and no edit. Returns the stroke.
+fn crash_unlanded(dir: &TestDir, map: &mut CorrectionMap, seed: u64) -> Stroke {
+    let mut project = new_project(dir);
+    stroke(&mut project, map, 100, seed);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    let mut landing = begin_on_top(&mut project, 10, seed + 1);
+    landing.place(&mut project, 10);
+    flush(&mut project);
+    drop(project);
+    landing
+}
+
+#[test]
+fn a_resumed_stroke_that_landed_nothing_never_has_its_op_handed_out_again() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let landing = crash_unlanded(&dir, &mut map, 96);
+    let mut restored = restore(&dir);
+    let open = restored.take_open_stroke().unwrap().unwrap();
+    let mut resumed = going_on(landing, &open);
+    restored.resume_stroke(open).unwrap();
+    resumed.land(&mut restored, &mut map, 10);
+    restored.end_unrecorded_stroke().unwrap();
+    let next = restored.begin_stroke().unwrap();
+    assert!(
+        next > resumed.op,
+        "{next:?} after the resumed {:?}",
+        resumed.op
+    );
+    restored.end_unrecorded_stroke().unwrap();
+    restored.close(false).unwrap();
+}
+
+#[test]
+fn a_restored_stroke_never_resumed_that_landed_nothing_never_has_its_op_handed_out_again() {
+    // The next stroke begins straight away, the restored one never resumed.
+    let dir = TestDir::new();
+    let landing = crash_unlanded(&dir, &mut CorrectionMap::new(), 97);
+    let mut restored = restore(&dir);
+    let next = restored.begin_stroke().unwrap();
+    assert!(
+        next > landing.op,
+        "{next:?} after the restored {:?}",
+        landing.op
+    );
+    restored.end_unrecorded_stroke().unwrap();
+    restored.close(false).unwrap();
+}
+
 #[test]
 fn a_damaged_pen_down_tile_record_restores_the_tiles_alone() {
     let dir = TestDir::new();

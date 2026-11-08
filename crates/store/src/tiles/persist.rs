@@ -122,7 +122,7 @@ impl TileStore {
         let cache_caps = crate::jobs::CacheCaps::of(shares.caches);
         let next_op = first_op(
             config.site,
-            [working.head(), base.as_ref().and_then(BaseFile::head)],
+            [working.last_op(), base.as_ref().and_then(BaseFile::head)],
         )?;
         let since_rebase = unsaved_in(&working);
         let bounds = book_of(&working, base.as_ref())?;
@@ -476,7 +476,7 @@ impl TileStore {
         }
         let next_op = match self.next_op {
             Some(op) => {
-                let after = first_op(op.site(), [working.head(), base.head()])?;
+                let after = first_op(op.site(), [working.last_op(), base.head()])?;
                 Some(op.max(after))
             }
             None => None,

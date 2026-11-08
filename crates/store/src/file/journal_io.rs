@@ -11,8 +11,8 @@ use std::os::unix::fs::FileExt;
 use super::error::FileError;
 use super::lock::Access;
 use super::{Loc, ProjectFile};
-use crate::journal::{DabBatch, MAX_JOURNAL_PAYLOAD};
-use crate::record::{HEAD, Head, KIND_JOURNAL, TAIL, frame, verify};
+use crate::journal::{BATCH_HEAD_BYTES, DabBatch, MAX_JOURNAL_PAYLOAD};
+use crate::record::{HEAD, Head, KIND_JOURNAL, TAIL, frame, parse_head, verify};
 
 /// The longest framed batch: framing around the longest payload a writer makes.
 ///
@@ -138,11 +138,39 @@ impl ProjectFile {
     /// Such a stroke is work a restore brings back even with no tile edit in the file (a stroke
     /// that had landed nothing), so the file isn't empty (see
     /// [`crate::RecoveryCandidate::last_edit`]). Whether a restore can use it is the restore's to
-    /// say (see `crate::project::resume`); this reads one batch.
+    /// say (see `crate::project::resume`).
+    ///
+    /// This reads the last batch's record head and fixed fields alone, checked as a read checks
+    /// them ([`DabBatch::decode_head`]), never its dabs, so it costs a few dozen bytes however
+    /// large the batch. Its checksum covers the whole record, so it isn't checked: a damaged
+    /// head that still parses can only give an op no stroke had, which makes the file count as
+    /// holding work and moves a new session's ops past it, never loses work or hands an op out
+    /// twice. A restore reads the batch whole, checked.
     pub(crate) fn landing_stroke(&self) -> Option<crate::OpId> {
         let last = self.batch_locations().last()?;
-        let batch = self.read_batch(last).ok()?;
-        (batch.landed() < batch.placed()).then(|| batch.op())
+        let mut bytes = [0; HEAD + BATCH_HEAD_BYTES];
+        let whole = u64::try_from(bytes.len() + TAIL).ok()?;
+        if last.len < whole {
+            return None;
+        }
+        self.file.read_exact_at(&mut bytes, last.offset).ok()?;
+        let (head, fields) = bytes.split_first_chunk::<HEAD>()?;
+        if parse_head(*head)?.kind != KIND_JOURNAL {
+            return None;
+        }
+        let batch = DabBatch::decode_head(fields).ok()?;
+        (batch.landed < batch.placed()).then_some(batch.op)
+    }
+
+    /// The newest op the file's state holds work of: its head ([`ProjectFile::head`]), or the
+    /// op of the stroke its journal leaves landing ([`ProjectFile::landing_stroke`]) if that is
+    /// greater. A stroke that has landed nothing has no tile record, so the head alone misses
+    /// it; a restore brings it back all the same.
+    ///
+    /// Every reader of a file's newest op takes it from here: the op generator, which must never
+    /// hand that stroke's op out again, and the recovery listing's last edit.
+    pub(crate) fn last_op(&self) -> Option<crate::OpId> {
+        self.head().max(self.landing_stroke())
     }
 
     /// Reads every batch of the file's state, in the order they were written: for tools, tests

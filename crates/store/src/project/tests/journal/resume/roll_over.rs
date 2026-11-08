@@ -161,21 +161,22 @@ fn a_damaged_fill_save_point_restores_the_pen_down_cut_consistently() {
     let mut project = Project::new((*mesh).clone(), displayed(&dir)).unwrap();
     project.set_dab_format(FORMAT);
     let (mut index, _) = project.load_index(bounds::top(), |_, _| {}).unwrap();
-    // A stroke saved into the project file with its bounds and display tiles, and one since in
-    // the recovery file alone: the project file's are stale for the tiles the recovery file holds.
-    for (seed, saved) in [(98, true), (99, false)] {
-        let layer = display_layer(project.store());
-        project.store().record_display(&layer).unwrap();
-        stroke(&mut project, &mut map, 300, seed);
-        index
-            .update(project.store(), &tiles(&mesh, TOP, TOP))
-            .unwrap();
-        if saved {
-            assert_saved(project.save_as(&dir.path("p.bcrf")));
-        } else {
-            flush(&mut project);
-        }
-    }
+    // A stroke saved into the project file with its bounds and display tiles, all known and
+    // current, then a small one since, in the recovery file alone: the project file's bounds and
+    // display tiles are stale for some of the tiles the recovery file holds, and current for the
+    // rest.
+    stroke(&mut project, &mut map, 300, 98);
+    index
+        .update(project.store(), &tiles(&mesh, TOP, TOP))
+        .unwrap();
+    let layer = display_layer(project.store());
+    project.store().record_display(&layer).unwrap();
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    stroke(&mut project, &mut map, 6, 99);
+    index
+        .update(project.store(), &tiles(&mesh, TOP, TOP))
+        .unwrap();
+    flush(&mut project);
     let found = map.clone();
     let mut landing = begin_on_top(&mut project, 30, 100);
     live_shapes(&mut project, &landing);

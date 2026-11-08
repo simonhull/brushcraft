@@ -328,8 +328,27 @@ impl DabBatch {
     /// [`JournalError::Frame`], [`JournalError::PastLastIndex`] or
     /// [`JournalError::LandedPastPlaced`].
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, JournalError> {
-        let mut reader = Reader::new(payload);
-        let fixed = reader.take(FIXED).ok_or(JournalError::Short)?;
+        let head = Self::decode_head(payload)?;
+        let count = usize::try_from(head.count).unwrap_or(usize::MAX);
+        let frame = payload.get(FIXED..).ok_or(JournalError::Short)?;
+        let planes = decompress_frame(frame, count * DAB_BYTES).or(Err(JournalError::Frame))?;
+        let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count)
+            .ok_or(JournalError::Frame)?
+            .collect();
+        Ok(
+            Self::new(head.op, head.first, head.landed, head.pen_down, dabs)?
+                .with_dab_format(head.dab_format),
+        )
+    }
+
+    /// The fixed fields at the start of `payload`, a batch's payload or only its first
+    /// [`BATCH_HEAD_BYTES`], checked as [`DabBatch::decode`] checks them, without the dabs.
+    ///
+    /// # Errors
+    ///
+    /// As [`DabBatch::decode`], but for [`JournalError::Frame`]: the dabs aren't read.
+    pub(crate) fn decode_head(payload: &[u8]) -> Result<BatchHead, JournalError> {
+        let fixed = payload.get(..FIXED).ok_or(JournalError::Short)?;
         let mut fields = Reader::new(fixed);
         let [version, r0, r1, r2] = fields.u32().ok_or(JournalError::Short)?.to_le_bytes();
         if version != VERSION {
@@ -350,12 +369,48 @@ impl DabBatch {
         let tag = fields.u8().ok_or(JournalError::Short)?;
         let offset = fields.u64().ok_or(JournalError::Short)?;
         let pen_down = PenDown::from_parts(tag, offset).ok_or(JournalError::PenDown)?;
-        let planes =
-            decompress_frame(reader.rest(), count * DAB_BYTES).or(Err(JournalError::Frame))?;
-        let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count)
-            .ok_or(JournalError::Frame)?
-            .collect();
-        Ok(Self::new(op, first, landed, pen_down, dabs)?.with_dab_format(dab_format))
+        let placed = first
+            .checked_add(stated)
+            .ok_or(JournalError::PastLastIndex)?;
+        if landed > placed {
+            return Err(JournalError::LandedPastPlaced { landed, placed });
+        }
+        Ok(BatchHead {
+            op,
+            first,
+            landed,
+            count: stated,
+            pen_down,
+            dab_format,
+        })
+    }
+}
+
+/// The bytes of a batch payload's fixed fields: what [`DabBatch::decode_head`] reads.
+pub(crate) const BATCH_HEAD_BYTES: usize = FIXED;
+
+/// A batch's fixed fields, read without its dabs ([`DabBatch::decode_head`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchHead {
+    /// The stroke's op.
+    pub(crate) op: OpId,
+    /// The index of the batch's first dab.
+    pub(crate) first: u32,
+    /// The stroke's dabs landed at the flush's cut.
+    pub(crate) landed: u32,
+    /// The dabs it holds.
+    pub(crate) count: u32,
+    /// The stroke's pen-down save point.
+    pub(crate) pen_down: PenDown,
+    /// The rows' format.
+    pub(crate) dab_format: u32,
+}
+
+impl BatchHead {
+    /// The dabs the stroke had placed by the batch's last: its first index plus its count. The
+    /// head was checked not to run past the last index.
+    pub(crate) const fn placed(&self) -> u32 {
+        self.first.saturating_add(self.count)
     }
 }
 

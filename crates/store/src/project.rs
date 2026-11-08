@@ -1081,6 +1081,10 @@ impl Project {
     /// a stroke a restore found still landing and nobody has resumed or closed yet. The last two
     /// may hold no tile edit (a stroke that has landed nothing), but they are work the recovery
     /// file keeps: a close must keep it ([`Project::close`]).
+    ///
+    /// A save ([`Project::save`], [`Project::save_as`]) made while a restored stroke is neither
+    /// resumed nor closed drops it: the save moves the project onto a new recovery file, which
+    /// holds none of its batches, and the stroke resumes no more. Resume it first to keep it.
     #[must_use]
     pub fn has_unsaved_edits(&self) -> bool {
         let unresumed = self
@@ -1374,9 +1378,10 @@ impl Project {
         self.end_stroke_at(Instant::now())
     }
 
-    /// A stroke ended with no record of it: as [`Project::end_stroke`] otherwise. For tools,
-    /// tests and benches only, whose edits no pen made; the app's strokes end with
-    /// [`Project::end_stroke`].
+    /// A stroke ended with no record of it: as [`Project::end_stroke`] otherwise. For a stroke
+    /// resumed after a restore ([`Project::resume_stroke`]), whose journal holds no pen samples
+    /// to record, once every dab has landed; and for tools, tests and benches, whose edits no pen
+    /// made. The app's live strokes end with [`Project::end_stroke`].
     ///
     /// # Errors
     ///
