@@ -285,7 +285,7 @@ fn assert_records(file: &ProjectFile, seeds: &[u64], what: &str) {
 /// Begins the stroke with `seed`, applies its `count` edits to the project's store, as dabs of
 /// its one op, and refits `index` to every tile of its level.
 fn edit(project: &mut Project, index: &mut SpatialIndex, count: u32, seed: u64) {
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     edit_and_refit(project.store(), index, count, seed);
 }
 
@@ -724,7 +724,7 @@ fn journal_child() {
     };
     let mut project = Project::new((*mesh()).clone(), config).unwrap();
     let mesh = project.store().working().mesh();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let start = Instant::now();
     let mut ready = false;
     let (mut placed, mut landed) = (0, 0);

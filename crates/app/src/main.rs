@@ -798,7 +798,7 @@ mod tests {
 
     /// Makes one edit of `project` as a stroke does, moving a vertex by `lift`.
     fn edit_by(project: &mut Project, lift: f32) {
-        project.begin_stroke().expect("begun");
+        project.begin_stroke_and_wait().expect("begun");
         let edited = project.store().edit_tile(edited_tile(), |tile| {
             tile.set(1, 1, Vec3::new(0.0, 0.0, lift))
         });
@@ -848,7 +848,7 @@ mod tests {
     /// Journals a dab of a stroke begun on `project`, and closes it keeping its recovery file:
     /// returns the batches' dab formats.
     fn journalled_formats(mut project: Project) -> Vec<u32> {
-        project.begin_stroke().expect("begun");
+        project.begin_stroke_and_wait().expect("begun");
         project
             .journal(&[[0; store::DAB_BYTES]])
             .expect("journalled");
@@ -1545,7 +1545,7 @@ mod tests {
 
     /// An edit of another vertex than `edit_by`'s.
     fn project_edit_elsewhere(project: &mut Project) {
-        project.begin_stroke().expect("begun");
+        project.begin_stroke_and_wait().expect("begun");
         let edited = project.store().edit_tile(edited_tile(), |tile| {
             tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5))
         });

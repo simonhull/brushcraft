@@ -194,7 +194,7 @@ impl Ridge {
             radius,
             stroke,
         };
-        ridge.project.begin_stroke().expect("stroke");
+        ridge.project.begin_stroke_and_wait().expect("stroke");
         while ridge.placed < dabs {
             let pair = [ridge.next_dab(), ridge.next_dab()];
             ridge.apply(&pair);
@@ -323,7 +323,7 @@ fn sculpt_octave(project: &mut Project, level: Level) {
             })
         })
         .collect();
-    project.begin_stroke().expect("stroke");
+    project.begin_stroke_and_wait().expect("stroke");
     let store = project.store();
     store
         .evaluate_many(&keys, Evaluation::Positions)

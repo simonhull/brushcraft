@@ -22,7 +22,9 @@
 //! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) as the stroke does, at its `Down`
 //!   once the engine finds the surface under it, before it places a dab: so every edit of the
 //!   store's current op is that stroke's, and its journal is open for its first dab ("The journal"
-//!   below). A stroke whose op can't begin doesn't begin either, its samples dropped.
+//!   below). It begins without waiting; its first landing may have to wait for its pen-down cut
+//!   ("The first landing waits for its cut", below). A stroke whose op can't begin doesn't begin
+//!   either, its samples dropped.
 //! - **A stroke begins on what the last one left:** it reads its pen-down surface (the brush-engine
 //!   spec), which is the surface once every stroke before it has landed. So a pen `Down` while an
 //!   earlier stroke still has dabs to apply (its pen lifted) waits, with every event after it, and
@@ -124,13 +126,13 @@
 //! - A journal call that fails means the brush's bookkeeping broke: it ends the stroke as a store
 //!   error does ("Errors" below).
 //! - **The first landing waits for its cut.** A stroke's op begins ahead
-//!   ([`Project::begin_stroke_ahead`]): when strokes come back to back, a save point at the
-//!   stroke's pen-down surface is the flush's queued behind the one in flight, and until that flush
-//!   has taken its cut the stroke may not land ([`Project::may_land`]). Its dabs are placed,
-//!   journalled and shown ahead meanwhile, as when the budget doesn't fit, and none is applied; the
-//!   frame loop's ticks and polls drive the flushes ([`Project::tick`]), so it may land within the
-//!   flush in flight's syncs, and lands then. A close's or a save's landing, which has no frames to
-//!   wait for, waits for the cut ([`Project::wait_to_land`]).
+//!   ([`Project::begin_stroke`]): when strokes come back to back, a save point at the stroke's
+//!   pen-down surface is the flush's queued behind the one in flight, and until that flush has
+//!   taken its cut the stroke may not land ([`Project::may_land`]). Its dabs are placed, journalled
+//!   and shown ahead meanwhile, as when the budget doesn't fit, and none is applied; the frame
+//!   loop's ticks and polls drive the flushes ([`Project::tick`]), so it may land within the flush
+//!   in flight's syncs, and lands then. A close's or a save's landing, which has no frames to wait
+//!   for, waits for the cut ([`Project::wait_to_land`]).
 //!
 //! # Warming under a hovering pen
 //!
@@ -160,7 +162,7 @@
 //!   engine stroke; one that refuses a landed count drops the stroke's dabs left after the batch
 //!   applied, so the stroke ends in that call, its journal closed by the store before any cut could
 //!   pair the batch's edits with the count before it;
-//! - an op that can't begin ([`Project::begin_stroke_ahead`]) starts no stroke;
+//! - an op that can't begin ([`Project::begin_stroke`]) starts no stroke;
 //! - a record [`Project::end_stroke`] refuses ([`ProjectError::Cache`],
 //!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
 //!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
@@ -1080,7 +1082,7 @@ impl Sculpting {
     }
 
     /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it,
-    /// and begins its op ahead ([`Project::begin_stroke_ahead`]): with none under way
+    /// and begins its op ahead ([`Project::begin_stroke`]): with none under way
     /// ([`Sculpting::admit`] holds a `Down` back until then). It lands once it may (see "The
     /// journal" in the module notes).
     fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
@@ -1106,7 +1108,7 @@ impl Sculpting {
             return;
         };
         // Before its first dab: the op's journal takes every dab it places.
-        let op = match scene.project.begin_stroke_ahead() {
+        let op = match scene.project.begin_stroke() {
             Ok(op) => op,
             Err(error) => {
                 // No op, so nothing of it can be applied: it is dropped.

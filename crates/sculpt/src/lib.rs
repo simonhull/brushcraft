@@ -27,10 +27,11 @@
 //! - [`StoreSurface`] is the store's pen-down surface as the stroke engine's [`stroke::Surface`]:
 //!   raycasts through the index, the stroke's connected region near a point, and area normals.
 //!
-//! Dabs are part of the stroke their caller has begun: [`store::Project::begin_stroke`] before
-//! the first, [`store::Project::end_stroke`] after the last, so every dab of the stroke is one
-//! op, and the store keeps the stroke's pen-down shapes from the first until the last. Every call
-//! takes the session's one [`Stroke`], which starts afresh when the op changes.
+//! Dabs are part of the stroke their caller has begun: [`store::Project::begin_stroke_and_wait`]
+//! before the first (or [`store::Project::begin_stroke`], and the first only once
+//! [`store::Project::may_land`]), [`store::Project::end_stroke`] after the last, so every dab of
+//! the stroke is one op, and the store keeps the stroke's pen-down shapes from the first until the
+//! last. Every call takes the session's one [`Stroke`], which starts afresh when the op changes.
 //!
 //! No GPU or windowing code: everything here runs headless.
 

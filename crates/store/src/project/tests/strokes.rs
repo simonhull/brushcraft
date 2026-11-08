@@ -13,7 +13,7 @@ fn recorded_stroke(
     seed: u64,
 ) -> StrokeRecord {
     let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
-    let op = project.begin_stroke().unwrap();
+    let op = project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), map, &edits);
     let record = wobbly(op, 30, seed);
     project.end_stroke(&record).unwrap();
@@ -91,7 +91,7 @@ fn each_strokes_record_goes_with_its_edits_into_every_file() {
 fn a_record_of_another_stroke_is_refused() {
     let dir = TestDir::new();
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
-    let op = project.begin_stroke().unwrap();
+    let op = project.begin_stroke_and_wait().unwrap();
     let other = wobbly(op.next().unwrap(), 5, 1);
     assert!(
         matches!(
@@ -175,7 +175,7 @@ fn a_save_in_the_middle_of_a_stroke_keeps_its_record_once() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
     let mesh = project.store().working().mesh();
-    let op = project.begin_stroke().unwrap();
+    let op = project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut map, &random_edits(&mesh, TOP, 40, 61));
     assert_saved(project.save_as(&path));
     // The save ended the store's op: the stroke's later edits take a new one.

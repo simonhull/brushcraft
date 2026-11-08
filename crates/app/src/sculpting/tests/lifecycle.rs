@@ -422,7 +422,7 @@ fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
         .expect("the sphere is under the middle");
     let near = pen_down_hit(&mut project, picker.index_mut(), edge - 4.0).expect("a hit");
     // The earlier stroke raises a bump at the silhouette, its pen-down shapes kept.
-    let op = project.begin_stroke().expect("a stroke");
+    let op = project.begin_stroke_and_wait().expect("a stroke");
     let mut state = sculpt::Stroke::new(project.store());
     let centre = near.position.to_f32();
     let outward = near.normal.to_f32();

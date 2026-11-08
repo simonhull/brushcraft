@@ -1078,20 +1078,23 @@ impl Project {
         self.store.working().meta().project()
     }
 
-    /// A stroke begins, and may land at once: [`Project::begin_stroke_ahead`], then
+    /// A stroke begins, and may land at once: [`Project::begin_stroke`], then
     /// [`Project::wait_to_land`] if its pen-down cut is still to be taken, which blocks for at
     /// most the flush in flight's syncs, and only when strokes come back to back. For tools,
     /// tests and benches that land a stroke's dabs as they make them; the app begins strokes ahead
     /// and lands once it may, so no frame waits.
     ///
-    /// A failure of the flushes on the way is reported as [`Project::begin_stroke_ahead`] says;
-    /// the stroke may land then all the same, its pen-down unknown.
+    /// The stroke may land once this returns, whatever the wait met.
     ///
     /// # Errors
     ///
-    /// As [`Project::begin_stroke_ahead`].
-    pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
-        let op = self.begin_stroke_ahead()?;
+    /// As [`Project::begin_stroke`]. What the wait meets is not returned: an old recovery file a
+    /// roll-over couldn't delete ([`ProjectError::OldRecoveryKept`]) is kept for the next call
+    /// that reports; a flush that fails (its pen-down then unknown) or a roll-over that fails is
+    /// dropped, the writer's to meet again with its next trigger and report then, as for
+    /// [`Project::begin_stroke`]'s own cut.
+    pub fn begin_stroke_and_wait(&mut self) -> Result<OpId, ProjectError> {
+        let op = self.begin_stroke()?;
         if !self.store.may_land() {
             let waited = self.drive_to_land();
             self.keep_report(waited);
@@ -1120,7 +1123,7 @@ impl Project {
     /// # Errors
     ///
     /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
-    pub fn begin_stroke_ahead(&mut self) -> Result<OpId, ProjectError> {
+    pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
         // Strokes don't overlap (see `crate::recovery`, "A stroke's first landing waits for its
         // cut"): a stroke landing while the next begins would edit past the next one's cut. A
         // stroke beginning while the last one lands is the next roadmap item, which must revisit
@@ -1139,7 +1142,7 @@ impl Project {
     }
 
     /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut (see
-    /// [`Project::begin_stroke_ahead`]). While it may not, the app places, journals and shows its
+    /// [`Project::begin_stroke`]). While it may not, the app places, journals and shows its
     /// dabs ahead, but applies none; the frame loop's [`Project::tick`] and [`Project::poll`] drive
     /// the flushes, so it may within the flush in flight's syncs, or at once with
     /// [`Project::wait_to_land`]. True with no stroke open.
@@ -1185,14 +1188,14 @@ impl Project {
     /// What a call that must go on met of crash protection: an old recovery file left undeleted
     /// is kept for the next call that reports ([`Project::report`]); anything else is the
     /// writer's to meet again with its next trigger, and to report then (see
-    /// [`Project::begin_stroke_ahead`]).
+    /// [`Project::begin_stroke`]).
     fn keep_report(&mut self, outcome: Result<(), ProjectError>) {
         if let Err(kept @ ProjectError::OldRecoveryKept { .. }) = outcome {
             self.kept = Some(kept);
         }
     }
 
-    /// The cut a stroke's op takes as it begins, at `now` (see [`Project::begin_stroke_ahead`]):
+    /// The cut a stroke's op takes as it begins, at `now` (see [`Project::begin_stroke`]):
     /// where its pen-down surface will be. Unknown with no writer (crash protection paused), or
     /// if the cut fails.
     ///

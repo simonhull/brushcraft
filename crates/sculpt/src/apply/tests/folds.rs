@@ -60,7 +60,7 @@ fn a_tall_stroke_on_a_rough_surface_folds_no_triangle() {
     let before = triangle_normals(project.store(), &keys);
 
     let mut stroke = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut least = 1.0_f32;
     for n in 0..RIDGE_DABS {
         let dab = next_dab(project.store(), &index, n);
@@ -186,7 +186,7 @@ fn sculpt_octave(project: &mut Project, level: Level) {
             })
         })
         .collect();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let store = project.store();
     store.evaluate_many(&keys, Evaluation::Positions).unwrap();
     for key in keys {

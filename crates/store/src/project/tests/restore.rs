@@ -491,7 +491,7 @@ fn a_save_leaves_a_file_with_an_equal_head() {
     stroke(&mut project, &mut map, 100, 121);
     assert_saved(project.save_as(&dir.path("p.bcrf")));
     let top = tiles(&mesh, TOP, TOP);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project
         .store()
         .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
@@ -542,7 +542,7 @@ fn discarding_leaves_a_file_with_an_equal_head() {
     stroke(&mut project, &mut map, 100, 121);
     assert_saved(project.save_as(&dir.path("p.bcrf")));
     let top = tiles(&mesh, TOP, TOP);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project
         .store()
         .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
@@ -599,7 +599,7 @@ fn a_save_leaves_a_head_passed_over_at_open() {
     first.close(false).unwrap();
     let top = tiles(&mesh, TOP, TOP);
     let mut crashed = Project::open(&path, config(&dir)).unwrap();
-    crashed.begin_stroke().unwrap();
+    crashed.begin_stroke_and_wait().unwrap();
     crashed
         .store()
         .edit_tile(top[5], |tile| tile.set(2, 2, Vec3::new(0.0, 0.0, 0.5)))
@@ -612,7 +612,7 @@ fn a_save_leaves_a_head_passed_over_at_open() {
     drop(crashed);
     fs::set_permissions(&other_session, fs::Permissions::from_mode(0o000)).unwrap();
     let mut next = Project::open(&path, config(&dir)).unwrap();
-    next.begin_stroke().unwrap();
+    next.begin_stroke_and_wait().unwrap();
     next.store()
         .edit_tile(top[30], |tile| tile.set(2, 2, Vec3::new(0.0, 0.5, 0.0)))
         .unwrap()

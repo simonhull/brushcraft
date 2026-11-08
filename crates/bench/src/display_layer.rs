@@ -308,7 +308,7 @@ fn refresh_stroke<J: Write, H: Write>(
         options.steps,
     )?;
     let mut state = Stroke::new(project.store());
-    project.begin_stroke()?;
+    project.begin_stroke_and_wait()?;
     let (mut steps, mut refreshes, mut built) = (Vec::new(), Vec::new(), Vec::new());
     let (mut longest, mut slices, mut long_slices) = (Duration::ZERO, 0, 0);
     for &centre in &plan.centres {
@@ -357,7 +357,7 @@ fn refresh_stroke<J: Write, H: Write>(
     ))?;
     // The same stroke again, its refresh run once at its end: what a refresh after the stroke
     // costs, the tiles the steps share built once.
-    project.begin_stroke()?;
+    project.begin_stroke_and_wait()?;
     for &centre in &plan.centres {
         let params = DrawParams::new(centre, centre, plan.radius, options.strength)?;
         draw_step(project.store(), index, &mut state, params)?;
@@ -407,7 +407,7 @@ fn paced_stroke<J: Write, H: Write>(
     let began = Instant::now();
     let (mut built, mut longest, mut late) = (0_usize, Duration::ZERO, 0_usize);
     let (mut slices, mut long_slices) = (0, 0);
-    project.begin_stroke()?;
+    project.begin_stroke_and_wait()?;
     for &centre in &plan.centres {
         let due = Instant::now() + period;
         let params = DrawParams::new(centre, centre, plan.radius, options.strength)?;

@@ -62,7 +62,7 @@ fn draw(project: &mut Project, index: &mut SpatialIndex, apply: bool) -> (Vec<Da
     let samples = samples();
     let (first, rest) = samples.split_first().unwrap();
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut down = StoreSurface::new(project.store(), index);
     let mut pen =
         PenStroke::begin(&settings, StrokeId::new(1), &camera, &mut down, *first).unwrap();

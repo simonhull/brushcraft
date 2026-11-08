@@ -469,7 +469,7 @@ fn a_stroke_shows_its_dabs_and_lands_none_until_its_cut_is_taken() {
     // editing after that cut, the flush still in flight (nothing polls the project between).
     let level = Level::new(LEVEL).expect("a level");
     let face = geom::FaceId::new(0);
-    let before = run.project.begin_stroke().expect("a stroke");
+    let before = run.project.begin_stroke_and_wait().expect("a stroke");
     let edit = |project: &mut Project, i: u32, z: f32| {
         project
             .store()

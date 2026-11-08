@@ -23,7 +23,7 @@ pub(super) fn indexed_stroke(
 ) {
     let mesh = project.store().working().mesh();
     let edits = random_edits(&mesh, TOP, 40, seed);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut CorrectionMap::new(), &edits);
     if refit {
         index
@@ -136,7 +136,7 @@ fn derived_bounds_skip_the_recovery_file_and_reach_the_saved_one() {
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
     let (_, loaded) = project.load_index(top(), |_, _| {}).unwrap();
     assert_eq!(loaded.stored, 0, "nothing stored: every bound computed");
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project.end_unrecorded_stroke().unwrap();
     poll_until_idle(&mut project);
     assert_eq!(
@@ -155,7 +155,7 @@ fn derived_bounds_skip_the_recovery_file_and_reach_the_saved_one() {
 /// Sets an interior vertex of `key` (a level-[`TOP`] tile) as a stroke of its own, refitting
 /// `index` to `refit` before the stroke ends.
 fn edit_interior(project: &mut Project, index: &mut SpatialIndex, key: TileKey, refit: &[TileKey]) {
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let region = Region::of_tile(&key);
     project
         .store()
@@ -277,7 +277,7 @@ fn a_bound_recorded_over_a_pending_edit_is_flushed() {
     // Saved, so the project file holds every bound; then an edit, refitted, streamed.
     assert_saved(project.save_as(&path));
     let key = all[9];
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let region = Region::of_tile(&key);
     project
         .store()

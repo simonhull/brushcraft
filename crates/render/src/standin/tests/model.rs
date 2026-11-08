@@ -301,7 +301,7 @@ impl Case {
             return;
         }
         let landing: Vec<stroke::Dab> = self.shown.drain(..count).collect();
-        self.project.begin_stroke().expect("a stroke");
+        self.project.begin_stroke_and_wait().expect("a stroke");
         sculpt::apply_dabs(
             self.project.store(),
             &mut self.index,
@@ -339,7 +339,7 @@ impl Case {
                 ..last
             });
         }
-        self.project.begin_stroke().expect("a stroke");
+        self.project.begin_stroke_and_wait().expect("a stroke");
         let applied = sculpt::apply_dabs(
             self.project.store(),
             &mut self.index,

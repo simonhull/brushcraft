@@ -161,7 +161,8 @@ fn area_normal(
 ///
 /// With `per_call` `None`, each dab is a [`draw_step`], the path the history measures; with
 /// `Some(n)`, the dabs go `n` to a call of [`apply_dabs`] (hardness 0, so the same draw brush),
-/// a frame's path, and each record is a call's. The calls run between [`Project::begin_stroke`]
+/// a frame's path, and each record is a call's. The calls run between
+/// [`Project::begin_stroke_and_wait`]
 /// and [`Project::end_unrecorded_stroke`], each watched as `detail` says. `stroke_state` is the
 /// session's one stroke state ([`Stroke`]), which starts afresh with the stroke.
 ///
@@ -187,7 +188,9 @@ pub(crate) fn stroke(
         Detail::Summary => Ok(None),
         Detail::PerStep => sys::minor_faults().map(Some),
     };
-    project.begin_stroke().context("beginning a stroke")?;
+    project
+        .begin_stroke_and_wait()
+        .context("beginning a stroke")?;
     let mut dabs = Vec::with_capacity(centres.len());
     let mut seq = 0_u32;
     for group in centres.chunks(per_call.unwrap_or(1)) {

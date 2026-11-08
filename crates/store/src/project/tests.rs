@@ -66,7 +66,7 @@ fn recovery_files(dir: &TestDir) -> Vec<String> {
 /// and to `map`, and ended.
 fn stroke(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64) {
     let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), map, &edits);
     project.end_unrecorded_stroke().unwrap();
 }
@@ -1324,7 +1324,7 @@ fn a_full_recovery_folder_is_not_tried_again_and_a_failed_file_takes_no_save_poi
 fn stroke_failing_its_sync(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64) {
     project.finish_flushes().unwrap();
     let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), map, &edits);
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     project.end_unrecorded_stroke().unwrap();
@@ -1386,7 +1386,7 @@ fn a_close_whose_last_sync_fails_still_deletes_the_recovery_file() {
 /// lost to a save or a roll-over leaves no twin disagreeing) in the project's store and in
 /// each of `maps`, and ended.
 fn interior(project: &mut Project, maps: &mut [&mut CorrectionMap], key: TileKey, c: Vec3) {
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project
         .store()
         .edit_tile(key, |edit| edit.set(5, 7, c))
@@ -1538,7 +1538,7 @@ fn a_save_goes_through_and_then_reports_what_is_unprotected() {
     project.finish_flushes().unwrap();
     // Edited again, its slot broken before the stroke ends: the flush leaves it out, and the
     // save copies its last record instead.
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project
         .store()
         .edit_tile(broken, |edit| edit.set(5, 7, Vec3::new(0.0, 0.0, 0.5)))

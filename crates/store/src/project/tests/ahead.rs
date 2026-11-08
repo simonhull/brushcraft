@@ -133,7 +133,7 @@ fn a_tile_lost_after_it_was_copied_stays_at_its_last_saved_state() {
         other,
         Vec3::new(0.25, 0.0, 0.0),
     );
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     project
         .store()
         .edit_tile(lost, |edit| edit.set(5, 7, Vec3::new(0.0, 0.0, 0.5)))
@@ -236,7 +236,7 @@ fn a_ticks_flush_between_slices_loses_nothing() {
         SaveAhead::Copying(_)
     ) {}
     let edits = random_edits(&project.store().working().mesh(), TOP, 60, 8);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut map, &edits);
     project
         .tick(Instant::now() + Duration::from_secs(5))

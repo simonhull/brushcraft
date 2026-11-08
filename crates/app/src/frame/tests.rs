@@ -162,7 +162,7 @@ impl Brush for OneEdit {
             return Ok(BrushReport::default());
         }
         let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST)?, 0, 0)?;
-        project.begin_stroke()?;
+        project.begin_stroke_and_wait()?;
         project
             .store()
             .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)))??;
@@ -2725,7 +2725,7 @@ impl Brush for Lands {
         }
         let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST)?, 0, 0)?;
         let project = context.project;
-        project.begin_stroke()?;
+        project.begin_stroke_and_wait()?;
         project
             .store()
             .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)))??;
@@ -4969,7 +4969,7 @@ fn left_work(dir: &TestDir) -> (PathBuf, ProjectConfig) {
 fn edit_one_tile(project: &mut Project) {
     let level = Level::new(FINEST).expect("a level");
     let key = TileKey::displacement(FaceId::new(0), level, 0, 0).expect("a tile");
-    project.begin_stroke().expect("begun");
+    project.begin_stroke_and_wait().expect("begun");
     let edited = project
         .store()
         .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)));

@@ -696,7 +696,7 @@ fn dabs_shown_from_a_distance_stand_in_at_once_and_catch_up_to_the_display_build
 
         // The catch-up lands them in two batches, then the refresh runs.
         let mut stroke = sculpt::Stroke::new(store);
-        project.begin_stroke().expect("a stroke");
+        project.begin_stroke_and_wait().expect("a stroke");
         for batch in dabs.chunks(3) {
             let landing = project.store();
             sculpt::apply_dabs(landing, &mut index, &mut stroke, batch).expect("applied");
@@ -802,7 +802,7 @@ fn dabs_shown_on_display_tiles_are_drawn_from_them_with_closed_seams_until_the_r
         );
 
         let mut stroke = sculpt::Stroke::new(store);
-        project.begin_stroke().expect("a stroke");
+        project.begin_stroke_and_wait().expect("a stroke");
         for batch in dabs.chunks(3) {
             let landing = project.store();
             sculpt::apply_dabs(landing, &mut index, &mut stroke, batch).expect("applied");
@@ -887,7 +887,7 @@ fn a_long_previewed_stroke_keeps_every_drawn_bound_true_and_flat_frame_by_frame_
         let resident: BTreeSet<Place> = display_tiles(gpu, &residency).keys().copied().collect();
         let mut preview = sculpt::Preview::new();
         let mut stroke = sculpt::Stroke::new(store);
-        project.begin_stroke().expect("a stroke");
+        project.begin_stroke_and_wait().expect("a stroke");
         let mut largest = Vec::new();
         let mut every = Vec::new();
         for (k, dab) in dabs.iter().enumerate() {

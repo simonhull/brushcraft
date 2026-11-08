@@ -304,7 +304,7 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
     let params = params(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
     let before = snapshot(project.store(), level);
 
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
     project.end_unrecorded_stroke().unwrap();
@@ -375,7 +375,7 @@ fn twins_stay_bit_identical() {
     let (mut project, mut index) = project(&dir, level);
     // On a cube corner, where three faces and many tiles meet.
     let corner = vertex(level, 0, 0, 0);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for (k, strength) in [0.04, -0.02, 0.03].into_iter().enumerate() {
         let shift = 0.05 * f32::from(u8::try_from(k).unwrap());
@@ -398,7 +398,7 @@ fn bounds_after_a_step_equal_bounds_built_from_scratch() {
     let level = Level::new(7).unwrap();
     let (mut project, mut index) = project(&dir, level);
     let params = params(vertex(level, 2, 100, 128), 0.2, 0.1).unwrap();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
     project.end_unrecorded_stroke().unwrap();
@@ -422,7 +422,7 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
     // weighed on the surface the stroke began on.
     let steps = [0.05, 0.03, -0.04, 0.06, 0.02];
     let mut oracle = OracleStroke::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for (k, strength) in (0_u32..).zip(steps) {
         let center = vertex(level, 4, 40 + 15 * k, 90 - 12 * k);
@@ -455,7 +455,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
     let mut map = CorrectionMap::new();
     let pen_down = map.clone();
     let mut oracle = OracleStroke::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     // On the pole, then off it so the falloff crosses it unevenly, pushing out and then in.
     for (k, (shift, strength)) in [(0.0, 0.05), (0.08, -0.03)].into_iter().enumerate() {
@@ -536,7 +536,7 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed >> 8) % below
         };
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         let mut stroke = Stroke::new(project.store());
         for k in 0..10 {
             // Near a face corner or a tile corner, a few vertices off it.
@@ -585,7 +585,7 @@ fn a_brush_away_from_the_surface_changes_nothing() {
     let level = Level::new(6).unwrap();
     let (mut project, mut index) = project(&dir, level);
     let before = snapshot(project.store(), level);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     let up = Vec3::new(0.0, 0.0, 1.0);
     let params = DrawParams::new(Vec3::new(0.0, 0.0, 0.0), up, 0.1, 1.0).unwrap();
@@ -751,7 +751,7 @@ fn light_dabs_move_a_tiles_interior_as_far_as_its_border() {
     let key = TileKey::displacement(FaceId::new(4), level, 0, 0).unwrap();
 
     // A strong dab alone makes the tile's scale large.
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut first = Stroke::new(project.store());
     let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), &mut index, &mut first, strong).unwrap();
@@ -762,7 +762,7 @@ fn light_dabs_move_a_tiles_interior_as_far_as_its_border() {
     // Light dabs near the tile's right border, each under half a step at most vertices.
     let light = params(vertex(level, 4, 60, 32), 0.06, 0.4 * scale).unwrap();
     let before = tile_state(project.store(), key);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     // A fresh stroke state, as a new stroke's.
     let mut stroke = Stroke::new(project.store());
     for _ in 0..10 {
@@ -805,7 +805,7 @@ fn project_with(
 /// the tile goes where the surface hasn't moved: [`light_dab`]'s `(50, 32)`.
 fn strong_stroke(project: &mut Project, index: &mut SpatialIndex, level: Level) -> (TileKey, f32) {
     let key = TileKey::displacement(FaceId::new(4), level, 0, 0).unwrap();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), index, &mut stroke, strong).unwrap();
@@ -832,7 +832,7 @@ fn a_strokes_writes_are_the_same_at_any_worker_count() {
     for threads in [1, 2, 8] {
         let dir = TestDir::new();
         let (mut project, mut index) = project_with(&dir, level, threads, 512);
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         let mut stroke = Stroke::new(project.store());
         for k in 0..20 {
             let center = vertex(level, 4, 20 + 4 * k, 32);
@@ -863,7 +863,7 @@ fn a_released_tile_revisited_stays_within_one_step() {
     let light = light_dab(level, 4, scale);
     let before = tile_state(project.store(), key);
 
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for (n, face) in [4, 1, 2, 3, 4].into_iter().enumerate() {
         if n == 4 {
@@ -896,7 +896,7 @@ fn tiles_edited_in_the_last_dabs_keep_their_state() {
     let light = light_dab(level, 4, scale);
     let before = tile_state(project.store(), key);
 
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for _ in 0..10 {
         for face in [4, 1, 2] {
@@ -918,7 +918,7 @@ fn a_dab_past_the_thrash_limit_writes_its_overflow_tiles_per_dab_and_does_not_fa
     let run = |threads: usize, stroke_tiles: usize| {
         let dir = TestDir::new();
         let (mut project, mut index) = project_with(&dir, level, threads, stroke_tiles);
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         let mut stroke = Stroke::new(project.store());
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
         project.end_unrecorded_stroke().unwrap();
@@ -982,7 +982,7 @@ fn a_new_stroke_starts_afresh() {
         let (key, scale) = strong_stroke(&mut project, &mut index, level);
         let mut stroke = Stroke::new(project.store());
         for k in 0..2 {
-            project.begin_stroke().unwrap();
+            project.begin_stroke_and_wait().unwrap();
             if k == 1 && !reuse {
                 stroke = Stroke::new(project.store());
             }
@@ -1013,7 +1013,7 @@ fn a_reused_buffer_starts_with_no_sums() {
     let light = params(vertex(level, 1, 50, 32), 0.06, 0.4 * scale).unwrap();
     let before = tile_state(project.store(), other);
 
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for _ in 0..5 {
         draw_step(
@@ -1052,7 +1052,7 @@ fn a_scale_that_grows_mid_stroke_keeps_vertices_within_a_step() {
     let light = light_dab(level, 4, scale);
     let before = tile_state(project.store(), key);
 
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stroke = Stroke::new(project.store());
     for _ in 0..10 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
@@ -1083,7 +1083,7 @@ fn a_stroke_used_over_another_project_starts_afresh() {
         let mut stroke = stroke
             .take()
             .unwrap_or_else(|| Stroke::new(project.store()));
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
         project.end_unrecorded_stroke().unwrap();
         assert_eq!(stroke.buffers(), 3, "the second store's reservation");
@@ -1093,7 +1093,7 @@ fn a_stroke_used_over_another_project_starts_afresh() {
     let (mut project, mut index) = project_with(&dir, level, 2, 512);
     let (_, scale) = strong_stroke(&mut project, &mut index, level);
     let mut stroke = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
     // The first project's stroke is still in progress.
     let reused = second(&mut Some(stroke));
@@ -1131,7 +1131,7 @@ fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
         let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
         let (_, scale) = strong_stroke(&mut project, &mut index, level);
         let mut stroke = Stroke::new(project.store());
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
         project.end_unrecorded_stroke().unwrap();
         // Closed unsaved, its recovery file deleted: the reopened project hands out the
@@ -1143,7 +1143,7 @@ fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
         if !reuse {
             stroke = Stroke::new(reopened.store());
         }
-        reopened.begin_stroke().unwrap();
+        reopened.begin_stroke_and_wait().unwrap();
         border_dabs(
             &mut reopened,
             &mut reindexed,
@@ -1190,7 +1190,7 @@ fn a_stroke_saved_part_way_goes_on_from_the_save() {
     let light = light_dab(level, 4, scale);
     let mut stroke = Stroke::new(project.store());
     let mut oracle = OracleStroke::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     for _ in 0..3 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
         oracle_step(&mesh, level, &pen_down, &mut map, &mut oracle, light);

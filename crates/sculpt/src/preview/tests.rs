@@ -117,7 +117,7 @@ pub(super) fn finest_tiles(store: &TileStore) -> Vec<TileKey> {
 /// Applies `dabs` at once, as finest work.
 pub(super) fn at_once(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab]) {
     let mut stroke = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), index, &mut stroke, dabs).unwrap();
     project.end_unrecorded_stroke().unwrap();
 }
@@ -143,7 +143,7 @@ pub(super) fn previewed_drawing(
 ) -> Vec<PreviewStats> {
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let shown = preview.show(project.store(), index, dabs, drawn).unwrap();
     assert_eq!(shown.dabs, dabs.len());
     assert!(shown.tiles_set > 0, "the dabs moved previews");
@@ -205,7 +205,7 @@ fn a_save_while_dabs_are_shown_holds_what_landed_and_nothing_of_the_previews() {
     let dabs = path(landed.store(), 12);
     let (first, _) = dabs.split_at(5);
     let mut landed_stroke = Stroke::new(landed.store());
-    landed.begin_stroke().unwrap();
+    landed.begin_stroke_and_wait().unwrap();
     apply_dabs(landed.store(), &mut landed_index, &mut landed_stroke, first).unwrap();
     drop(landed.save().unwrap());
     landed.end_unrecorded_stroke().unwrap();
@@ -214,7 +214,7 @@ fn a_save_while_dabs_are_shown_holds_what_landed_and_nothing_of_the_previews() {
     let (mut shown, mut shown_index, shown_path) = open_copy(&dir, &base, "shown");
     let mut stroke = Stroke::new(shown.store());
     let mut preview = Preview::new();
-    shown.begin_stroke().unwrap();
+    shown.begin_stroke_and_wait().unwrap();
     preview
         .show(shown.store(), &shown_index, &dabs, &finest_only)
         .expect("shown");
@@ -339,7 +339,7 @@ fn the_refresh_waits_for_previews_and_runs_once_every_dab_has_landed() {
     let (first, rest) = dabs.split_at(4);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &finest_only)
         .unwrap();
@@ -411,7 +411,7 @@ fn a_preview_differs_from_what_lands_only_by_the_stored_encoding() {
         .map(|key| (key, shown_positions(store, &key)))
         .collect();
     let mut stroke = Stroke::new(store);
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, &dabs).unwrap();
     preview
         .land(project.store(), &index, dabs.len(), &finest_only)
@@ -466,7 +466,7 @@ fn the_pen_down_surface_is_hit_where_it_was_whatever_is_shown_or_landed() {
         .map(|ray| index.raycast_exhaustive(project.store(), ray).unwrap())
         .collect();
     let mut stroke = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut preview = Preview::new();
     preview
         .show(project.store(), &index, &dabs, &finest_only)
@@ -587,7 +587,7 @@ fn a_preview_over_dabs_its_stroke_landed_differs_from_what_lands_only_by_the_enc
     let dabs = path(project.store(), 10);
     let (first, rest) = dabs.split_at(5);
     let mut stroke = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
     let landed_first: BTreeMap<TileKey, Vec<Vec3>> = {
         let store = project.store();

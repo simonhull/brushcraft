@@ -581,7 +581,7 @@ fn run_with(gpu: &Gpu, case: Case, patches: &[(&str, &str)]) -> BTreeMap<u8, Fig
     let mut index =
         store::SpatialIndex::build(project.store(), finest, |_, _| {}).expect("an index");
     let mut stroke_state = sculpt::Stroke::new(project.store());
-    project.begin_stroke().expect("a stroke");
+    project.begin_stroke_and_wait().expect("a stroke");
     let mut edited = BTreeSet::new();
     for step in dabs.chunks(case.batch) {
         let step = area_normals(project.store(), &index, step);

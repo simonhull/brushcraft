@@ -144,7 +144,7 @@ pub(crate) fn run<J: Write, H: Write>(
     let mut scratch = Scratch::default();
     for &level in &levels {
         let octave = Octave::new(options, level);
-        project.begin_stroke()?;
+        project.begin_stroke_and_wait()?;
         for batch in tiles_of(faces, level)?.chunks(TICK_EVERY) {
             vertices += sculpt_batch(&mut project, noise, octave, batch, &mut scratch)?;
             done += batch.len();

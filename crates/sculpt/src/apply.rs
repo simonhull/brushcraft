@@ -293,8 +293,10 @@ impl AddAssign for ApplyStats {
 ///
 /// `store` is the project's ([`Project::store`](store::Project::store)). The dabs edit as part
 /// of the store's current op: call it between
-/// [`Project::begin_stroke`](store::Project::begin_stroke) and
-/// [`Project::end_stroke`](store::Project::end_stroke), so the stroke is one op. `stroke` keeps
+/// [`Project::begin_stroke_and_wait`](store::Project::begin_stroke_and_wait) (or a
+/// [`Project::begin_stroke`](store::Project::begin_stroke) that [may
+/// land](store::Project::may_land)) and [`Project::end_stroke`](store::Project::end_stroke), so
+/// the stroke is one op. `stroke` keeps
 /// the value each edited vertex's correction is being built to across the stroke's dabs (see
 /// [`Stroke`]); keep
 /// one for the session and pass it to every call.

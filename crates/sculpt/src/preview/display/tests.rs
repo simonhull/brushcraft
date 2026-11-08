@@ -144,7 +144,7 @@ fn a_display_preview_bounds_the_finest_result_shown_and_part_landed() {
     let (first, rest) = dabs.split_at(7);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &display_only)
         .unwrap();
@@ -201,7 +201,7 @@ fn border_vertices_are_the_finest_previews_bits_and_the_landed_work_replaces_the
     let (first, rest) = dabs.split_at(4);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &DrawsAll)
         .unwrap();
@@ -314,7 +314,7 @@ fn a_long_strokes_bound_follows_the_dabs_over_each_place_not_its_length() {
     let (mut project, index, _) = open_copy(&dir, &base, "long");
     let dabs = ridge(project.store(), 20);
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let coarse = TileKey::display(FaceId::new(0), Level::new(4).unwrap(), 0, 0).unwrap();
     let mut bounds = Vec::new();
     for chunk in dabs.chunks(5) {
@@ -345,7 +345,7 @@ fn a_previews_normals_follow_the_moved_surface_as_the_refresh_makes_them() {
     let dabs = ridge(project.store(), 20);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &display_only)
         .unwrap();
@@ -465,7 +465,7 @@ fn worst_place(store: &mut TileStore, key: &TileKey) -> Vec3 {
 fn shown_then_landed(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab], what: &str) {
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), index, dabs, &display_only)
         .unwrap();
@@ -512,7 +512,7 @@ fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() 
     let (first, rest) = (first.as_slice(), rest.as_slice());
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     // Six dabs applied at once, then the refresh rebuilds the records over them.
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
     preview
@@ -557,7 +557,7 @@ fn a_display_preview_left_undrawn_for_a_call_still_takes_its_dabs() {
     let made = |name: &str, middle: &dyn Fn(&TileKey) -> bool| {
         let (mut project, index, _) = open_copy(&dir, &base, name);
         let mut preview = Preview::new();
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         for (n, dab) in dabs.iter().enumerate() {
             let drawn = |key: &TileKey| if n == 1 { middle(key) } else { true };
             preview
@@ -607,7 +607,7 @@ fn a_preview_that_moved_nothing_over_an_unchanged_tile_is_gone_with_its_stroke()
     let dabs = vec![dab(off, 0.002, 0.01, 0.0, 0)];
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &display_only)
         .unwrap();
@@ -637,7 +637,7 @@ fn display_previews_are_counted_with_the_pen_down_data_and_go_with_it() {
     let before = project.store().pen_down_bytes();
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &display_only)
         .unwrap();
@@ -670,7 +670,7 @@ fn the_previews_a_renderer_waits_for_are_made_a_few_a_call() {
     let (mut project, index, _) = open_copy(&dir, &base, "waiting");
     let dabs = path(project.store(), 6);
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     // A renderer drawing nothing yet: every held display tile waits.
     preview
         .show(project.store(), &index, &dabs, &|_: &TileKey| false)
@@ -784,7 +784,7 @@ fn dabs_applied_at_once_move_the_previews_the_stroke_has() {
     let (shown_first, then_applied) = dabs.split_at(dabs.len() / 2);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, shown_first, &display_only)
         .unwrap();
@@ -828,7 +828,7 @@ fn nothing_of_the_previews_stays_after_a_stroke_and_its_jobs() {
     ];
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     // Each dab shown, landed and its tiles refreshed before the next: what it left behind is
     // rebuilt while the stroke goes on, and the next dabs come near it again.
     for dab in &dabs {
@@ -861,7 +861,7 @@ fn a_held_tile_with_a_state_and_no_preview_gets_it_handed_over_again() {
     let (mut project, index, _) = open_copy(&dir, &base, "state");
     let dabs = path(project.store(), 6);
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &display_only)
         .unwrap();
@@ -886,7 +886,7 @@ fn tiles_that_get_no_preview_starve_none_behind_them() {
     let (mut project, index, _) = open_copy(&dir, &base, "starved");
     let dabs = path(project.store(), 6);
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &dabs, &|_: &TileKey| false)
         .unwrap();
@@ -946,7 +946,7 @@ fn a_fresh_preview_late_in_a_long_stroke_takes_the_dabs_near_it() {
         .unwrap();
     let made_after = |dabs_before: u32, opened: &mut Project| {
         let mut preview = Preview::new();
-        opened.begin_stroke().unwrap();
+        opened.begin_stroke_and_wait().unwrap();
         let earlier: Vec<Dab> = (0..dabs_before)
             .map(|n| dab(far_off, 0.02, 0.0001, 0.0, n))
             .collect();
@@ -984,7 +984,7 @@ fn a_preview_held_again_by_a_dab_that_touches_none_of_it_says_so() {
     let first = [dab(on, 0.02, 0.01, 0.0, 0)];
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     preview
         .show(project.store(), &index, &first, &display_only)
         .unwrap();

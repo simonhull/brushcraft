@@ -65,7 +65,7 @@ impl Stroke {
     fn begin(project: &mut Project, count: u32, seed: u64) -> Self {
         let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
         // Ahead: a test lands only once it may, as the app does.
-        let op = project.begin_stroke_ahead().unwrap();
+        let op = project.begin_stroke().unwrap();
         Self {
             op,
             edits,
@@ -556,8 +556,8 @@ fn a_stroke_begun_while_the_last_one_waits_writes_after_it() {
     new.place(&mut project, 3);
     let_go(&mut project);
     flush(&mut project);
-    // The old stroke's landing came after the held flush's cut: the new stroke's op took the
-    // queued flush's cut early, and its save point, the second, holds the new pen-down surface.
+    // The old stroke's landing came after the held flush's cut: the new stroke waited for the
+    // cut of the flush queued behind it, whose save point, the second, holds its pen-down surface.
     let points = project.store().working().save_points().unwrap();
     assert_eq!(
         points.len(),

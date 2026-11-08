@@ -233,7 +233,7 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
     let path: Vec<Vec3> = (0..PATH_STEPS)
         .map(|k| on_surface(&mut fresh, direction(k, radius)))
         .collect();
-    fresh.project.begin_stroke().expect("stroke");
+    fresh.project.begin_stroke_and_wait().expect("stroke");
     let mut stroke = Stroke::new(fresh.project.store());
     let mut all: Vec<StepStats> = Vec::new();
     bencher.bench_local(|| {

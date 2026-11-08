@@ -36,7 +36,7 @@ fn bumps(project: &mut Project, index: &mut SpatialIndex) {
         frame.push(dab(centre, 0.2, 0.03, 0.2, n));
     }
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), index, &mut state, &frame).unwrap();
     project.end_unrecorded_stroke().unwrap();
 }
@@ -426,7 +426,7 @@ fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
     // The stroke engine's dabs are final: the brush's own strength times the pressure.
     let settings = StrokeSettings::default().with_strength(Strength::new(0.004).unwrap());
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let (first, rest) = samples.split_first().unwrap();
     let mut pen = {
         let mut surface = StoreSurface::new(project.store(), &index);
@@ -505,7 +505,7 @@ fn surface_costs() {
         frame.push(dab(hit.position.to_f32(), 0.2, 0.02, 0.0, n));
     }
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut index, &mut state, &frame).unwrap();
     project.end_unrecorded_stroke().unwrap();
 
@@ -634,7 +634,7 @@ fn placement_after_a_dab_raycasts_as_every_triangle_does() {
     );
     // One strong dab at the top, raising it by up to a tenth.
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let raise = dab(top.to_f32(), 0.2, 0.1, 0.5, 0);
     apply_dabs(project.store(), &mut index, &mut state, &[raise]).unwrap();
     project.end_unrecorded_stroke().unwrap();

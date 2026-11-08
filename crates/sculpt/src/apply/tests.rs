@@ -59,7 +59,7 @@ fn apply_with(
     dabs: &[Dab],
     frames: &[usize],
 ) -> ApplyStats {
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let mut stats = ApplyStats::default();
     let mut rest = dabs;
     for &size in frames.iter().cycle() {
@@ -139,7 +139,7 @@ fn run_project_with(
     opened(project.store().id());
     let dabs = path(&mut project, count);
     let mut brush_state = Stroke::new(project.store());
-    project.begin_stroke().ok()?;
+    project.begin_stroke_and_wait().ok()?;
     let mut stats = ApplyStats::default();
     let mut rest = dabs.as_slice();
     for &size in frames.iter().cycle() {
@@ -383,7 +383,7 @@ fn stepped(dabs: &[Dab]) -> std::collections::BTreeMap<TileKey, TileBits> {
     let dir = TestDir::new();
     let (mut project, mut index) = cube(&dir, level(), fixed(2));
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     for d in dabs {
         let ([x, y, z], [nx, ny, nz]) = (d.position, d.normal);
         let (centre, normal) = (Vec3::new(x, y, z), Vec3::new(nx, ny, nz));
@@ -439,7 +439,7 @@ fn a_store_error_ends_the_call_and_keeps_the_dabs_before_it() {
     let (far, centre) = far_from(&mut project, &frame);
     frame.push(dab(centre, 0.15, 3e38, 0.0, 2));
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let failed = apply_dabs(project.store(), &mut index, &mut state, &frame);
     assert!(
         matches!(
@@ -554,7 +554,7 @@ fn a_dab_weighs_a_vertex_the_dab_before_lifted_where_it_was_at_pen_down() {
     let before = vertex(project.store(), left, 64, 32);
     let first = lift(&mut project);
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
     let after = vertex(project.store(), left, 64, 32);
     assert!((after - before).length() > 0.1, "the first dab lifted it");
@@ -597,7 +597,7 @@ fn a_failed_call_closes_its_epoch() {
     let (_, centre) = far_from(&mut project, &frame);
     frame.push(dab(centre, 0.15, 3e38, 0.0, 2));
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let failed = apply_dabs(project.store(), &mut index, &mut state, &frame);
     assert!(failed.is_err(), "the third dab can't be stored");
     assert!(
@@ -666,7 +666,7 @@ fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
         };
         let dabs = far_apart(&mut project);
         let mut brush_state = Stroke::new(project.store());
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         let applied = apply_dabs(project.store(), &mut index, &mut brush_state, &dabs);
         project.end_unrecorded_stroke().unwrap();
         let Ok(done) = applied else {
@@ -722,7 +722,7 @@ fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
         })
         .collect();
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     apply_dabs(project.store(), &mut index, &mut state, &frame).unwrap();
     project.end_unrecorded_stroke().unwrap();
     let store::Drained::Epochs(epochs) = project.store().drain_stale(&cursor) else {
@@ -803,7 +803,7 @@ fn a_tile_the_stroke_state_released_is_weighed_at_its_first_pen_down_shape_when_
         })
         .collect();
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let first = dab(base, radius, strength, 0.0, 0);
     apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
     for dab in &away {
@@ -858,7 +858,7 @@ fn a_dab_of_more_tiles_than_the_store_keeps_predictions_for_writes_finite_deltas
     let mut project = Project::new(geom::cube_sphere(1).unwrap(), project_config).unwrap();
     let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     for n in 0..6_u16 {
         let key = TileKey::displacement(FaceId::new(u32::from(n % 3)), level(), n % 2, 0).unwrap();
         let centre = vertex(project.store(), key, 64, 32);
@@ -909,7 +909,7 @@ fn under_a_budget_its_first_dab_just_fits_a_stroke_goes_on_beside_its_pen_down_d
             return false;
         };
         let mut state = Stroke::new(project.store());
-        project.begin_stroke().unwrap();
+        project.begin_stroke_and_wait().unwrap();
         apply_dabs(project.store(), &mut index, &mut state, &[first]).is_ok()
     };
     // Bisected, in chunks above the minimum: the least that fits.
@@ -927,7 +927,7 @@ fn under_a_budget_its_first_dab_just_fits_a_stroke_goes_on_beside_its_pen_down_d
     let dir = TestDir::new();
     let (mut project, mut index, first) = tight_cube(&dir, budget).unwrap();
     let mut state = Stroke::new(project.store());
-    project.begin_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
     let opening = apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
     assert!(opening.candidates > 100, "{} tiles", opening.candidates);
     for n in 1..4 {

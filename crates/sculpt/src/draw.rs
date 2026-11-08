@@ -192,8 +192,10 @@ pub struct StepStats {
 ///
 /// `store` is the project's ([`Project::store`](store::Project::store)). The step edits as part
 /// of the store's current op: call it between
-/// [`Project::begin_stroke`](store::Project::begin_stroke)
-/// and [`Project::end_stroke`](store::Project::end_stroke), so the stroke's steps are one op. The
+/// [`Project::begin_stroke_and_wait`](store::Project::begin_stroke_and_wait) (or a
+/// [`Project::begin_stroke`](store::Project::begin_stroke) that [may
+/// land](store::Project::may_land)) and [`Project::end_stroke`](store::Project::end_stroke), so
+/// the stroke's steps are one op. The
 /// vertices edited are those of the level `index` holds, the finest the store evaluates.
 ///
 /// `stroke` keeps the value each edited vertex's correction is being built to across the stroke's
