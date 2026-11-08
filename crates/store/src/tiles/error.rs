@@ -235,6 +235,10 @@ pub enum Invariant {
     /// the journal holds its counts to what a batch takes.
     #[error("the journal cut a dab batch it can't make")]
     Journal(#[source] crate::JournalError),
+    /// The open stroke's journal ran out of rows before the dabs it counts placed, though it
+    /// holds one for every dab not landed.
+    #[error("the journal holds fewer rows than it counts")]
+    JournalRows,
     /// A full save point would have named a different number of records than the maps derived
     /// for it hold (see [`FileError::SavePointMismatch`]). Nothing was written.
     #[error("a full save point names {named} records, but its derived maps hold {derived}")]

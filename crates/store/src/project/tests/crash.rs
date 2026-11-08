@@ -762,11 +762,18 @@ fn random_delay(max: Duration) -> Duration {
     max.mul_f64(f64::from(nanos) / 1e9)
 }
 
+/// The journal crash test's runs: kills at as many moments.
+const JOURNAL_RUNS: u32 = 8;
+
+/// The longest the journal crash test waits after the child's first save point to kill it: well
+/// within the time the child takes to place [`JOURNAL_DABS`], even on a loaded machine.
+const JOURNAL_KILL_WITHIN: Duration = Duration::from_millis(300);
+
 #[test]
 fn a_kill_keeps_every_dab_journalled_by_the_last_save_point() {
-    for run in 0..3 {
+    for run in 0..JOURNAL_RUNS {
         let dir = TestDir::new();
-        let delay = random_delay(Duration::from_secs(1));
+        let delay = random_delay(JOURNAL_KILL_WITHIN);
         let what = format!("run {run}, killed {delay:?} after its first save point");
         run_and_kill(JOURNAL_CHILD_TEST, (JOURNAL, "1"), &dir, delay, &what);
         let candidate = find_recoveries(&dir.path("recovery"))
@@ -782,6 +789,10 @@ fn a_kill_keeps_every_dab_journalled_by_the_last_save_point() {
             .map(Result::unwrap)
             .collect();
         let (first, last) = (batches.first().unwrap(), batches.last().unwrap());
+        assert!(
+            last.placed() < JOURNAL_DABS && last.landed() < last.placed(),
+            "{what}: killed mid-stroke, dabs still landing ({last:?})"
+        );
         assert_eq!(
             first.first(),
             first.landed(),

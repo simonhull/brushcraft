@@ -367,7 +367,8 @@ pub struct ProjectFile {
     #[cfg(test)]
     skew_derivation: bool,
     /// Makes the next [`ProjectFile::save`] fail with an I/O error after its records' sync,
-    /// before its Index: for tests of a save made again.
+    /// before its Index, or the next [`ProjectFile::write_save_point`] before it writes anything:
+    /// for tests of a save, or a flush, made again.
     #[cfg(test)]
     fail_next_save: bool,
 }
@@ -1535,6 +1536,10 @@ impl ProjectFile {
         if self.access == Access::ReadOnly {
             return Err(FileError::ReadOnly);
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_save) {
+            return Err(io::Error::other("a save point failing, for the test").into());
+        }
         let appended = self.append_index()?;
         Ok(self.commit_index(appended))
     }
@@ -1923,7 +1928,8 @@ impl ProjectFile {
         );
     }
 
-    /// Makes the next [`ProjectFile::save`] fail after syncing its records, before its Index.
+    /// Makes the next [`ProjectFile::save`] fail after syncing its records, before its Index, or
+    /// the next [`ProjectFile::write_save_point`] before it writes anything.
     pub(crate) const fn fail_next_save(&mut self) {
         self.fail_next_save = true;
     }

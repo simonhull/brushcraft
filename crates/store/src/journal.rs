@@ -82,15 +82,6 @@ pub enum JournalError {
         /// The dabs placed: the batch's first index plus its count.
         placed: u32,
     },
-    /// A landed count given to the open stroke's journal is below the one it had: dabs never
-    /// unland. Only the store's journal refuses this; no reader meets it.
-    #[error("{landed} dabs landed, after {before} had")]
-    LandedBack {
-        /// The landed count given.
-        landed: u32,
-        /// The count the journal had.
-        before: u32,
-    },
     /// The payload ends before its fixed fields do.
     #[error("the dab batch is cut short")]
     Short,

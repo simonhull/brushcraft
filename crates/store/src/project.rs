@@ -101,11 +101,11 @@ use thiserror::Error;
 use crate::OpId;
 use crate::file::{FileError, PRIVATE_MODE, ProjectFile, SHARED_MODE, sync_parent};
 use crate::index::{IndexError, LoadStats, SpatialIndex};
-use crate::journal::{DAB_BYTES, JournalError};
+use crate::journal::DAB_BYTES;
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::stroke_record::StrokeRecord;
-use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
+use crate::tiles::{CacheError, JournalCountError, Saved, StoreConfig, TileStore};
 
 mod discover;
 mod place;
@@ -249,7 +249,12 @@ pub enum ProjectError {
     /// The open stroke's journal refused what it was given: a landed count that goes back or
     /// passes the dabs placed, or dabs past the last index a stroke counts. Nothing changed.
     #[error("the stroke's dab journal refused it")]
-    Journal(#[from] JournalError),
+    Journal(#[from] JournalCountError),
+    /// [`Project::save`] or [`Project::save_as`] while the open stroke has dabs journalled and not
+    /// landed: a save lands every dab first, so the project file never depends on a journal.
+    /// Nothing was written; land them (or end the stroke), then save.
+    #[error("the stroke's dabs are still landing")]
+    StillLanding,
 }
 
 /// Takes what `writer` left out: the tiles gone into `lost`, those only late into `left_out`.
@@ -763,6 +768,9 @@ impl Project {
     /// the one before, and the next save saves its edits again.
     pub fn save(&mut self) -> Result<SaveOutcome, ProjectError> {
         let path = self.path.clone().ok_or(ProjectError::NoPath)?;
+        if self.store.is_landing() {
+            return Err(ProjectError::StillLanding);
+        }
         let mut kept = self.prepare_save()?;
         let mut project = self.file.take().ok_or(ProjectError::NoPath)?;
         let switched = self
@@ -837,6 +845,9 @@ impl Project {
     /// [`Project::save`] once the new file is in place and durable: the project goes on with
     /// the old one then.
     pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome, ProjectError> {
+        if self.store.is_landing() {
+            return Err(ProjectError::StillLanding);
+        }
         let path = std::path::absolute(path)?;
         if fs::symlink_metadata(&path).is_ok() {
             return Err(ProjectError::Exists(path));
@@ -1071,6 +1082,7 @@ impl Project {
     /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
     pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
         let op = self.store.begin_op()?;
+        self.store.begin_journal(op);
         self.stroke = Some(op);
         Ok(op)
     }
@@ -1155,22 +1167,28 @@ impl Project {
     /// # Errors
     ///
     /// [`ProjectError::NoStroke`] if no stroke is open; [`ProjectError::Journal`] with
-    /// [`JournalError::PastLastIndex`] if the stroke's dabs would run past the last index a `u32`
-    /// counts. Nothing is kept then.
+    /// [`JournalCountError::PastLastIndex`] if the stroke's dabs would run past the last index a
+    /// `u32` counts. Nothing is kept then.
     pub fn journal(&mut self, placed: &[[u8; DAB_BYTES]]) -> Result<(), ProjectError> {
         let op = self.stroke.ok_or(ProjectError::NoStroke)?;
         Ok(self.store.journal(op, placed)?)
     }
 
-    /// How many of the open stroke's dabs have landed: called as their edits are made, before
-    /// the next tick, so a flush's cut always pairs the store's tiles with the count that made
-    /// them. A dab landed and not yet written is never written.
+    /// How many of the open stroke's dabs have landed: passed with each landing, with the
+    /// count it reaches, before the next [`Project::tick`], so a flush's cut always pairs the
+    /// store's tiles with the count that made them.
+    ///
+    /// The count must hold before the edits it describes are made and no tick comes between:
+    /// a tick that cut after the edits and before the count would name tiles whose dabs its batch
+    /// doesn't count landed, and a restore would land them twice. A dab landed and not yet
+    /// written is never written. A stroke that ends with dabs not landed counts them landed:
+    /// they were dropped, and a restore never lands them.
     ///
     /// # Errors
     ///
     /// [`ProjectError::NoStroke`] if no stroke is open; [`ProjectError::Journal`] with
-    /// [`JournalError::LandedBack`] for a count below the last, or
-    /// [`JournalError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
+    /// [`JournalCountError::LandedBack`] for a count below the last, or
+    /// [`JournalCountError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
     pub fn journal_landed(&mut self, landed: u32) -> Result<(), ProjectError> {
         let op = self.stroke.ok_or(ProjectError::NoStroke)?;
         Ok(self.store.journal_landed(op, landed)?)

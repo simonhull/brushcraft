@@ -760,8 +760,10 @@ impl TileStore {
                 mark.clear();
             }
         }
-        // The new file holds every bound as it is now, and every stroke record waiting.
+        // The new file holds every bound as it is now, and every stroke record waiting, but no
+        // dab batch: the open stroke's journal writes its dabs not landed again.
         self.forget_saved_strokes(strokes);
+        self.rebase_journal();
         self.bounds.all_flushed();
         self.display.all_flushed();
         self.generation += 1;

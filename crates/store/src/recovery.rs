@@ -85,7 +85,11 @@
 //! A dab batch that doesn't encode ([`RecoveryError::Journal`]) is such an error, unlike a tile:
 //! its dabs stay in the journal for the next flush, with nothing of the flush appended. Leaving
 //! the batch out and writing the save point would name tiles with dabs landed past the count the
-//! file's last batch states, and a restore would land those dabs a second time.
+//! file's last batch states, and a restore would land those dabs a second time. For the same
+//! reason a tile left out for a failure that may pass, in a flush that carries a batch, abandons
+//! the flush too ([`RecoveryError::Unpaired`]): the save point would name the tile's older state
+//! beside a count that counts its dabs landed. A broken slot is lost either way, and handled as
+//! in any flush first.
 //!
 //! A failed sync is different, and final for the file. After one, the kernel may have dropped
 //! the unsynced pages, so the records appended since the last durable save point may not be on
@@ -123,7 +127,7 @@ use thiserror::Error;
 use crate::feed::ConsumerId;
 use crate::file::{FileError, FileSyncer, FramedTile, frame_batch, frame_displacement};
 use crate::journal::DabBatch;
-use crate::tiles::{CacheError, JournalCut, Snapshot, TileStore};
+use crate::tiles::{CacheError, Snapshot, TileStore};
 
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -158,6 +162,12 @@ pub enum RecoveryError {
     /// notes).
     #[error("a dab batch of the stroke's journal couldn't be encoded")]
     Journal(#[source] FileError),
+    /// A tile's copy didn't encode, for a failure that may pass, in a flush that carries a dab
+    /// batch. The flush is abandoned with none of its tiles or batches appended: its save point
+    /// would name the tile's older state beside a landed count that counts its dabs. The tile
+    /// stays dirty and the dabs in the journal, for the next flush (see the module notes).
+    #[error("a tile of a flush with dab batches didn't encode")]
+    Unpaired,
     /// A reply arrived that the flush in flight wasn't waiting for: a bug in the writer.
     #[error("the recovery writer's thread replied out of step")]
     OutOfStep,
@@ -323,9 +333,6 @@ pub struct RecoveryWriter {
     thread: Option<JoinHandle<()>>,
     /// Where the flush in flight is.
     phase: Phase,
-    /// What the flush in flight's cut took of the store's journals: noted written once its
-    /// batches are appended.
-    journal_cut: Vec<JournalCut>,
     /// When a trigger that met a flush in flight came: the next flush is owed, and starts as
     /// soon as the current one is durable.
     queued: Option<Instant>,
@@ -382,7 +389,6 @@ impl RecoveryWriter {
             stop,
             thread: Some(thread),
             phase: Phase::Idle,
-            journal_cut: Vec::new(),
             queued: None,
             unconfirmed: false,
             last_flush: None,
@@ -589,19 +595,18 @@ impl RecoveryWriter {
                 // The journal as of the snapshot, so its landed count is the snapshot's; the
                 // bounds of the snapshot's state, at the same cut; and the records of the strokes
                 // it ends.
-                let (batches, cuts) = store.cut_journal()?;
+                let batches = store.cut_journal()?;
                 store.flush_bounds(self.skipped.get(before..).unwrap_or_default())?;
                 store.flush_strokes()?;
-                Ok((snapshots, batches, cuts))
+                Ok((snapshots, batches))
             });
         // A dirty slot with no op is a broken one: lost, not late.
         self.lost
             .extend(self.skipped.get(before..).unwrap_or_default());
         let started = match snapshot {
-            Ok((snapshots, batches, cuts)) if !snapshots.is_empty() || !batches.is_empty() => {
+            Ok((snapshots, batches)) if !snapshots.is_empty() || !batches.is_empty() => {
                 #[cfg(test)]
                 self.hooks.sent(&snapshots);
-                self.journal_cut = cuts;
                 self.send(Request::Encode(snapshots, batches))
                     .map(|()| self.phase = Phase::Encoding)
             }
@@ -671,11 +676,16 @@ impl RecoveryWriter {
                 self.skipped.extend(broken.iter().copied());
                 self.lost.extend(lost.iter().copied());
                 store.forget_bounds_at_cut(&broken, &lost)?;
+                // A valid tile left out keeps its older state in the save point, which the
+                // batch's landed count would count past: nothing of the flush is appended, and
+                // the tile and the dabs wait for the next. A lost one is gone either way.
+                if store.has_journal_cut() && broken.len() > lost.len() {
+                    return Err(RecoveryError::Unpaired);
+                }
                 store.append_streamed(self.consumer, &tiles)?;
                 // Before the sync is asked for, so it covers them and the save point holds them;
                 // the journal moves on only once they are in the file.
-                let cuts = std::mem::take(&mut self.journal_cut);
-                store.append_journal(&batches, &cuts)?;
+                store.append_journal(&batches)?;
                 self.request_tile_sync(store)
             }
             (Phase::SyncingTiles { end }, Reply::Synced(synced)) => {
@@ -745,6 +755,9 @@ impl RecoveryWriter {
     ) -> Result<(), RecoveryError> {
         if let Err(e) = &outcome {
             store.drop_cut();
+            // A cut whose batches were appended is noted written already: only one still in
+            // flight goes, for the next flush to write again.
+            store.drop_journal_cut();
             self.queued = None;
             self.unconfirmed = true;
             self.phase = match (self.phase, e) {

@@ -4,9 +4,9 @@
 use std::ops::Range;
 
 use super::*;
-use crate::FLUSH_INTERVAL;
 use crate::fixture::dab_at;
-use crate::journal::{DAB_BYTES, DabBatch, JournalError, MAX_JOURNAL_DABS};
+use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS};
+use crate::{FLUSH_INTERVAL, JournalCountError};
 
 /// The tests' dabs `range`, as [`dab_at`] makes them.
 fn dabs(range: Range<u32>) -> Vec<[u8; DAB_BYTES]> {
@@ -260,7 +260,7 @@ fn a_save_writes_no_batch_into_the_project_file() {
 }
 
 #[test]
-fn a_save_mid_stroke_journals_the_dabs_not_landed_into_the_fresh_recovery_file() {
+fn a_save_waits_for_the_dabs_to_land() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
     let mut map = CorrectionMap::new();
@@ -269,15 +269,29 @@ fn a_save_mid_stroke_journals_the_dabs_not_landed_into_the_fresh_recovery_file()
     stroke.place(&mut project, 10);
     flush(&mut project);
     stroke.land(&mut project, &mut map, 4);
+    assert!(
+        matches!(project.save_as(&path), Err(ProjectError::StillLanding)),
+        "a save as, refused"
+    );
+    assert!(!path.exists(), "nothing written");
+    stroke.land(&mut project, &mut map, 6);
     assert_saved(project.save_as(&path));
     assert_eq!(batches(&mut project), Vec::new(), "a fresh recovery file");
+    stroke.place(&mut project, 2);
+    assert!(
+        matches!(project.save(), Err(ProjectError::StillLanding)),
+        "a save, refused"
+    );
     flush(&mut project);
     assert_eq!(
         batches(&mut project),
-        vec![batch(stroke.op, 4..10, 4)],
-        "the dabs not landed, again"
+        vec![batch(stroke.op, 10..12, 10)],
+        "the journal goes on in the fresh file"
     );
+    stroke.land(&mut project, &mut map, 2);
+    assert_saved(project.save());
     project.close(false).unwrap();
+    assert_project_file(&path, &map, "every dab landed and saved");
 }
 
 #[test]
@@ -330,7 +344,7 @@ fn a_journal_refuses_counts_a_stroke_cannot_have() {
     assert!(
         matches!(
             project.journal_landed(6),
-            Err(ProjectError::Journal(JournalError::LandedPastPlaced {
+            Err(ProjectError::Journal(JournalCountError::LandedPastPlaced {
                 landed: 6,
                 placed: 5
             }))
@@ -340,7 +354,7 @@ fn a_journal_refuses_counts_a_stroke_cannot_have() {
     assert!(
         matches!(
             project.journal_landed(2),
-            Err(ProjectError::Journal(JournalError::LandedBack {
+            Err(ProjectError::Journal(JournalCountError::LandedBack {
                 landed: 2,
                 before: 3
             }))
@@ -386,6 +400,201 @@ fn a_batch_that_fails_to_encode_is_written_by_the_next_flush() {
         batches(&mut project),
         vec![batch(stroke.op, 5..10, 5)],
         "the dabs not landed, once, with the count at the next cut"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_stroke_ending_with_dabs_not_landed_counts_them_landed() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 14);
+    stroke.place(&mut project, 10);
+    flush(&mut project);
+    stroke.land(&mut project, &mut map, 4);
+    project.end_unrecorded_stroke().unwrap();
+    crash::poll_until_idle(&mut project);
+    let op = stroke.op;
+    let written = vec![batch(op, 0..10, 0), batch(op, 10..10, 10)];
+    assert_eq!(
+        batches(&mut project),
+        written,
+        "the dropped dabs never land"
+    );
+
+    // With no batch in the file yet, none is written: the tiles hold every dab landed.
+    let mut unwritten = Stroke::begin(&mut project, 20, 15);
+    unwritten.place(&mut project, 10);
+    unwritten.land(&mut project, &mut map, 4);
+    project.end_unrecorded_stroke().unwrap();
+    crash::poll_until_idle(&mut project);
+    flush(&mut project);
+    assert_eq!(batches(&mut project), written, "no batch of it");
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_flush_whose_save_point_fails_leaves_its_batches_for_the_next() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 16);
+    stroke.place(&mut project, 10);
+    stroke.land(&mut project, &mut map, 2);
+    project.store().fail_next_save_point();
+    let failed = project.finish_flushes();
+    assert!(
+        matches!(failed, Err(ProjectError::Recovery(RecoveryError::Store(_)))),
+        "{failed:?}"
+    );
+    let op = stroke.op;
+    let first = batch(op, 2..10, 2);
+    assert_eq!(
+        batches(&mut project),
+        vec![first.clone()],
+        "appended, unsaved"
+    );
+    assert!(
+        project.store().working().has_unsaved_records(),
+        "no save point holds it yet"
+    );
+    stroke.land(&mut project, &mut map, 3);
+    stroke.place(&mut project, 4);
+    flush(&mut project);
+    assert_eq!(
+        batches(&mut project),
+        vec![first, batch(op, 10..14, 5)],
+        "the next goes on after it: no gap, no overlap"
+    );
+    assert!(
+        !project.store().working().has_unsaved_records(),
+        "a save point holds both"
+    );
+    project.close(false).unwrap();
+}
+
+/// Starts a flush with the writer thread held back, so it stays in flight, its cut taken.
+fn start_held_flush(project: &mut Project) {
+    project.writer.as_ref().unwrap().pause(true);
+    project.tick(Instant::now() + FLUSH_INTERVAL * 100).unwrap();
+    assert!(
+        !project.writer.as_ref().unwrap().is_idle(),
+        "a flush in flight"
+    );
+}
+
+/// Lets a held writer thread go, and waits until every flush is durable.
+fn let_go(project: &mut Project) {
+    project.writer.as_ref().unwrap().pause(false);
+    crash::poll_until_idle(project);
+}
+
+#[test]
+fn a_stroke_ending_while_its_cut_is_in_flight_writes_its_last_count_once() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 17);
+    stroke.place(&mut project, 10);
+    start_held_flush(&mut project);
+    stroke.land(&mut project, &mut map, 10);
+    project.end_unrecorded_stroke().unwrap();
+    assert!(
+        project.writer.as_ref().unwrap().is_queued(),
+        "its flush queued"
+    );
+    let_go(&mut project);
+    let op = stroke.op;
+    let written = vec![batch(op, 0..10, 0), batch(op, 10..10, 10)];
+    assert_eq!(
+        batches(&mut project),
+        written,
+        "the queued flush writes its last count"
+    );
+    flush(&mut project);
+    assert_eq!(batches(&mut project), written, "once");
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_stroke_begun_while_the_last_one_waits_writes_after_it() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut old = Stroke::begin(&mut project, 20, 18);
+    old.place(&mut project, 10);
+    start_held_flush(&mut project);
+    old.land(&mut project, &mut map, 10);
+    project.end_unrecorded_stroke().unwrap();
+    let mut new = Stroke::begin(&mut project, 20, 19);
+    new.place(&mut project, 3);
+    let_go(&mut project);
+    flush(&mut project);
+    assert_eq!(
+        batches(&mut project),
+        vec![
+            batch(old.op, 0..10, 0),
+            batch(old.op, 10..10, 10),
+            batch(new.op, 0..3, 0)
+        ],
+        "the old stroke's last count first"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_roll_over_journals_the_dabs_not_landed_into_the_fresh_file() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 20);
+    stroke.place(&mut project, 10);
+    flush(&mut project);
+    stroke.land(&mut project, &mut map, 4);
+    let old = project.recovery_path().unwrap().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.finish_flushes().unwrap();
+    assert_ne!(project.recovery_path().unwrap(), old, "rolled over");
+    flush(&mut project);
+    assert_eq!(
+        batches(&mut project),
+        vec![batch(stroke.op, 4..10, 4)],
+        "from the landed count, with no gap"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_tile_left_out_of_a_flush_with_a_batch_abandons_it() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 21);
+    stroke.place(&mut project, 10);
+    stroke.land(&mut project, &mut map, 2);
+    let flushes = project.writer.as_ref().unwrap().flushes();
+    project.writer.as_ref().unwrap().fail_encodes(1);
+    let failed = project.finish_flushes();
+    assert!(
+        matches!(failed, Err(ProjectError::Recovery(RecoveryError::Unpaired))),
+        "{failed:?}"
+    );
+    assert_eq!(
+        project.writer.as_ref().unwrap().flushes(),
+        flushes,
+        "no save point pairs the tile's older state with the count"
+    );
+    assert_eq!(batches(&mut project), Vec::new(), "no batch");
+    flush(&mut project);
+    assert_eq!(
+        batches(&mut project),
+        vec![batch(stroke.op, 2..10, 2)],
+        "the next flush writes both"
+    );
+    assert!(
+        !project.store().working().has_unsaved_records(),
+        "a save point holds them"
     );
     project.close(false).unwrap();
 }
