@@ -775,6 +775,42 @@ fn a_resume_whose_shape_fails_to_install_gives_back_its_charge() {
 }
 
 #[test]
+fn a_journal_with_no_dab_landed_is_unsaved_work_and_restores() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = new_project(&dir);
+    stroke(&mut project, &mut map, 100, 94);
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
+    assert!(!project.has_unsaved_edits(), "saved");
+    let mut landing = begin_on_top(&mut project, 10, 95);
+    landing.place(&mut project, 10);
+    assert!(project.has_unsaved_edits(), "dabs placed, none landed");
+    flush(&mut project);
+    drop(project);
+    // The file holds no tile edit, only the stroke's journal: it isn't empty.
+    let found = candidate(&dir);
+    assert_eq!(found.status, CandidateStatus::Restorable, "on the save");
+    assert_eq!(found.last_edit, Some(landing.op), "the stroke is its work");
+    let mut restored = restore(&dir);
+    assert!(restored.has_unsaved_edits(), "the stroke to resume");
+    let taken = restored.take_open_stroke().unwrap().unwrap();
+    assert_eq!(taken.landed(), 0, "none landed");
+    assert_eq!(taken.dabs(), dabs(0..10), "every dab");
+    drop(taken);
+    assert!(restored.has_unsaved_edits(), "taken, not resumed");
+    let keep = restored.has_unsaved_edits();
+    restored.close(keep).unwrap();
+    let mut again = restore(&dir);
+    let open = again.take_open_stroke().unwrap().unwrap();
+    let mut resumed = going_on(landing, &open);
+    again.resume_stroke(open).unwrap();
+    resumed.land(&mut again, &mut map, 10);
+    again.end_unrecorded_stroke().unwrap();
+    assert_tiles(&mut again, &map, "every dab landed");
+    again.close(false).unwrap();
+}
+
+#[test]
 fn a_damaged_pen_down_tile_record_restores_the_tiles_alone() {
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();

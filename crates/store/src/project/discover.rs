@@ -221,7 +221,7 @@ fn candidate(path: PathBuf, named: ProjectId, modified: SystemTime) -> Option<Re
         project: named,
         base,
         base_path: meta.base_path().map(Path::to_path_buf),
-        last_edit: file.head(),
+        last_edit: file.head().max(file.landing_stroke()),
         modified,
         status,
         path,

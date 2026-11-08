@@ -131,6 +131,20 @@ impl ProjectFile {
         .ok_or(FileError::Damaged { offset: loc.offset })
     }
 
+    /// The op of the stroke the file's journal leaves landing: that of its last batch, if that
+    /// batch has dabs not landed (no closing batch came after). `None` with no batch, a last
+    /// batch whose dabs have all landed, or one that doesn't read.
+    ///
+    /// Such a stroke is work a restore brings back even with no tile edit in the file (a stroke
+    /// that had landed nothing), so the file isn't empty (see
+    /// [`crate::RecoveryCandidate::last_edit`]). Whether a restore can use it is the restore's to
+    /// say (see `crate::project::resume`); this reads one batch.
+    pub(crate) fn landing_stroke(&self) -> Option<crate::OpId> {
+        let last = self.batch_locations().last()?;
+        let batch = self.read_batch(last).ok()?;
+        (batch.landed() < batch.placed()).then(|| batch.op())
+    }
+
     /// Reads every batch of the file's state, in the order they were written: for tools, tests
     /// and the fuzz target. Opening a file reads none (see [`DabBatch`]).
     ///

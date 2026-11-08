@@ -368,8 +368,10 @@ pub struct RecoveryCandidate {
     /// Where that project file was when the recovery file was made; `None` as for `base`.
     pub base_path: Option<PathBuf>,
     /// The newest edit a restore brings back: the recovery file's head op at its last durable
-    /// save point. `None` if it holds no edits (or is damaged): restoring it gives the save
-    /// point alone, or for a project never saved, an empty project.
+    /// save point, or the op of the stroke its journal leaves landing if that is later (a
+    /// stroke that had landed nothing holds no tile edit, but its dabs are work a restore brings
+    /// back). `None` if it holds neither (or is damaged): restoring it gives the save point
+    /// alone, or for a project never saved, an empty project.
     pub last_edit: Option<OpId>,
     /// When the recovery file was last written to.
     pub modified: SystemTime,
@@ -1074,11 +1076,17 @@ impl Project {
         first_failure.map_err(ProjectError::from)
     }
 
-    /// Whether the project has edits no save holds: any edit since the last save, or, for a
-    /// project never saved, any edit at all.
+    /// Whether the project has work no save holds: any edit since the last save (or, for a
+    /// project never saved, any edit at all), dabs the open stroke placed and hasn't landed, or
+    /// a stroke a restore found still landing and nobody has resumed or closed yet. The last two
+    /// may hold no tile edit (a stroke that has landed nothing), but they are work the recovery
+    /// file keeps: a close must keep it ([`Project::close`]).
     #[must_use]
     pub fn has_unsaved_edits(&self) -> bool {
-        self.store.has_unsaved_edits()
+        let unresumed = self
+            .unresumed
+            .is_some_and(|unresumed| unresumed.generation == self.store.generation());
+        self.store.has_unsaved_edits() || self.store.is_landing() || unresumed
     }
 
     /// The tile store, for edits and evaluation.
