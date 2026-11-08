@@ -341,8 +341,8 @@ impl DabBatch {
         )
     }
 
-    /// The fixed fields at the start of `payload`, a batch's payload or only its first
-    /// [`BATCH_HEAD_BYTES`], checked as [`DabBatch::decode`] checks them, without the dabs.
+    /// The fixed fields at the start of `payload`, a batch's payload, checked as
+    /// [`DabBatch::decode`] checks them, without decompressing the dabs.
     ///
     /// # Errors
     ///
@@ -385,9 +385,6 @@ impl DabBatch {
         })
     }
 }
-
-/// The bytes of a batch payload's fixed fields: what [`DabBatch::decode_head`] reads.
-pub(crate) const BATCH_HEAD_BYTES: usize = FIXED;
 
 /// A batch's fixed fields, read without its dabs ([`DabBatch::decode_head`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

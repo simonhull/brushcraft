@@ -11,8 +11,8 @@ use std::os::unix::fs::FileExt;
 use super::error::FileError;
 use super::lock::Access;
 use super::{Loc, ProjectFile};
-use crate::journal::{BATCH_HEAD_BYTES, DabBatch, MAX_JOURNAL_PAYLOAD};
-use crate::record::{HEAD, Head, KIND_JOURNAL, TAIL, frame, parse_head, verify};
+use crate::journal::{DabBatch, MAX_JOURNAL_PAYLOAD};
+use crate::record::{HEAD, Head, KIND_JOURNAL, TAIL, frame, verify};
 
 /// The longest framed batch: framing around the longest payload a writer makes.
 ///
@@ -140,25 +140,20 @@ impl ProjectFile {
     /// [`crate::RecoveryCandidate::last_edit`]). Whether a restore can use it is the restore's to
     /// say (see `crate::project::resume`).
     ///
-    /// This reads the last batch's record head and fixed fields alone, checked as a read checks
-    /// them ([`DabBatch::decode_head`]), never its dabs, so it costs a few dozen bytes however
-    /// large the batch. Its checksum covers the whole record, so it isn't checked: a damaged
-    /// head that still parses can only give an op no stroke had, which makes the file count as
-    /// holding work and moves a new session's ops past it, never loses work or hands an op out
-    /// twice. A restore reads the batch whole, checked.
+    /// This reads the last batch's whole record (no longer than [`MAX_JOURNAL_RECORD`], as every
+    /// batch location is) and checks its checksum, then decodes its fixed fields alone
+    /// ([`DabBatch::decode_head`]), never decompressing its dabs. A record that fails its
+    /// checksum counts as no stroke landing: an op read from damaged bytes could be one no
+    /// stroke had, and one at its site's last sequence number would leave a new session no op
+    /// to start, refusing to open the project. One batch read a file is the price.
     pub(crate) fn landing_stroke(&self) -> Option<crate::OpId> {
         let last = self.batch_locations().last()?;
-        let mut bytes = [0; HEAD + BATCH_HEAD_BYTES];
-        let whole = u64::try_from(bytes.len() + TAIL).ok()?;
-        if last.len < whole {
+        let raw = self.reader().read_record(last).ok()?;
+        let (kind, payload) = verify(&raw)?;
+        if kind != KIND_JOURNAL {
             return None;
         }
-        self.file.read_exact_at(&mut bytes, last.offset).ok()?;
-        let (head, fields) = bytes.split_first_chunk::<HEAD>()?;
-        if parse_head(*head)?.kind != KIND_JOURNAL {
-            return None;
-        }
-        let batch = DabBatch::decode_head(fields).ok()?;
+        let batch = DabBatch::decode_head(payload).ok()?;
         (batch.landed < batch.placed()).then_some(batch.op)
     }
 
