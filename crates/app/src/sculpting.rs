@@ -1312,7 +1312,9 @@ impl Sculpting {
         if self.landing == Landing::InSteps {
             return;
         }
-        if !self.may_land(scene) {
+        // A step that must land everything (no budget: a flush's) waits, as a close's does.
+        let at_once = self.landing == Landing::Stepping || budget.is_none();
+        if !self.may_land(scene, at_once) {
             return;
         }
         let moving = self.landing == Landing::InFrames && self.pen_moving();
@@ -1417,14 +1419,15 @@ impl Sculpting {
 
     /// Whether the stroke may land now ([`Project::may_land`]): its pen-down flush has taken its
     /// cut. A frame's step goes on without landing until it has (what it would land is shown
-    /// ahead); a close's or a save's step, which has no frames to wait for, waits for the cut
-    /// ([`Project::wait_to_land`]), at most the flush in flight's syncs. What waiting meets of the
-    /// recovery file is reported as a stroke end's is; the stroke may land then all the same.
-    fn may_land(&mut self, scene: &mut Scene<'_>) -> bool {
+    /// ahead); a step that lands `at_once`, with no frames to wait for (a close's, a save's, a
+    /// flush's), waits for the cut ([`Project::wait_to_land`]), at most the flush in flight's
+    /// syncs. What waiting meets of the recovery file is reported as a stroke end's is; the stroke
+    /// may land then all the same.
+    fn may_land(&mut self, scene: &mut Scene<'_>, at_once: bool) -> bool {
         if scene.project.may_land() {
             return true;
         }
-        if self.landing != Landing::Stepping {
+        if !at_once {
             return false;
         }
         if let Err(error) = scene.project.wait_to_land() {

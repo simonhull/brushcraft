@@ -175,6 +175,27 @@ impl Journalling {
         drop(dir);
         batches
     }
+
+    /// Two strokes back to back, the second waiting to begin: the first (`Down` to `Up`) is
+    /// shown and none of it lands; a tick cuts the journal, its flush left in flight (nothing
+    /// polls the project); the second's `Down` to `Up` waits for the first to land. Whatever
+    /// lands the first lands it after that cut, so the second begins waiting for the next
+    /// flush's.
+    fn second_waits(&mut self) {
+        let first = self.frame(&stroke(ACROSS, 12));
+        assert!(first.dabs_shown > 0, "{first:?}");
+        self.ticked = self.ticked.max(Instant::now()) + FLUSH_INTERVAL * 2;
+        self.project.tick(self.ticked).expect("ticked");
+        self.frame(&below());
+        assert!(!self.brush.deferred.is_empty(), "the second waits to begin");
+    }
+
+    /// Asserts that every dab of both strokes has landed, and no stroke waits to.
+    fn assert_both_landed(&self) {
+        assert_eq!(self.brush.landing(), 0, "nothing left to land");
+        assert!(self.brush.stroke.is_none(), "no stroke under way");
+        assert!(self.project.may_land(), "and none waits");
+    }
 }
 
 /// [`stroke()`] along [`ACROSS`] in 12 drags, without its `Up`: the pen stays down.
@@ -498,4 +519,55 @@ fn a_stroke_shows_its_dabs_and_lands_none_until_its_cut_is_taken() {
             .all(|batch| matches!(batch.pen_down(), store::PenDown::At(_))),
         "naming the save point its cut made: {batches:?}"
     );
+}
+
+/// A stroke along the sphere's middle lower down than [`ACROSS`], `Down` to `Up`.
+fn below() -> Vec<PenSample> {
+    stroke(((130.0, 120.0), (190.0, 130.0)), 12)
+}
+
+#[test]
+fn a_flush_lands_a_stroke_that_begins_waiting_for_its_cut() {
+    let mut run = Journalling::new();
+    run.second_waits();
+    let flushing = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    run.brush.flush(flushing).expect("flushed");
+    run.assert_both_landed();
+}
+
+#[test]
+fn a_close_lands_a_stroke_that_begins_waiting_for_its_cut() {
+    let mut run = Journalling::new();
+    run.second_waits();
+    let closing = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    run.brush.begin_closing(closing).expect("closing");
+    let began = Instant::now();
+    while run.brush.landing() > 0 {
+        let step = context(&mut run.project, run.picker.index_mut(), &run.camera);
+        run.brush.close_step(step).expect("a step");
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the close lands it all"
+        );
+    }
+    run.assert_both_landed();
+}
+
+#[test]
+fn a_save_lands_a_stroke_that_begins_waiting_for_its_cut() {
+    let mut run = Journalling::new();
+    run.second_waits();
+    run.brush.begin_saving(Instant::now());
+    run.brush.begin_landing();
+    let began = Instant::now();
+    while run.brush.landing_for_save() > 0 {
+        let step = context(&mut run.project, run.picker.index_mut(), &run.camera);
+        run.brush.save_step(step).expect("a step");
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the save lands it all"
+        );
+    }
+    run.brush.end_saving();
+    run.assert_both_landed();
 }
