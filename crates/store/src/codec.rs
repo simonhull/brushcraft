@@ -236,6 +236,33 @@ pub(crate) fn decompress(packed: &[u8], len: usize) -> std::io::Result<Vec<u8>> 
     }
 }
 
+/// The magic number a zstd frame that holds data begins with, little-endian; a skippable frame
+/// has another.
+const FRAME_MAGIC: u32 = 0xFD2F_B528;
+
+/// Decompresses `packed`, which must be one zstd frame holding exactly `len` bytes, and nothing
+/// else.
+///
+/// A record's writer makes one frame holding data, so its reader takes nothing else: not a
+/// skippable frame, and nothing after the frame.
+///
+/// # Errors
+///
+/// `InvalidData` if `packed` isn't one such frame; as [`decompress`] otherwise.
+pub(crate) fn decompress_frame(packed: &[u8], len: usize) -> std::io::Result<Vec<u8>> {
+    let magic = packed
+        .first_chunk::<4>()
+        .map(|bytes| u32::from_le_bytes(*bytes));
+    let size = zstd::zstd_safe::find_frame_compressed_size(packed).ok();
+    if magic != Some(FRAME_MAGIC) || size != Some(packed.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not exactly one zstd frame",
+        ));
+    }
+    decompress(packed, len)
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {

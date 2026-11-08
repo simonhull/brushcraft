@@ -10,6 +10,7 @@ use std::sync::Arc;
 use geom::{BaseMesh, CorrectionMap, DenseEvaluation, FaceId, Level, Region, TileKey, Vec3};
 
 use crate::file::Loc;
+use crate::journal::DAB_BYTES;
 use crate::meta::{Meta, ProjectId, Role};
 use crate::slot::EvaluatedSlot;
 use crate::tiles::{StoreConfig, TileStore};
@@ -359,4 +360,59 @@ pub(crate) fn display_layer_at(store: &mut TileStore, top: u8) -> Vec<geom::Disp
             .unwrap();
     }
     geom::build_mesh(&mesh, &positions, &normals).unwrap()
+}
+
+/// The dab at `index` in a realistic stroke, as its bytes.
+///
+/// Positions follow a gently curving path on a sphere, with two symmetry copies of each placed
+/// dab (the second mirrored in x); pressure moves the strength; the stroke's id, sequence,
+/// copy and time are as the engine sets them.
+pub(crate) fn dab_at(index: u32) -> [u8; DAB_BYTES] {
+    let seq = index / 2;
+    let copy = index % 2;
+    let step = f64::from(seq);
+    let mirror = if copy == 0 { 1.0 } else { -1.0 };
+    let narrow = |v: f64| -> f32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "test values are small, and f32 is the dab's own precision"
+        )]
+        let v = v as f32;
+        v
+    };
+    let x = mirror * (0.3 + step * 0.0015);
+    let y = 0.1 + (step * 0.01).sin() * 0.05;
+    let z = (1.0 - x * x - y * y).sqrt();
+    let floats = [
+        x,
+        y,
+        z,
+        x,
+        y,
+        z,
+        mirror,
+        0.0,
+        -x,
+        0.05,
+        0.01 * (0.5 + 0.5 * (step * 0.03).sin()),
+        0.0,
+        0.5,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    let words = floats.iter().map(|&v| narrow(v).to_bits()).chain([
+        3,
+        seq,
+        copy,
+        narrow(step / 240.0).to_bits(),
+    ]);
+    let mut dab = [0; DAB_BYTES];
+    let (slots, _) = dab.as_chunks_mut::<4>();
+    let slots = slots.iter_mut().zip(words);
+    for (slot, word) in slots {
+        *slot = word.to_le_bytes();
+    }
+    dab
 }

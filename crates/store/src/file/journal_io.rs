@@ -175,9 +175,8 @@ mod tests {
 
     use super::*;
     use crate::OpId;
-    use crate::fixture::{damage, mesh, meta};
+    use crate::fixture::{dab_at, damage, mesh, meta};
     use crate::journal::DAB_BYTES;
-    use crate::journal::tests::dab_at;
     use crate::test_dir::TestDir;
 
     /// The `k`th test batch: op 5 of site 0, `k + 1` dabs from index `10 × k`, all but the last

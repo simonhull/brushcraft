@@ -261,18 +261,19 @@ impl Held {
         }
     }
 
-    /// Those of `latest`, the latest save point, before `index`, the offset of an Index at or
-    /// before its own: the ones that Index's save point holds.
-    fn before(latest: &SavedState, index: u64) -> Self {
-        let before = |held: &SharedMap<u64, Loc>| -> Vec<Loc> {
-            held.iter()
-                .map(|(_, &loc)| loc)
-                .take_while(|loc| loc.offset < index)
-                .collect()
-        };
+    /// The stroke records of `latest`, the latest save point, before `index`, the offset of an
+    /// Index at or before its own: the ones that Index's save point holds. No batch: this is for
+    /// a base, which a store reads tiles and copies stroke records through, while a journal is
+    /// read from the recovery file it is in, never through a base.
+    fn strokes_before(latest: &SavedState, index: u64) -> Self {
+        let strokes = latest
+            .strokes
+            .iter()
+            .map(|(_, &loc)| loc)
+            .take_while(|loc| loc.offset < index);
         Self {
-            strokes: before(&latest.strokes),
-            batches: before(&latest.batches),
+            strokes: strokes.collect(),
+            batches: Vec::new(),
         }
     }
 }
@@ -1215,11 +1216,11 @@ impl ProjectFile {
             return Ok(None);
         }
         // Every save point of the chain is at or before the latest, which holds every stroke
-        // record and batch before it: this one's are those before its Index.
+        // record before it: this one's are those before its Index. A base needs no batches.
         let held = self
             .saved
             .as_ref()
-            .map(|latest| Held::before(latest, point.offset))
+            .map(|latest| Held::strokes_before(latest, point.offset))
             .unwrap_or_default();
         let saved = SavedState::loaded(point.offset, chain.head, &chain.live, held);
         Ok(Some(BaseFile {

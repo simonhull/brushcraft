@@ -15,39 +15,48 @@ pub(crate) fn put_key(out: &mut Vec<u8>, key: &TileKey) {
     out.extend_from_slice(&key.ty().to_le_bytes());
 }
 
-/// `rows` of `W` bytes transposed into `W` byte planes: byte `j` of row `i` at `j × rows.len() +
-/// i`.
+/// `rows` of `W` bytes transposed into `W` byte planes: byte `j` of row `i` at `j × n + i`, for
+/// `n` rows.
 ///
 /// Rows of numbers that change little from one to the next become long runs of alike bytes,
-/// which compress well (the stroke record's samples, the journal's dabs).
-pub(crate) fn transpose<const W: usize>(rows: &[[u8; W]]) -> Vec<u8> {
+/// which compress well (the stroke record's samples, the journal's dabs). The rows are taken as
+/// they come, so a caller that makes them on the fly holds no copy of them. Every caller's rows
+/// are of a record held to its limits, far below `usize::MAX` bytes; rows too many to count in
+/// a `usize` would give no planes rather than panic. Rows past the count the iterator states are
+/// left out, and rows it states but doesn't give are zero.
+pub(crate) fn transpose<const W: usize>(rows: impl ExactSizeIterator<Item = [u8; W]>) -> Vec<u8> {
     let n = rows.len();
-    let mut out = vec![0; n * W];
-    let numbered = rows.iter().enumerate();
+    let mut out = vec![0; n.checked_mul(W).unwrap_or(0)];
+    let numbered = rows.enumerate();
     for (i, row) in numbered {
         let targets = out.iter_mut().skip(i).step_by(n.max(1)).zip(row);
-        for (slot, &byte) in targets {
+        for (slot, byte) in targets {
             *slot = byte;
         }
     }
     out
 }
 
-/// Undoes [`transpose`]: the `count` rows of `W` bytes `planes` holds; `None` unless it is
-/// exactly `W × count` bytes.
-pub(crate) fn untranspose<const W: usize>(planes: &[u8], count: usize) -> Option<Vec<[u8; W]>> {
+/// Undoes [`transpose`]: the `count` rows of `W` bytes `planes` holds, made as they are taken;
+/// `None` unless it is exactly `W × count` bytes.
+pub(crate) fn untranspose<const W: usize>(
+    planes: &[u8],
+    count: usize,
+) -> Option<impl ExactSizeIterator<Item = [u8; W]> + '_> {
     if planes.len() != count.checked_mul(W)? {
         return None;
     }
-    let rows = (0..count).map(|i| {
+    let rows = (0..count).map(move |i| {
         let mut row = [0; W];
-        let sources = row.iter_mut().zip(planes.iter().skip(i).step_by(count));
+        let sources = row
+            .iter_mut()
+            .zip(planes.iter().skip(i).step_by(count.max(1)));
         for (slot, &byte) in sources {
             *slot = byte;
         }
         row
     });
-    Some(rows.collect())
+    Some(rows)
 }
 
 /// A cursor over a byte slice; every read returns `None` past the end.
@@ -126,6 +135,26 @@ impl<'a> Reader<'a> {
 mod proofs {
     use super::*;
 
+    /// [`untranspose`] never panics or reads out of range, whatever the planes' length and the
+    /// count, and gives back exactly the rows [`transpose`] was given.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn untranspose_is_in_range_and_undoes_transpose() {
+        let planes: [u8; 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= planes.len());
+        let count: usize = kani::any();
+        let Some(prefix) = planes.get(..len) else {
+            return;
+        };
+        if let Some(rows) = untranspose::<2>(prefix, count) {
+            assert_eq!(len, 2 * count, "only exactly 2 × count bytes");
+            assert_eq!(rows.len(), count, "count rows");
+            let back = transpose(rows);
+            assert_eq!(back.as_slice(), prefix, "transposed back, the same planes");
+        }
+    }
+
     /// Every key [`TileKey::new`] accepts reads back from its encoding.
     #[kani::proof]
     #[kani::unwind(13)]
@@ -181,12 +210,22 @@ mod tests {
     #[test]
     fn rows_transpose_into_planes_and_back() {
         let rows: Vec<[u8; 3]> = vec![[1, 2, 3], [4, 5, 6]];
-        let planes = transpose(&rows);
+        let planes = transpose(rows.iter().copied());
         assert_eq!(planes, [1, 4, 2, 5, 3, 6], "byte j of row i at j × n + i");
-        assert_eq!(untranspose(&planes, 2), Some(rows), "and back");
-        assert_eq!(untranspose::<3>(&planes, 3), None, "too few bytes");
-        assert_eq!(untranspose::<3>(&planes[..5], 2), None, "a short plane");
-        assert_eq!(transpose::<3>(&[]), Vec::<u8>::new(), "no rows");
-        assert_eq!(untranspose::<3>(&[], 0), Some(Vec::new()), "no rows back");
+        let back: Vec<[u8; 3]> = untranspose(&planes, 2).unwrap().collect();
+        assert_eq!(back, rows, "and back");
+        assert!(untranspose::<3>(&planes, 3).is_none(), "too few bytes");
+        assert!(untranspose::<3>(&planes[..5], 2).is_none(), "a short plane");
+        assert!(
+            untranspose::<3>(&planes, usize::MAX).is_none(),
+            "a count past usize"
+        );
+        assert!(transpose::<3>(std::iter::empty()).is_empty(), "no rows");
+        assert_eq!(untranspose::<3>(&[], 0).unwrap().count(), 0, "no rows back");
+        assert_eq!(
+            untranspose::<0>(&[], 4).unwrap().count(),
+            4,
+            "rows of no bytes"
+        );
     }
 }

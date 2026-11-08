@@ -34,8 +34,9 @@
 //! `f64`s of the camera: it reads as magnification 1 and no shift, the view it was drawn through.
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a start time
-//! that isn't finite, a length or count past its limit, a frame that doesn't decompress to the
-//! stated size, and a sample that isn't canonical (a tilt direction with no tilt, see
+//! that isn't finite, a length or count past its limit, anything but exactly one zstd frame after
+//! the fixed fields (a skippable frame, or bytes after the frame), a frame that doesn't decompress
+//! to the stated size, and a sample that isn't canonical (a tilt direction with no tilt, see
 //! [`PenSample`]; a twist with no tilt is valid).
 //!
 //! # Where records live
@@ -51,7 +52,7 @@ use thiserror::Error;
 
 use crate::OpId;
 use crate::bytes::{Reader, transpose, untranspose};
-use crate::codec::{compress, decompress};
+use crate::codec::{compress, decompress_frame};
 
 /// Bytes a quantized sample takes, before delta coding and compression.
 pub const SAMPLE_BYTES: usize = 16;
@@ -680,7 +681,7 @@ impl StrokeRecord {
         if settings_len > MAX_STROKE_SETTINGS || count > MAX_STROKE_SAMPLES {
             return None;
         }
-        let raw = decompress(reader.rest(), settings_len + count * SAMPLE_BYTES).ok()?;
+        let raw = decompress_frame(reader.rest(), settings_len + count * SAMPLE_BYTES).ok()?;
         let (settings, planes) = raw.split_at_checked(settings_len)?;
         Some(Self {
             op,
@@ -705,49 +706,44 @@ impl StrokeRecord {
 /// [`transpose`]).
 fn planes(samples: &[Quantized]) -> Vec<u8> {
     let mut previous = [0; 8];
-    let rows: Vec<[u8; SAMPLE_BYTES]> = samples
-        .iter()
-        .map(|sample| {
-            let fields = sample.fields();
-            let mut coded = [0; 8];
-            let columns = coded
-                .iter_mut()
-                .zip(&fields)
-                .zip(&previous)
-                .zip(&FIELD_BITS);
-            for (((slot, &value), &before), &bits) in columns {
-                *slot = delta(value, before, bits);
-            }
-            previous = fields;
-            let mut row = [0; SAMPLE_BYTES];
-            put_row(&mut row, coded);
-            row
-        })
-        .collect();
-    transpose(&rows)
+    let rows = samples.iter().map(|sample| {
+        let fields = sample.fields();
+        let mut coded = [0; 8];
+        let columns = coded
+            .iter_mut()
+            .zip(&fields)
+            .zip(&previous)
+            .zip(&FIELD_BITS);
+        for (((slot, &value), &before), &bits) in columns {
+            *slot = delta(value, before, bits);
+        }
+        previous = fields;
+        let mut row = [0; SAMPLE_BYTES];
+        put_row(&mut row, coded);
+        row
+    });
+    transpose(rows)
 }
 
 /// Undoes [`planes`] for `count` samples: `None` if the planes aren't `count` rows, or a sample
 /// isn't canonical.
 fn unplane(planes: &[u8], count: usize) -> Option<Vec<Quantized>> {
-    let rows: Vec<[u8; SAMPLE_BYTES]> = untranspose(planes, count)?;
     let mut previous = [0; 8];
-    rows.iter()
-        .map(|row| {
-            let coded = read_row(row);
-            let mut fields = [0; 8];
-            let columns = fields
-                .iter_mut()
-                .zip(&coded)
-                .zip(&previous)
-                .zip(&FIELD_BITS);
-            for (((slot, &zig), &before), &bits) in columns {
-                *slot = undelta(zig, before, bits);
-            }
-            previous = fields;
-            Quantized::from_fields(fields)
-        })
-        .collect()
+    let samples = untranspose::<SAMPLE_BYTES>(planes, count)?.map(|row| {
+        let coded = read_row(&row);
+        let mut fields = [0; 8];
+        let columns = fields
+            .iter_mut()
+            .zip(&coded)
+            .zip(&previous)
+            .zip(&FIELD_BITS);
+        for (((slot, &zig), &before), &bits) in columns {
+            *slot = undelta(zig, before, bits);
+        }
+        previous = fields;
+        Quantized::from_fields(fields)
+    });
+    samples.collect()
 }
 
 #[cfg(test)]
@@ -1042,6 +1038,14 @@ pub(crate) mod tests {
             "a count past the limit",
         );
         refused(&|p| p.truncate(p.len() - 1), "a short frame");
+        refused(
+            &|p| p.extend_from_slice(&compress(&[]).unwrap()),
+            "an empty frame after the frame",
+        );
+        refused(
+            &|p| p.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]),
+            "a skippable frame after the frame",
+        );
         refused(&|p| p.truncate(FIXED - 1), "a short payload");
     }
 

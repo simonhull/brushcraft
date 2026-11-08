@@ -26,9 +26,10 @@
 //!   × count + i`): `DAB_BYTES × count` bytes once decompressed, exactly.
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a count past
-//! its limit, a frame that doesn't decompress to the stated size (or has bytes after it), a
-//! batch whose dabs run past the last `u32` index, and a landed count past the dabs placed: the
-//! first index plus the count.
+//! its limit, anything but exactly one zstd frame after the fixed fields (a skippable frame, or
+//! bytes after the frame), a frame that doesn't decompress to the stated size, a batch whose dabs
+//! run past the last `u32` index, and a landed count past the dabs placed: the first index plus
+//! the count.
 //!
 //! # Where batches live
 //!
@@ -40,7 +41,7 @@
 use thiserror::Error;
 
 use crate::bytes::{Reader, transpose, untranspose};
-use crate::codec::{compress, decompress};
+use crate::codec::{compress, decompress_frame};
 use crate::{FileError, OpId};
 
 /// The bytes of one dab as the journal keeps it: `stroke::Dab`'s, which the store never reads.
@@ -102,8 +103,8 @@ pub enum JournalError {
 /// the batch before, from index [`DabBatch::first`], and how many of its dabs had landed at the
 /// flush's cut.
 ///
-/// Made by [`DabBatch::new`], which holds it to what a reader takes, so every batch encodes to a
-/// payload [`DabBatch::decode`] reads back as the same batch.
+/// Made by [`DabBatch::new`], which holds it to what a reader of the record takes, so every batch
+/// the store writes reads back as the same batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DabBatch {
     /// The stroke's op.
@@ -194,8 +195,8 @@ impl DabBatch {
     /// # Errors
     ///
     /// [`FileError::Io`] if compressing fails.
-    pub fn encode(&self) -> Result<Vec<u8>, FileError> {
-        let packed = compress(&transpose(&self.dabs))?;
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, FileError> {
+        let packed = compress(&transpose(self.dabs.iter().copied()))?;
         let mut out = Vec::with_capacity(FIXED + packed.len());
         out.extend_from_slice(&[VERSION, 0, 0, 0]);
         out.extend_from_slice(&self.op.to_bits().to_le_bytes());
@@ -214,7 +215,7 @@ impl DabBatch {
     /// [`JournalError::Short`], [`JournalError::Version`], [`JournalError::Reserved`],
     /// [`JournalError::ReservedSite`], [`JournalError::TooManyDabs`], [`JournalError::Frame`],
     /// [`JournalError::PastLastIndex`] or [`JournalError::LandedPastPlaced`].
-    pub fn decode(payload: &[u8]) -> Result<Self, JournalError> {
+    pub(crate) fn decode(payload: &[u8]) -> Result<Self, JournalError> {
         let mut reader = Reader::new(payload);
         let fixed = reader.take(FIXED).ok_or(JournalError::Short)?;
         let mut fields = Reader::new(fixed);
@@ -233,71 +234,20 @@ impl DabBatch {
         if count > MAX_JOURNAL_DABS {
             return Err(JournalError::TooManyDabs(count));
         }
-        let planes = decompress(reader.rest(), count * DAB_BYTES).or(Err(JournalError::Frame))?;
-        let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count).ok_or(JournalError::Frame)?;
+        let planes =
+            decompress_frame(reader.rest(), count * DAB_BYTES).or(Err(JournalError::Frame))?;
+        let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count)
+            .ok_or(JournalError::Frame)?
+            .collect();
         Self::new(op, first, landed, dabs)
     }
 }
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-
-    /// The dab at `index` in a realistic stroke, as its bytes.
-    ///
-    /// Positions follow a gently curving path on a sphere, with two symmetry copies of each placed
-    /// dab (the second mirrored in x); pressure moves the strength; the stroke's id, sequence,
-    /// copy and time are as the engine sets them.
-    pub(crate) fn dab_at(index: u32) -> [u8; DAB_BYTES] {
-        let seq = index / 2;
-        let copy = index % 2;
-        let step = f64::from(seq);
-        let mirror = if copy == 0 { 1.0 } else { -1.0 };
-        let narrow = |v: f64| -> f32 {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "test values are small, and f32 is the dab's own precision"
-            )]
-            let v = v as f32;
-            v
-        };
-        let x = mirror * (0.3 + step * 0.0015);
-        let y = 0.1 + (step * 0.01).sin() * 0.05;
-        let z = (1.0 - x * x - y * y).sqrt();
-        let floats = [
-            x,
-            y,
-            z,
-            x,
-            y,
-            z,
-            mirror,
-            0.0,
-            -x,
-            0.05,
-            0.01 * (0.5 + 0.5 * (step * 0.03).sin()),
-            0.0,
-            0.5,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-        ];
-        let words = floats.iter().map(|&v| narrow(v).to_bits()).chain([
-            3,
-            seq,
-            copy,
-            narrow(step / 240.0).to_bits(),
-        ]);
-        let mut dab = [0; DAB_BYTES];
-        let (slots, _) = dab.as_chunks_mut::<4>();
-        let slots = slots.iter_mut().zip(words);
-        for (slot, word) in slots {
-            *slot = word.to_le_bytes();
-        }
-        dab
-    }
+    use crate::fixture::dab_at;
 
     /// The tests' batch: op 9 of site 2, three dabs of distinct bytes from index 37, 12 of the
     /// stroke's dabs landed.
@@ -317,6 +267,22 @@ pub(crate) mod tests {
         assert_eq!(batch.dabs().len(), 3, "dabs");
         let payload = batch.encode().unwrap();
         assert_eq!(DabBatch::decode(&payload), Ok(batch), "round trip");
+    }
+
+    /// An empty skippable zstd frame: its magic number, then a length of zero.
+    const SKIPPABLE: [u8; 8] = [0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+
+    #[test]
+    fn an_empty_batch_s_frame_is_a_real_one() {
+        let empty = DabBatch::new(OpId::new(0, 4).unwrap(), 3, 3, Vec::new()).unwrap();
+        let mut payload = empty.encode().unwrap();
+        payload.truncate(FIXED);
+        payload.extend_from_slice(&SKIPPABLE);
+        assert_eq!(
+            DabBatch::decode(&payload),
+            Err(JournalError::Frame),
+            "a skippable frame alone"
+        );
     }
 
     #[test]
@@ -384,6 +350,11 @@ pub(crate) mod tests {
         );
         refused(&|p| p.truncate(p.len() - 1), JournalError::Frame);
         refused(&|p| p.push(0), JournalError::Frame);
+        refused(
+            &|p| p.extend_from_slice(&compress(&[]).unwrap()),
+            JournalError::Frame,
+        );
+        refused(&|p| p.extend_from_slice(&SKIPPABLE), JournalError::Frame);
         refused(
             &|p| p[16..20].copy_from_slice(&41_u32.to_le_bytes()),
             JournalError::LandedPastPlaced {

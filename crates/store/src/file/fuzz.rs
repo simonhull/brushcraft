@@ -525,10 +525,11 @@ fn journal_decode() {
 ///
 /// Three save points (one full Index, two deltas) of a tile each at levels 1 to 3, a known and an
 /// unknown bound, and an unsaved tile after the last save point. The first and third tiles'
-/// strokes leave records, and so does the unsaved tile's. With `journal`, as a recovery file
-/// holds one, the third tile's stroke also journals two batches before its save point (some dabs,
-/// then only its landed count moving), and the unsaved tile's one after it.
-fn seed_file(path: &Path, meta: Meta, journal: bool) {
+/// strokes leave records, and so does the unsaved tile's. A recovery file holds a journal too:
+/// the third tile's stroke journals two batches before its save point (some dabs, then only its
+/// landed count moving), and the unsaved tile's one after it.
+fn seed_file(path: &Path, meta: Meta) {
+    let journal = matches!(meta.role(), Role::Recovery { .. });
     let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
     for (seq, level) in (1..).zip(1..=3_u8) {
         let face = FaceId::new(level.into());
@@ -585,9 +586,7 @@ fn seed_file(path: &Path, meta: Meta, journal: bool) {
 /// Appends a batch of `op` to `file`: `count` of the tests' realistic dabs from index `first`,
 /// `landed` of them landed.
 fn seed_batch(file: &mut ProjectFile, op: OpId, (first, count): (u32, u32), landed: u32) {
-    let dabs: Vec<[u8; DAB_BYTES]> = (first..first + count)
-        .map(crate::journal::tests::dab_at)
-        .collect();
+    let dabs: Vec<[u8; DAB_BYTES]> = (first..first + count).map(fixture::dab_at).collect();
     let batch = DabBatch::new(op, first, landed, dabs).unwrap();
     file.append_batches(&[frame_batch(&batch).unwrap()])
         .unwrap();
@@ -725,7 +724,7 @@ fn write_fuzz_seeds() {
     std::fs::write(corpus.join("mesh_from_bytes/seed-cube"), mesh).unwrap();
     let dir = TestDir::new();
     let project = dir.path("project");
-    seed_file(&project, fixture::meta(), false);
+    seed_file(&project, fixture::meta());
     let point = ProjectFile::open(&project)
         .unwrap()
         .base()
@@ -735,7 +734,7 @@ fn write_fuzz_seeds() {
         .with_role(Role::Recovery { base: Some(point) })
         .on_save_point(point, Path::new("/home/someone/sculpts/head.project"));
     let recovery_path = dir.path("recovery");
-    seed_file(&recovery_path, recovery, true);
+    seed_file(&recovery_path, recovery);
     let seeds = corpus.join("project_open");
     for (from, name) in [(project, "seed-project"), (recovery_path, "seed-recovery")] {
         let bytes = std::fs::read(from).unwrap();
