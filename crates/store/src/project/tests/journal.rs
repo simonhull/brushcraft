@@ -544,7 +544,7 @@ fn a_stroke_begun_while_the_last_one_waits_writes_after_it() {
 }
 
 #[test]
-fn a_roll_over_journals_the_dabs_not_landed_into_the_fresh_file() {
+fn after_a_roll_over_the_next_flush_journals_the_dabs_not_landed_into_the_fresh_file() {
     let dir = TestDir::new();
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
@@ -596,5 +596,80 @@ fn a_tile_left_out_of_a_flush_with_a_batch_abandons_it() {
         !project.store().working().has_unsaved_records(),
         "a save point holds them"
     );
+    project.close(false).unwrap();
+}
+
+/// Lets a held writer thread go, and polls until the flush in flight fails: its batch's encode,
+/// made to fail. Returns the error.
+fn let_go_to_fail(project: &mut Project) -> ProjectError {
+    project.writer.as_ref().unwrap().pause(false);
+    let began = Instant::now();
+    loop {
+        if let Err(e) = project.poll() {
+            return e;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "the flush fails");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn an_ended_stroke_whose_cut_fails_writes_its_last_count_only_if_a_batch_is_in_the_file() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+
+    // No batch of it in the file: nothing to write, and the journal goes.
+    let mut unwritten = Stroke::begin(&mut project, 20, 22);
+    unwritten.place(&mut project, 10);
+    project.writer.as_ref().unwrap().fail_batch_encodes(1);
+    start_held_flush(&mut project);
+    unwritten.land(&mut project, &mut map, 10);
+    project.end_unrecorded_stroke().unwrap();
+    let failed = let_go_to_fail(&mut project);
+    assert!(
+        matches!(failed, ProjectError::Recovery(RecoveryError::Journal(_))),
+        "{failed:?}"
+    );
+    assert!(
+        project.writer.as_ref().unwrap().is_idle(),
+        "the stroke end's flush dropped"
+    );
+    assert!(!project.store().has_journal_work(), "the journal gone");
+    flush(&mut project);
+    assert_eq!(batches(&mut project), Vec::new(), "no batch, then or later");
+
+    // A batch of it in the file: its last count waits for the next flush.
+    let mut written = Stroke::begin(&mut project, 20, 23);
+    written.place(&mut project, 4);
+    flush(&mut project);
+    written.place(&mut project, 6);
+    project.writer.as_ref().unwrap().fail_batch_encodes(1);
+    start_held_flush(&mut project);
+    written.land(&mut project, &mut map, 10);
+    project.end_unrecorded_stroke().unwrap();
+    let failed_again = let_go_to_fail(&mut project);
+    assert!(
+        matches!(
+            failed_again,
+            ProjectError::Recovery(RecoveryError::Journal(_))
+        ),
+        "{failed_again:?}"
+    );
+    assert!(
+        project.writer.as_ref().unwrap().is_idle(),
+        "the stroke end's flush dropped"
+    );
+    let op = written.op;
+    assert_eq!(batches(&mut project), vec![batch(op, 0..4, 0)], "not yet");
+    assert!(project.store().has_journal_work(), "the last count waits");
+    project
+        .tick(Instant::now() + FLUSH_INTERVAL * 1_000)
+        .unwrap();
+    crash::poll_until_idle(&mut project);
+    let last = vec![batch(op, 0..4, 0), batch(op, 10..10, 10)];
+    assert_eq!(batches(&mut project), last, "the next tick writes it");
+    flush(&mut project);
+    assert_eq!(batches(&mut project), last, "once");
     project.close(false).unwrap();
 }

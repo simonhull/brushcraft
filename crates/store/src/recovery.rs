@@ -91,6 +91,12 @@
 //! beside a count that counts its dabs landed. A broken slot is lost either way, and handled as
 //! in any flush first.
 //!
+//! So a valid tile that keeps failing to encode while a batch is due abandons every flush, with
+//! no save point, until it encodes, and its key is reported late each time
+//! ([`crate::ProjectError::Unprotected`]). That is accepted: a valid slot's copy fails only as
+//! compression does, which passes, and a slot found broken is lost, as in any flush, and stops
+//! abandoning them.
+//!
 //! A failed sync is different, and final for the file. After one, the kernel may have dropped
 //! the unsynced pages, so the records appended since the last durable save point may not be on
 //! disk although the store counts them as written, and a later sync that succeeds proves

@@ -1174,14 +1174,15 @@ impl Project {
         Ok(self.store.journal(op, placed)?)
     }
 
-    /// How many of the open stroke's dabs have landed: passed with each landing, with the
-    /// count it reaches, before the next [`Project::tick`], so a flush's cut always pairs the
-    /// store's tiles with the count that made them.
+    /// How many of the open stroke's dabs have landed: the app passes it with each landing, the
+    /// count that landing reaches, on the owner thread, so a flush's cut always pairs the store's
+    /// tiles with the count that made them.
     ///
-    /// The count must hold before the edits it describes are made and no tick comes between:
-    /// a tick that cut after the edits and before the count would name tiles whose dabs its batch
-    /// doesn't count landed, and a restore would land them twice. A dab landed and not yet
-    /// written is never written. A stroke that ends with dabs not landed counts them landed:
+    /// What matters is that no tick (so no cut) falls between a landing's edits and its count,
+    /// in either order: count first, a cut between would count dabs landed that its tiles lack,
+    /// and a restore would lose them; edits first, it would name tiles holding dabs its count
+    /// leaves out, and a restore would land them twice. A dab landed and not yet written is never
+    /// written. A stroke that ends with dabs not landed counts them landed:
     /// they were dropped, and a restore never lands them.
     ///
     /// # Errors

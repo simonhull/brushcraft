@@ -6,10 +6,14 @@
 //! The recovery writer takes the journal's **cut** as it takes its tile snapshot, on the owner
 //! thread, at the same moment ([`TileStore::cut_journal`]): a [`DabBatch`] of the dabs placed and
 //! not yet written, from whichever is later of the last written and the last landed (a dab landed
-//! is never written: the tiles hold it), with the landed count as it is then. The landed count is
-//! moved by [`TileStore::journal_landed`] before the dabs' edits are made, between two ticks, so
-//! at any cut it is the count of dabs whose edits the snapshot copies, and the batch's count
-//! describes exactly the tiles that flush's save point names.
+//! is never written: the tiles hold it), with the landed count as it is then. The app passes the
+//! landed count ([`TileStore::journal_landed`]) with each landing, on the owner thread, with no
+//! tick (so no cut) between the landing's edits and its count, in either order: a cut after the
+//! count and before the edits would count dabs landed that its tiles lack, and a restore would
+//! lose them; a cut after the edits and before the count would name tiles holding dabs its count
+//! leaves out, and a restore would land them twice. So at any cut the count is that of the dabs
+//! whose edits the snapshot copies, and the batch's count describes exactly the tiles that
+//! flush's save point names.
 //!
 //! The cut stays **in flight** on the journal until the writer appends its batches with the
 //! flush's records ([`TileStore::append_journal`]), before the tile sync, so the save point that
@@ -58,7 +62,9 @@ use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum JournalCountError {
-    /// No journal of the stroke is open: no stroke began, or it has ended.
+    /// No journal of the stroke is open: no stroke began, or it has ended. [`crate::Project`]
+    /// never meets it: it answers [`crate::ProjectError::NoStroke`] first, and opens a journal
+    /// with every stroke it begins.
     #[error("no journal of the stroke is open")]
     NotOpen,
     /// The dabs would run past the last index a `u32` counts.
@@ -317,9 +323,10 @@ impl TileStore {
         self.journals.open(op)?.place(placed)
     }
 
-    /// `landed` of the dabs the stroke made as `op` placed have landed, or are about to: given
-    /// before their edits are made, so a flush's cut always pairs the store's tiles with the count
-    /// that made them.
+    /// `landed` of the dabs the stroke made as `op` placed have landed: passed with each landing,
+    /// on the owner thread, with no cut between the landing's edits and this count, in either
+    /// order, so a flush's cut always pairs the store's tiles with the count that made them (see
+    /// the module notes).
     ///
     /// # Errors
     ///
@@ -371,11 +378,24 @@ impl TileStore {
     pub(crate) fn cut_journal(&mut self) -> Result<Vec<DabBatch>, CacheError> {
         self.drop_journal_cut();
         let mut batches = Vec::new();
+        let mut refused = None;
         for journal in self.journals.all_mut() {
-            if let Some((cut, reached)) = journal.cut()? {
-                batches.extend(cut);
-                journal.in_flight = Some(reached);
+            match journal.cut() {
+                Ok(Some((cut, reached))) => {
+                    batches.extend(cut);
+                    journal.in_flight = Some(reached);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
             }
+        }
+        if let Some(e) = refused {
+            // The journals cut before it hold cuts no flush will append.
+            self.drop_journal_cut();
+            return Err(e.into());
         }
         Ok(batches)
     }
