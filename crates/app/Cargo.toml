@@ -29,5 +29,10 @@ ui.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# A desktop notification's socket, connected within its deadline, and the uid it authenticates
+# to the session bus with.
+rustix = { workspace = true, features = ["net", "process"] }
+
 [dev-dependencies]
 bolero.workspace = true

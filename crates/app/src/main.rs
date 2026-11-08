@@ -31,6 +31,14 @@ mod cli;
 mod dialogs;
 mod frame;
 mod navigate;
+#[cfg_attr(
+    any(not(test), not(target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "the finisher that sends a notification comes next"
+    )
+)]
+mod notify;
 mod overlay;
 mod pace;
 mod paths;
