@@ -89,8 +89,9 @@
 //! is discarded: a save point is the unit of durability, and replaying the tail could bring
 //! back half a stroke. A stroke whose dabs were still landing comes back from the dab journal
 //! that save point holds ([`Project::take_open_stroke`], [`Project::resume_stroke`]): its tiles
-//! as far as it had landed, its dabs not landed, and the surface it began on, to land the rest
-//! as it would have live. At worst, about a second of placed dabs is lost, or, with a journal
+//! as far as it had landed, its dabs not landed, and the surface it began on, all exact, to land
+//! the rest on; the app's landing gives the live result within half a quantization step per
+//! vertex it touches. At worst, about a second of placed dabs is lost, or, with a journal
 //! that can't be used, the dabs not landed.
 
 use std::collections::BTreeSet;
@@ -1385,9 +1386,15 @@ impl Project {
         self.open_stroke.take()
     }
 
-    /// Reopens `stroke`'s op and installs its pen-down shapes, so its dabs land as they would
-    /// have live: the stroke is open again, as [`Project::begin_stroke`] leaves one, and may land
-    /// at once (its pen-down surface is in the file, and its cut is the restored state).
+    /// Reopens `stroke`'s op and installs its pen-down shapes, so its dabs land on the surface the
+    /// stroke began on: the stroke is open again, as [`Project::begin_stroke`] leaves one, and may
+    /// land at once (its pen-down surface is in the file, and its cut is the restored state).
+    ///
+    /// What the store gives back is exact: the tiles, the rows, the pen-down shapes and the
+    /// journal. The landing above it isn't quite: the app's stroke restarted on the restored tiles
+    /// takes each vertex's start from its stored, quantized correction, so the result matches the
+    /// live one within half a quantization step per vertex it touches (see the `resume` module
+    /// notes).
     ///
     /// Its edits from now on are made as its op. Its journal goes on from what the recovery file
     /// holds: [`Project::journal_landed`] counts on from [`OpenStroke::landed`], its dabs not

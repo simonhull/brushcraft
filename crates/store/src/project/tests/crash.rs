@@ -854,8 +854,17 @@ const RESUME_RUNS: u32 = 20;
 /// The longest the resuming crash test waits after the child's first save point to kill it.
 const RESUME_KILL_WITHIN: Duration = Duration::from_millis(150);
 
+/// A restore after a kill mid-landing continues the stroke's tiles, rows and journal exactly.
+///
+/// Killed at random moments of a long stroke's landing, a restore gives them as the last save
+/// point left them, and landing the rows not landed gives the tiles of every dab placed by it.
+///
+/// The fixture's dabs are store edits that each set one vertex's correction outright, so landing
+/// them from the restored tiles gives the same tiles as landing them all live: this proves the
+/// store's part exact, not the app's stroke, which lands within half a quantization step of the
+/// live result (see `crate::project::resume`, "What is exact").
 #[test]
-fn restoring_and_landing_the_rest_gives_the_bits_of_a_run_never_killed() {
+fn restoring_and_landing_the_rest_gives_the_tiles_of_every_dab_placed() {
     let mesh = mesh();
     for run in 0..RESUME_RUNS {
         let dir = TestDir::new();
@@ -890,12 +899,12 @@ fn restoring_and_landing_the_rest_gives_the_bits_of_a_run_never_killed() {
             done = next;
         }
         project.end_unrecorded_stroke().unwrap();
-        // A run never killed: every dab placed by the last save point, landed.
-        let mut never_killed = CorrectionMap::new();
-        record(&mesh, &mut never_killed, &edits);
+        // Every dab placed by the last save point, landed.
+        let mut placed_all = CorrectionMap::new();
+        record(&mesh, &mut placed_all, &edits);
         assert_positions(
             project.store(),
-            &dense(&mesh, &never_killed),
+            &dense(&mesh, &placed_all),
             &tiles(&mesh, 1, TOP),
             &what,
         );

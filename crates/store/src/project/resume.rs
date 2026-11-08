@@ -23,9 +23,19 @@
 //! record there, or, where it had none, the base's (the project file's save point the recovery
 //! file extends), or zero, as the store reads a tile.
 //!
+//! # What is exact
+//!
+//! What the store restores is exact: the tiles as the save point names them, the stroke's dabs
+//! not landed (the very rows it journalled), its pen-down shapes (the tiles as it found them, bit
+//! for bit) and its journal, which goes on from its landed count as the live one would. The
+//! landing above the store is not: the app's stroke (`sculpt::Stroke`) restarted on the restored
+//! tiles takes each vertex's start from the stored, quantized correction, where the live stroke
+//! kept it unrounded, so the result matches the live one within half a quantization step per
+//! vertex the stroke touches (the dab journal spec, "Restoring a journalled stroke").
+//!
 //! # When it can't be used
 //!
-//! Anything that keeps the stroke from landing as it would have live makes its journal unusable
+//! Anything that keeps the store from restoring the stroke exactly makes its journal unusable
 //! ([`JournalUnusable`]), never an error of the restore: the restored tiles stand, as they would
 //! with no journal, and the project opens. That is a batch that doesn't read, a gap or an overlap,
 //! batches of the stroke that disagree, rows of no format, a pen-down surface no save point of

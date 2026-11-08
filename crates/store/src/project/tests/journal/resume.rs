@@ -1,9 +1,9 @@
 //! Restoring yields the open stroke.
 //!
 //! A restore finds the stroke still landing in the recovery file's journal, with its dabs not
-//! landed and its pen-down surface as the save point its batches name holds it, and resuming it
-//! lands the rest as the live stroke would have; a journal it can't use leaves the restored tiles
-//! alone, and says why.
+//! landed and its pen-down surface as the save point its batches name holds it, all exact, and
+//! resuming it lands the rest with its own op and its journal going on from its landed count; a
+//! journal it can't use leaves the restored tiles alone, and says why.
 
 use std::collections::{BTreeMap, BTreeSet};
 
