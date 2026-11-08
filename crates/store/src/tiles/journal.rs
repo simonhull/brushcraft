@@ -77,6 +77,7 @@ use super::TileStore;
 use super::error::{CacheError, Invariant};
 use crate::OpId;
 use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS, PenDown};
+use crate::stamp::Stamp;
 
 /// The name of a flush's cut of the journals ([`TileStore::cut_journal`]).
 ///
@@ -170,14 +171,18 @@ struct Journal {
     /// The format of its rows, as the app set it when the stroke began (see
     /// [`crate::journal`]): every batch of it carries it.
     dab_format: u32,
+    /// The store's latest write when the stroke began: a write since (of the stroke's, or of any
+    /// other op) changed the surface it found.
+    begun_at: Stamp,
 }
 
 impl Journal {
     /// An empty journal of the stroke made as `op`, its pen-down surface at `pen_down`, its rows
-    /// in `dab_format`.
-    const fn new(op: OpId, pen_down: PenDownPoint, dab_format: u32) -> Self {
+    /// in `dab_format`, begun with the store's writes at `begun_at`.
+    const fn new(op: OpId, pen_down: PenDownPoint, dab_format: u32, begun_at: Stamp) -> Self {
         Self {
             dab_format,
+            begun_at,
             op,
             placed: 0,
             landed: 0,
@@ -383,7 +388,8 @@ impl TileStore {
     /// notes): opens its journal, closing any still open (see [`TileStore::end_journal`]).
     pub(crate) fn begin_journal(&mut self, op: OpId, pen_down: PenDownPoint) {
         self.journals.close();
-        self.journals.open = Some(Journal::new(op, pen_down, self.journals.dab_format));
+        let dab_format = self.journals.dab_format;
+        self.journals.open = Some(Journal::new(op, pen_down, dab_format, self.last_write));
     }
 
     /// The rows the app journals are laid out in dab format `dab_format`, the version of
@@ -602,12 +608,13 @@ impl TileStore {
     ///
     /// The open stroke's pen-down surface:
     ///
-    /// - **After a save**, if the stroke has landed nothing, the saved state is its surface, and
-    ///   the new file's base: [`PenDown::Base`]. Otherwise the new file holds no save point of the
-    ///   surface it began on, and its pen-down is unknown from then on (its journal can't be
-    ///   restored from the new file). A save refuses while dabs are landing, and the app saves only
-    ///   after the pen lifts, so the app never meets that; a store-level save in the middle of a
-    ///   stroke whose dabs have all landed leaves the rest of the stroke's dabs unrestorable.
+    /// - **After a save**, if the store took no write since the stroke began (none of the stroke's,
+    ///   none of any other op's), the saved state is its surface, and the new file's base:
+    ///   [`PenDown::Base`]. Otherwise the new file holds no save point of the surface it began on,
+    ///   and its pen-down is unknown from then on (its journal can't be restored from the new
+    ///   file). A save refuses while dabs are landing, and the app saves only after the pen lifts,
+    ///   so the app never meets that; a store-level save in the middle of a stroke whose dabs have
+    ///   all landed leaves the rest of the stroke's dabs unrestorable.
     /// - **After a roll-over**, unknown for now: a roll-over can leave a stroke landing, and is to
     ///   write the pen-down surface into the new file and name that save point instead (the dab
     ///   journal's next step).
@@ -616,7 +623,7 @@ impl TileStore {
         if let Some(journal) = &mut self.journals.open {
             journal.written = None;
             journal.in_flight = None;
-            let found = how == Rebase::Save && journal.landed == 0;
+            let found = how == Rebase::Save && self.last_write <= journal.begun_at;
             journal.pen_down = PenDownPoint::Known(if found {
                 PenDown::Base
             } else {

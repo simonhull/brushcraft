@@ -809,6 +809,10 @@ pub(crate) struct Sculpting {
     /// Whether the last route raycast its `Down` and found no surface
     /// ([`Brush::routed_off_surface`]).
     route_missed: bool,
+    /// Test record: how many steps that land at once found the stroke waiting for its cut, and
+    /// waited ([`Sculpting::may_land`]).
+    #[cfg(test)]
+    waited_to_land: u64,
 }
 
 impl Sculpting {
@@ -851,6 +855,8 @@ impl Sculpting {
             status: (Vec::new(), None),
             stroke_start: None,
             route_missed: false,
+            #[cfg(test)]
+            waited_to_land: 0,
         };
         brush.refresh_status();
         brush
@@ -1431,6 +1437,10 @@ impl Sculpting {
         }
         if !at_once {
             return false;
+        }
+        #[cfg(test)]
+        {
+            self.waited_to_land += 1;
         }
         if let Err(error) = scene.project.wait_to_land() {
             self.ended_with(error);

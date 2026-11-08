@@ -603,3 +603,35 @@ fn a_save_before_a_stroke_lands_anything_makes_the_new_file_s_base_its_pen_down(
     );
     project.close(false).unwrap();
 }
+
+#[test]
+fn a_save_after_any_write_since_a_stroke_began_leaves_its_pen_down_unknown() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+
+    // The stroke's own edits, journalling nothing: none counted landed, the surface changed.
+    Stroke::begin(&mut project, 20, 65);
+    apply_dabs(project.store(), &mut map, &random_edits(&mesh, TOP, 10, 66));
+    assert_saved(project.save_as(&path));
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "edited unjournalled: the saved state isn't what it found"
+    );
+    project.end_unrecorded_stroke().unwrap();
+    crash::poll_until_idle(&mut project);
+
+    // An edit of another op in between.
+    Stroke::begin(&mut project, 20, 67);
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 10, 68));
+    assert_saved(project.save());
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "another op's edit since it began"
+    );
+    project.close(false).unwrap();
+}

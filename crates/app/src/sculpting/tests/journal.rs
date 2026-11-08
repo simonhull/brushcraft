@@ -190,8 +190,13 @@ impl Journalling {
         assert!(!self.brush.deferred.is_empty(), "the second waits to begin");
     }
 
-    /// Asserts that every dab of both strokes has landed, and no stroke waits to.
+    /// Asserts that the second stroke began waiting for its cut and the step waited for it, that
+    /// every dab of both strokes has landed, and that no stroke waits to.
     fn assert_both_landed(&self) {
+        assert!(
+            self.brush.waited_to_land > 0,
+            "the second stroke began waiting for its cut, and the step waited"
+        );
         assert_eq!(self.brush.landing(), 0, "nothing left to land");
         assert!(self.brush.stroke.is_none(), "no stroke under way");
         assert!(self.project.may_land(), "and none waits");

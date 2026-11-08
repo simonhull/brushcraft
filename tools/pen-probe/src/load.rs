@@ -438,7 +438,9 @@ impl Load {
             .collect::<Result<Vec<_>>>()?;
         let stroke = Stroke::new(project.store());
         let cursor = project.store().subscribe_stale();
-        project.begin_stroke().context("beginning a stroke")?;
+        project
+            .begin_stroke_and_wait()
+            .context("beginning a stroke")?;
         let now = Instant::now();
         Ok(Self {
             project,
@@ -563,7 +565,9 @@ impl Load {
                 .context("ending a stroke")?;
             self.plan = (self.plan + 1) % self.plans.len();
             self.dab = 0;
-            self.project.begin_stroke().context("beginning a stroke")?;
+            self.project
+                .begin_stroke_and_wait()
+                .context("beginning a stroke")?;
             record.stroke_end += ending.elapsed();
         }
         Ok(())
