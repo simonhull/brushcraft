@@ -33,8 +33,8 @@ pub struct Control<A> {
 pub struct Bar<A> {
     /// What it says.
     title: String,
-    /// More, in quieter text under the title.
-    detail: Option<String>,
+    /// More, in quieter text under the title: a line each, in order.
+    detail: Vec<String>,
     /// 0 to 1: draws the progress line.
     progress: Option<f32>,
     /// A coral hairline: this needs the user.
@@ -54,20 +54,19 @@ impl<A> Bar<A> {
         filled.for_each(|control| control.emphasis = Emphasis::Quiet);
         Self {
             title: title.into(),
-            detail: None,
+            detail: Vec::new(),
             progress: None,
             needs_you: false,
             controls,
         }
     }
 
-    /// This bar with more to say, in quieter text under the title.
+    /// This bar with more to say, in quieter text under the title: a line under any said
+    /// already. A bar of more than one such line grows by a line for each after the first.
     #[must_use]
-    pub fn with_detail(self, detail: impl Into<String>) -> Self {
-        Self {
-            detail: Some(detail.into()),
-            ..self
-        }
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail.push(detail.into());
+        self
     }
 
     /// This bar with a progress line, `progress` of the way along, 0 to 1.
@@ -94,10 +93,16 @@ impl<A> Bar<A> {
         &self.title
     }
 
-    /// What it says under that, if anything.
+    /// What it says under that, if anything: its first detail line.
     #[must_use]
     pub fn detail(&self) -> Option<&str> {
-        self.detail.as_deref()
+        self.detail.first().map(String::as_str)
+    }
+
+    /// Every line it says under that, in order.
+    #[must_use]
+    pub fn details(&self) -> &[String] {
+        &self.detail
     }
 
     /// Its controls, left to right, at most one of them filled.
@@ -277,9 +282,11 @@ impl BarSizes {
         let title = text
             .line(&bar.title, theme.title_weight, self.body_px)
             .width;
-        let detail = bar.detail.as_deref().map_or(0.0, |detail| {
-            text.line(detail, theme.status_weight, self.status_px).width
-        });
+        let widths = bar
+            .detail
+            .iter()
+            .map(|detail| text.line(detail, theme.status_weight, self.status_px).width);
+        let detail = widths.fold(0.0_f32, f32::max);
         let controls: f32 = labels.iter().map(|label| label.width + self.gap).sum();
         let content =
             self.text_inset + self.mark_room + title.max(detail).ceil() + controls + self.inset;
@@ -289,13 +296,21 @@ impl BarSizes {
         let extra = bar
             .progress
             .map_or(0.0, |_| self.gap + self.progress_height);
-        let height = 2.0 * self.inset + self.row_height + extra;
+        let height = 2.0 * self.inset + self.row(bar) + extra;
         Rect {
             x: ((view.width - width) * 0.5).round(),
             y: view.height - view.whole(theme.bar_bottom) - height,
             w: width,
             h: height,
         }
+    }
+
+    /// The height of `bar`'s row: the controls' height, and a status line more for each detail
+    /// line after the first.
+    fn row<A>(&self, bar: &Bar<A>) -> f32 {
+        let more = bar.detail.len().saturating_sub(1);
+        let more = f32::from(u16::try_from(more).unwrap_or(u16::MAX));
+        self.row_height + more * self.status_height
     }
 
     /// The title and any detail, centred together on the row at `at`, its left and top, and
@@ -309,9 +324,9 @@ impl BarSizes {
         text: &mut Text,
     ) -> Vec<PlacedLine> {
         let (x, row_top) = at;
-        let detail = bar.detail.as_deref();
-        let block = self.body_height + detail.map_or(0.0, |_| self.status_height);
-        let top = row_top + ((self.row_height - block) * 0.5).round();
+        let count = f32::from(u16::try_from(bar.detail.len()).unwrap_or(u16::MAX));
+        let block = self.body_height + count * self.status_height;
+        let top = row_top + ((self.row(bar) - block) * 0.5).round();
         let (title_weight, status_weight) = (theme.title_weight, theme.status_weight);
         let title = PlacedLine {
             line: fitted(text, &bar.title, title_weight, self.body_px, room),
@@ -319,15 +334,21 @@ impl BarSizes {
             baseline: top + text.baseline(title_weight, self.body_px, self.body_height),
             colour: theme.text,
         };
-        let detail = detail.map(|detail| PlacedLine {
-            line: fitted(text, detail, status_weight, self.status_px, room),
-            x,
-            baseline: top
-                + self.body_height
-                + text.baseline(status_weight, self.status_px, self.status_height),
-            colour: theme.quiet_text,
-        });
-        std::iter::once(title).chain(detail).collect()
+        let under = top + self.body_height;
+        let tops = (0_u16..).map(|line| under + f32::from(line) * self.status_height);
+        let details = bar
+            .detail
+            .iter()
+            .zip(tops)
+            .map(|(detail, line_top)| PlacedLine {
+                line: fitted(text, detail, status_weight, self.status_px, room),
+                x,
+                baseline: line_top
+                    + text.baseline(status_weight, self.status_px, self.status_height),
+                colour: theme.quiet_text,
+            });
+        let details: Vec<PlacedLine> = details.collect();
+        std::iter::once(title).chain(details).collect()
     }
 }
 
@@ -400,7 +421,7 @@ pub(crate) struct BarLayout {
     pub(crate) glass: Rect,
     /// Its controls, left to right.
     pub(crate) controls: Vec<ControlLayout>,
-    /// Its title, and its detail if it has one.
+    /// Its title, and its detail lines if it has any.
     pub(crate) lines: Vec<PlacedLine>,
     /// Its needs-you mark, if it has one.
     mark: Option<Rect>,
@@ -419,12 +440,15 @@ impl BarLayout {
             .collect();
         let glass = sizes.glass(bar, &labels, view, theme, text);
         let row_top = glass.y + sizes.inset;
+        let row = sizes.row(bar);
+        // The controls, and the mark, centred on a row grown for more detail lines.
+        let controls_top = row_top + ((row - sizes.row_height) * 0.5).round();
 
         let mut right = glass.x + glass.w - sizes.inset;
         let mut controls = Vec::with_capacity(labels.len());
         let right_to_left = labels.into_iter().rev();
         for label in right_to_left {
-            let control = label.place(right, row_top, &sizes, text);
+            let control = label.place(right, controls_top, &sizes, text);
             right = control.rect.x - sizes.gap;
             controls.push(control);
         }
@@ -434,14 +458,14 @@ impl BarLayout {
         let lines = sizes.text_lines(bar, (text_left, row_top), right - text_left, theme, text);
         let mark = bar.needs_you.then(|| Rect {
             x: glass.x + sizes.text_inset,
-            y: row_top + ((sizes.row_height - sizes.mark_size) * 0.5).round(),
+            y: row_top + ((row - sizes.mark_size) * 0.5).round(),
             w: sizes.mark_size,
             h: sizes.mark_size,
         });
         let progress = bar.progress.map(|done| ProgressLayout {
             track: Rect {
                 x: glass.x + sizes.text_inset,
-                y: row_top + sizes.row_height + sizes.gap,
+                y: row_top + row + sizes.gap,
                 w: glass.w - sizes.text_inset - sizes.inset - view.whole(theme.progress_end_inset),
                 h: sizes.progress_height,
             },

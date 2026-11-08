@@ -144,7 +144,8 @@ pub(crate) enum LastStroke {
     Unfinished,
 }
 
-/// The restore note's detail when the last stroke can't be finished ([`LastStroke::Unfinished`]).
+/// The restore note's line under its time when the last stroke can't be finished
+/// ([`LastStroke::Unfinished`]).
 pub(crate) const UNFINISHED_STROKE: &str =
     "Your last stroke couldn't be finished; the rest of your work is back.";
 
@@ -175,7 +176,7 @@ enum Prompt {
         /// say.
         said: Option<String>,
         /// What became of the stroke the restore found still landing: one that can't be finished
-        /// is the detail in place of `said`.
+        /// is a detail line under `said`.
         last: LastStroke,
         /// When the note goes by itself.
         until: Instant,
@@ -233,14 +234,14 @@ impl Prompt {
             }
             Self::Restored { said, last, .. } => {
                 let controls = vec![quiet("Use last save instead", Action::UseLastSave)];
-                let detail = match last {
-                    LastStroke::Whole => said.as_deref(),
-                    LastStroke::Unfinished => Some(UNFINISHED_STROKE),
-                };
-                Some(detailed(
+                let bar = detailed(
                     Bar::new("Your unsaved work is back", controls),
-                    detail,
-                ))
+                    said.as_deref(),
+                );
+                Some(match last {
+                    LastStroke::Whole => bar,
+                    LastStroke::Unfinished => bar.with_detail(UNFINISHED_STROKE),
+                })
             }
             Self::EarlierVersion { said, .. } => {
                 let copy = Control {
@@ -1625,16 +1626,19 @@ mod tests {
     }
 
     #[test]
-    fn a_last_stroke_that_cant_be_finished_is_the_notes_detail() {
+    fn a_last_stroke_that_cant_be_finished_is_a_line_under_the_notes_time() {
         let now = Instant::now();
+        let when = SystemTime::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(SystemTime::now()), LastStroke::Unfinished, now);
+        dialogs.note(&restored(when), LastStroke::Unfinished, now);
         let last_save = Control {
             label: "Use last save instead".to_owned(),
             action: Action::UseLastSave,
             emphasis: Emphasis::Quiet,
         };
+        let said = said_now(when).expect("a time the clock can say");
         let bar = Bar::new("Your unsaved work is back", vec![last_save])
+            .with_detail(said)
             .with_detail("Your last stroke couldn't be finished; the rest of your work is back.");
         assert_eq!(dialogs.bar(), Some(bar));
     }

@@ -1121,6 +1121,39 @@ mod tests {
     }
 
     #[test]
+    fn a_second_detail_line_goes_under_the_first_and_the_bar_grows_for_it() {
+        let now = Instant::now();
+        let theme = Theme::GLASS;
+        let bar = || Bar::new("Your unsaved work is back", vec![quiet("Use last save", 1)]);
+        let mut one = new_ui(now);
+        one.set_bar(Some(bar().with_detail("From yesterday at 16:42")), now);
+        let mut two = new_ui(now);
+        let both = bar()
+            .with_detail("From yesterday at 16:42")
+            .with_detail("Your last stroke couldn't be finished.");
+        two.set_bar(Some(both), now);
+        let frame = two.frame(now).expect("a bar shows");
+        let tops: Vec<f32> = glyphs_in(&frame.list, theme.quiet_text)
+            .into_iter()
+            .map(|glyph| glyph.rect.y)
+            .collect();
+        let highest = tops.iter().copied().fold(f32::MAX, f32::min);
+        let lowest = tops.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            lowest - highest >= theme.status.1 * 0.5,
+            "the second line a status line under the first: {highest} and {lowest}"
+        );
+        let (short, tall) = (glass_of(&one), glass_of(&two));
+        assert!(
+            near(tall.h - short.h, theme.status.1),
+            "a status line taller: {} and {}",
+            short.h,
+            tall.h
+        );
+        assert!(near(tall.y + tall.h, short.y + short.h), "the same bottom");
+    }
+
+    #[test]
     fn only_the_first_filled_control_stays_filled() {
         let bar = Bar::new("Two", vec![filled("One", 1), filled("Two", 2)]);
         assert_eq!(bar.controls()[0].emphasis, Emphasis::Filled, "the first");

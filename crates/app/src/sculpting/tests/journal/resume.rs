@@ -199,7 +199,9 @@ fn rows_of_another_dab_format_are_not_resumed_and_the_note_says_so() {
     owner.note(&note, Instant::now());
     let bar = owner.bar().expect("the note");
     assert_eq!(bar.title(), "Your unsaved work is back");
-    assert_eq!(bar.detail(), Some(UNFINISHED_STROKE));
+    let last = bar.details().last().map(String::as_str);
+    assert_eq!(last, Some(UNFINISHED_STROKE), "under the note's time");
+    assert_eq!(bar.details().len(), 2, "{:?}", bar.details());
     // The next stroke closes it in the file, and goes on as ever.
     queue(&mut owner, below());
     run(&mut owner, 10_000);

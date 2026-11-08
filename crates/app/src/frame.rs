@@ -176,6 +176,9 @@ impl Drawing<'_> {
     /// Every tile drawn: for a brush with no renderer to ask (the tests', and routing, which
     /// makes no preview).
     pub(crate) const ALL: Drawing<'static> = Drawing(&|_| true);
+    /// No tile drawn: for a brush landing with no renderer at all, which shows nothing ahead
+    /// ([`crate::sculpting::finish_restored`]).
+    pub(crate) const NONE: Drawing<'static> = Drawing(&|_| false);
 
     /// Whether the renderer holds or wants `key`.
     pub(crate) fn draws(&self, key: &TileKey) -> bool {
@@ -1757,6 +1760,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
         self.dialogs.note(note, self.last_stroke, now);
         self.scheduler.want(Reason::Overlay);
+    }
+
+    /// The stroke a restore found still landing couldn't be finished, taken on elsewhere (for a
+    /// copy of found work, [`crate::sculpting::finish_restored`]): the note that follows says so.
+    pub(crate) const fn last_stroke_unfinished(&mut self) {
+        self.last_stroke = LastStroke::Unfinished;
     }
 
     /// Hands the brush the stroke a restore found still landing, if there was one

@@ -5749,9 +5749,14 @@ fn an_unusable_journal_says_the_last_stroke_couldn_t_be_finished() {
     owner.note(&note, Instant::now());
     let bar = owner.dialogs.bar().expect("the note");
     assert_eq!(bar.title(), "Your unsaved work is back");
+    let lines: Vec<&str> = bar.details().iter().map(String::as_str).collect();
+    let [when, last] = lines.as_slice() else {
+        panic!("the time, and a line under it: {lines:?}");
+    };
+    assert!(when.starts_with("From "), "{when}");
     assert_eq!(
-        bar.detail(),
-        Some("Your last stroke couldn't be finished; the rest of your work is back.")
+        *last,
+        "Your last stroke couldn't be finished; the rest of your work is back."
     );
     owner.close().expect("closed");
 }

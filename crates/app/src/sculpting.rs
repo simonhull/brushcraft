@@ -215,6 +215,7 @@ use stroke::{
 };
 
 use crate::camera::{Camera, Pixel};
+use crate::dialogs::LastStroke;
 use crate::frame::{
     Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
     Landing, STROKE_QUIET, SampleTimes, recovery_report,
@@ -2043,6 +2044,82 @@ impl Sculpting {
             self.fail("warming the surface under the pen", &error);
         }
     }
+}
+
+/// The size of the view a stroke a restore found lands through with no window
+/// ([`finish_restored`]): its dabs are placed already, so any view does.
+const UNSEEN_VIEW: (u32, u32) = (320, 200);
+
+/// Finishes the stroke a restore of `project` found still landing, with no frame loop.
+///
+/// Taken on as [`Brush::resume`] takes it, and landed whole, its op ended, before anything else
+/// edits or saves the project (a copy of found work, [`crate::ProjectToOpen::reopen`]). It is
+/// shown nowhere: nothing draws.
+///
+/// Returns what became of it: [`LastStroke::Whole`] if there was none or it landed, and
+/// [`LastStroke::Unfinished`] if it can't be (a journal the project can't use, rows of another
+/// layout, a project keeping no display layer to brush), said on stderr, the restored tiles
+/// standing.
+///
+/// # Errors
+///
+/// If the spatial index can't be loaded, or landing it dropped dabs: what it would hold isn't all
+/// there.
+pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
+    let Some(found) = project.take_open_stroke() else {
+        return Ok(LastStroke::Whole);
+    };
+    let stroke = match found {
+        Ok(stroke) => stroke,
+        Err(why) => {
+            let why = anyhow::Error::new(why);
+            crate::saving::log(&format!("brushcraft: the last stroke's journal: {why:#}"));
+            return Ok(LastStroke::Unfinished);
+        }
+    };
+    let Some(level) = project.store().display_finest() else {
+        crate::saving::log("brushcraft: the last stroke can't land with no display layer");
+        return Ok(LastStroke::Unfinished);
+    };
+    let (mut index, _) = project.load_index(level, |_, _| {})?;
+    let mut brush = Sculpting::new(project);
+    // Nothing draws, so nothing is shown ahead: every dab is finest work.
+    brush.preview = None;
+    let camera = Camera::default();
+    let (width, height) = UNSEEN_VIEW;
+    let size = render::surface::Size::new(width, height)
+        .ok_or_else(|| anyhow!("a view of {width} × {height}"))?;
+    let taking = BrushContext {
+        project: &mut *project,
+        index: Some(&mut index),
+        camera: &camera,
+        size,
+        drawn: Drawing::NONE,
+        waiting: &[],
+    };
+    if !brush.resume(taking, stroke) {
+        let why = brush
+            .error
+            .as_deref()
+            .unwrap_or("the brush can't take it on");
+        crate::saving::log(&format!("brushcraft: the last stroke: {why}"));
+        return Ok(LastStroke::Unfinished);
+    }
+    let landing = BrushContext {
+        project,
+        index: Some(&mut index),
+        camera: &camera,
+        size,
+        drawn: Drawing::NONE,
+        waiting: &[],
+    };
+    brush.flush(landing)?;
+    let reports = brush.take_recovery_reports().into_iter();
+    for report in reports {
+        let why = anyhow::Error::new(report);
+        crate::saving::log(&format!("brushcraft: landing the last stroke: {why:#}"));
+    }
+    Ok(LastStroke::Whole)
 }
 
 /// When `sample` was taken and when it reached the app.
