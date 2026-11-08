@@ -87,7 +87,11 @@
 //! What a restore gets is the recovery file's last durable save point. Whatever was appended
 //! after it, a flush cut short or tiles of the stroke in progress written back to make room,
 //! is discarded: a save point is the unit of durability, and replaying the tail could bring
-//! back half a stroke. At worst, the stroke in progress is lost.
+//! back half a stroke. A stroke whose dabs were still landing comes back from the dab journal
+//! that save point holds ([`Project::take_open_stroke`], [`Project::resume_stroke`]): its tiles
+//! as far as it had landed, its dabs not landed, and the surface it began on, to land the rest
+//! as it would have live. At worst, about a second of placed dabs is lost, or, with a journal
+//! that can't be used, the dabs not landed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -109,12 +113,14 @@ use crate::tiles::{CacheError, JournalCountError, PenDownPoint, Saved, StoreConf
 
 mod discover;
 mod place;
+mod resume;
 
 pub use discover::find_recoveries;
 use discover::{not_restorable, past, recovery_heads, standing};
 use place::{
     create_clean, create_placed, create_recovery, place_new, retire, scratch, scratch_in, temporary,
 };
+pub use resume::{JournalUnusable, OpenStroke};
 
 /// The extension of a recovery file (and of a project file).
 const EXTENSION: &str = "bcrf";
@@ -255,6 +261,11 @@ pub enum ProjectError {
     /// Nothing was written; land them (or end the stroke), then save.
     #[error("the stroke's dabs are still landing")]
     StillLanding,
+    /// [`Project::resume_stroke`] was given a stroke it can't resume: another op began since the
+    /// restore (or an edit was made), the project has moved onto another recovery file since (a
+    /// save, or a roll-over), or the stroke is another project's. Nothing changed.
+    #[error("the stroke of op {0:?} can't be resumed")]
+    NotResumable(OpId),
 }
 
 /// Takes what `writer` left out: the tiles gone into `lost`, those only late into `left_out`.
@@ -485,6 +496,9 @@ pub struct Project {
     stroke: Option<OpId>,
     /// The op of the last stroke record kept: a second record of it is refused.
     recorded: Option<OpId>,
+    /// What [`Project::restore`] found of a stroke still landing, until
+    /// [`Project::take_open_stroke`] takes it; `None` for a project not restored, or with none.
+    open_stroke: Option<Result<OpenStroke, JournalUnusable>>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename, with an I/O error of
     /// this kind (see [`Unplaced::crash`](place::Unplaced::crash)).
@@ -596,6 +610,12 @@ impl Project {
     /// cut short, tiles of the stroke in progress) is discarded. The project's ops start past
     /// the newest edit of every recovery file of the project, as [`Project::open`]'s do.
     ///
+    /// A stroke still landing when the recovery file was last written is found then, its dabs
+    /// not landed and its pen-down surface read from the file, for the app to take
+    /// ([`Project::take_open_stroke`]) and land on ([`Project::resume_stroke`]). A journal that
+    /// can't be used never fails the restore: the restored tiles stand, and
+    /// [`Project::take_open_stroke`] says why.
+    ///
     /// # Errors
     ///
     /// [`ProjectError::NotRestorable`] with the candidate's status if it is neither of the two,
@@ -607,6 +627,21 @@ impl Project {
     /// [`ProjectError::Recovery`] if the writer's thread can't be started. The recovery file is
     /// kept on error.
     pub fn restore(
+        candidate: &RecoveryCandidate,
+        config: ProjectConfig,
+    ) -> Result<Self, ProjectError> {
+        let mut project = Self::restore_tiles(candidate, config)?;
+        project.open_stroke = resume::find(&project.store);
+        Ok(project)
+    }
+
+    /// [`Project::restore`], but for the stroke still landing: the tiles, the files and the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::restore`].
+    fn restore_tiles(
         candidate: &RecoveryCandidate,
         config: ProjectConfig,
     ) -> Result<Self, ProjectError> {
@@ -744,6 +779,7 @@ impl Project {
             stranded: None,
             stroke: None,
             recorded: None,
+            open_stroke: None,
             #[cfg(test)]
             fail_next_recovery: None,
             #[cfg(test)]
@@ -1305,6 +1341,69 @@ impl Project {
         self.store.release_pen_down();
         self.store.end_journal();
         self.end_stroke_at(Instant::now())
+    }
+
+    /// What [`Project::restore`] found of a stroke still landing when the recovery file was last
+    /// written, once: `None` if it found none (no journal, or its last stroke's dabs had all
+    /// landed), or for a project not restored, or once taken.
+    ///
+    /// `Some(Ok(stroke))` is a stroke to land on ([`Project::resume_stroke`]): its op, its dabs
+    /// not landed and its pen-down surface, read from the save point its batches name.
+    /// `Some(Err(why))` is a journal found and not used: the restored tiles stand, and the
+    /// stroke's dabs not landed are lost (see [`JournalUnusable`]). Either way the project is
+    /// open, its tiles as the recovery file's last save point holds them.
+    pub fn take_open_stroke(&mut self) -> Option<Result<OpenStroke, JournalUnusable>> {
+        self.open_stroke.take()
+    }
+
+    /// Reopens `stroke`'s op and installs its pen-down shapes, so its dabs land as they would
+    /// have live: the stroke is open again, as [`Project::begin_stroke`] leaves one, and may land
+    /// at once (its pen-down surface is in the file, and its cut is the restored state).
+    ///
+    /// Its edits from now on are made as its op. Its journal goes on from what the recovery file
+    /// holds: [`Project::journal_landed`] counts on from [`OpenStroke::landed`], its dabs not
+    /// landed are in the file already and never written again, its pen-down stays the save point
+    /// its batches name, and its rows keep their format, whatever [`Project::set_dab_format`]
+    /// says now. Its pen-down shapes are charged to the budget as a live stroke's are. Once every
+    /// dab has landed, end it with [`Project::end_unrecorded_stroke`]: the journal holds no pen
+    /// samples to record.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NotResumable`] if another op began since the restore (or an edit was
+    /// made), the project has moved onto another recovery file (a save or a roll-over), or
+    /// `stroke` isn't this project's; [`ProjectError::Cache`] if a shape can't be installed
+    /// (evaluating a tile's parents fails). The stroke isn't resumed then, and no shape is kept.
+    pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), ProjectError> {
+        let op = stroke.op();
+        if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
+            return Err(ProjectError::NotResumable(op));
+        }
+        let resumed = stroke.into_parts();
+        for (key, corrections) in resumed.shapes {
+            if let Err(e) = self.store.install_pen_down(key, corrections) {
+                self.store.release_pen_down();
+                return Err(e.into());
+            }
+        }
+        let reopened = self
+            .store
+            .resume_journal(
+                op,
+                resumed.landed,
+                resumed.dabs,
+                resumed.pen_down,
+                resumed.dab_format,
+            )
+            .map_err(ProjectError::from)
+            .and_then(|()| Ok(self.store.resume_op(op)?));
+        if let Err(e) = reopened {
+            self.store.end_journal();
+            self.store.release_pen_down();
+            return Err(e);
+        }
+        self.stroke = Some(op);
+        Ok(())
     }
 
     /// The version of the layout of the rows the app journals ([`Project::journal`]): every

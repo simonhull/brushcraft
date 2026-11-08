@@ -618,6 +618,28 @@ impl TileStore {
         Ok(op)
     }
 
+    /// Makes `op`, a stroke's op the working file holds edits of, the op edits are made as again,
+    /// as [`TileStore::begin_op`] would have left it: the edits that land the rest of a stroke
+    /// restored after a crash are its own (see [`crate::Project::resume_stroke`]). The op
+    /// generator doesn't move: it is past every op of the files already, so no op is handed out
+    /// twice. The pen-down shapes stay: the stroke's own, installed first
+    /// ([`TileStore::install_pen_down`]).
+    ///
+    /// Only on a store no op has begun on since it opened, no edit made on: the stroke's edits
+    /// must be the last before its own.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::OpBegun`] if an op is current, the one begun or edited as since the store
+    /// opened; the store is unchanged then.
+    pub(crate) fn resume_op(&mut self, op: OpId) -> Result<(), CacheError> {
+        if let Some(current) = self.op {
+            return Err(CacheError::OpBegun(current));
+        }
+        self.op = Some(op);
+        Ok(())
+    }
+
     /// Starts the site's next op, as [`TileStore::begin_op`] does, the pen-down shapes kept: for
     /// an edit that finds no op (after a rebase moved the store's later edits to a new op, in
     /// the middle of a stroke).

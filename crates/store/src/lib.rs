@@ -58,9 +58,9 @@ pub use journal::{DAB_BYTES, DabBatch, JournalError, MAX_JOURNAL_DABS, PenDown};
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use project::{
-    CandidateStatus, KeptRecovery, Project, ProjectConfig, ProjectError, Protection,
-    ROLL_OVER_RETRY, RecoveryCandidate, SaveAhead, SaveOutcome, default_recovery_dir,
-    find_recoveries,
+    CandidateStatus, JournalUnusable, KeptRecovery, OpenStroke, Project, ProjectConfig,
+    ProjectError, Protection, ROLL_OVER_RETRY, RecoveryCandidate, SaveAhead, SaveOutcome,
+    default_recovery_dir, find_recoveries,
 };
 pub use queued::EvaluatedTile;
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};

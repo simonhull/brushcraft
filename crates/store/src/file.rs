@@ -16,7 +16,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use geom::{BaseMesh, Channel, CorrectionTile, TileKey};
+use geom::{BaseMesh, Channel, CorrectionTile, LayerId, TileKey};
 
 use self::bounds_io::{bounds_record, read_bounds_at};
 #[cfg(test)]
@@ -145,6 +145,10 @@ impl Name {
 
 /// Records of one kind, by the key of their tile, in key order.
 type Records = Vec<(TileKey, Loc)>;
+
+/// Tiles changed since an earlier save point, in key order, each with its record there, if it
+/// had one ([`ProjectFile::tiles_changed_since`]).
+pub(crate) type Changed = Vec<(TileKey, Option<Loc>)>;
 
 /// Splits a map keyed by [`Name`] into its tile records and its bounds records, each in key
 /// order.
@@ -1241,6 +1245,67 @@ impl ProjectFile {
             head: self.head,
             extends: None,
         }))
+    }
+
+    /// The tiles whose records differ between the save point at `earlier` and the latest one,
+    /// in key order, each with its record at `earlier` (`None` where it had none there, and
+    /// reads what lies under the file): what a stroke begun at `earlier` changed, and where the
+    /// tiles were as it found them (see [`crate::journal`]). `earlier` is `None` for the state
+    /// the file starts from, before its first save point, which holds no record.
+    ///
+    /// Only base-layer displacement tiles are listed, the ones a stroke keeps pen-down shapes of
+    /// (see `crate::tiles::pen_down`), never display tiles. Records written since the latest
+    /// save point are left out: the latest save point is the state compared.
+    ///
+    /// `Ok(None)` if `earlier` isn't a save point of the latest one's chain, or the file has no
+    /// save point at all.
+    ///
+    /// The cost is a walk of the chain's Indexes and the load of `earlier`'s state, as
+    /// [`ProjectFile::open_at`] loads it, then one pass over both states' tiles, in memory.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Damaged`] if an Index of the chain is; [`FileError::Io`].
+    pub(crate) fn tiles_changed_since(
+        &self,
+        earlier: Option<u64>,
+    ) -> Result<Option<Changed>, FileError> {
+        let Some(latest) = self.saved.as_ref() else {
+            return Ok(None);
+        };
+        let before: BTreeMap<TileKey, Loc> = match earlier {
+            None => BTreeMap::new(),
+            Some(offset) => {
+                if !self.save_points()?.contains(&offset) {
+                    return Ok(None);
+                }
+                let len = self.file.metadata()?.len();
+                let chain =
+                    load_chain(&self.file, offset, len)?.ok_or(FileError::Damaged { offset })?;
+                let tiles = chain.live.into_iter().filter_map(|(name, loc)| match name {
+                    Name::Tile(key) => Some((key, loc)),
+                    Name::Bounds(_) => None,
+                });
+                tiles.collect()
+            }
+        };
+        let gone = before
+            .iter()
+            .filter(|&(key, loc)| latest.tiles.get(key) != Some(loc))
+            .map(|(&key, &loc)| (key, Some(loc)));
+        let new = latest
+            .tiles
+            .iter()
+            .filter(|(key, _)| !before.contains_key(key))
+            .map(|(&key, _)| (key, None));
+        let mut changed: Changed = gone
+            .chain(new)
+            .filter(|(key, _)| {
+                key.layer() == LayerId::BASE && key.channel() == Channel::DISPLACEMENT
+            })
+            .collect();
+        changed.sort_unstable_by_key(|&(key, _)| key);
+        Ok(Some(changed))
     }
 
     /// `key`'s latest record, framing included, after checking that it verifies and is a tile

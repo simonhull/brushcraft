@@ -9,6 +9,7 @@ use crate::journal::{DAB_BYTES, DabBatch, MAX_JOURNAL_DABS, PenDown};
 use crate::{FLUSH_INTERVAL, JournalCountError};
 
 mod pen_down;
+mod resume;
 
 /// The tests' dabs `range`, as [`dab_at`] makes them.
 fn dabs(range: Range<u32>) -> Vec<[u8; DAB_BYTES]> {

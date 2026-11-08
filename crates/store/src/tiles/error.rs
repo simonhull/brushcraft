@@ -131,6 +131,11 @@ pub enum CacheError {
     /// Every op id of this site has been handed out.
     #[error("the op ids of this site are used up")]
     OpsExhausted,
+    /// A restored stroke's op can't be made current again
+    /// ([`Project::resume_stroke`](crate::Project::resume_stroke)): this one is, begun or edited as
+    /// since the store opened.
+    #[error("op {0:?} is current: no op can be resumed")]
+    OpBegun(crate::OpId),
     /// A pin request can't be held within the budget, even with every unpinned slot freed.
     /// Nothing was evicted or pinned.
     #[error("pinning {tiles} tiles needs {needed} bytes of pool chunks; the budget is {budget}")]

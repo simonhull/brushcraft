@@ -825,6 +825,13 @@ impl TileStore {
         self.base.as_ref()
     }
 
+    /// The bytes the pools may hold together, as the store opened with them, before any of it
+    /// is withheld for a stroke's pen-down data: what bounds the memory a restore spends on a
+    /// stroke it finds in a file, which may be hostile (see [`crate::Project::take_open_stroke`]).
+    pub(crate) const fn pools_budget(&self) -> usize {
+        self.budget.opened()
+    }
+
     /// Writes every dirty correction tile, every spatial-index bound the working file lacks and
     /// every stroke record waiting to the working file and records a save point there. Returns its
     /// offset.

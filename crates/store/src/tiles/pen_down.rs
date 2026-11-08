@@ -134,7 +134,12 @@ impl PenDownShape {
     /// three `f32`.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        let side = usize::try_from(self.corrections.side()).unwrap_or(0);
+        Self::bytes_of(self.corrections.side())
+    }
+
+    /// The bytes a shape of a tile of `side` vertices a side holds ([`PenDownShape::bytes`]).
+    pub(crate) fn bytes_of(side: u32) -> usize {
+        let side = usize::try_from(side).unwrap_or(0);
         let inner = side.saturating_sub(2);
         size_of::<Self>()
             + inner * inner * size_of::<[i16; 3]>()
@@ -409,6 +414,48 @@ impl TileStore {
             }
         }
         self.keep_pen_down(keys)
+    }
+
+    /// Keeps `corrections` as tile `key`'s pen-down shape, if the current stroke hasn't kept one
+    /// for it: its corrections as the stroke found them, read from the save point that holds its
+    /// pen-down surface, for a stroke restored after a crash whose dabs land on (see
+    /// [`crate::Project::resume_stroke`]). The shape's box is made from them over the tile's
+    /// prediction as the store has it now, which the stroke never changed, so the shape is the one
+    /// [`TileStore::keep_pen_down`] made live. It is charged as every shape is.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`] if `corrections` isn't of `key`'s side; as
+    /// [`TileStore::evaluate`] for the tile's parents. Nothing is kept then.
+    pub(crate) fn install_pen_down(
+        &mut self,
+        key: TileKey,
+        corrections: CorrectionTile,
+    ) -> Result<(), CacheError> {
+        if corrections.side() != key.side() {
+            return Err(CacheError::NotATile(key));
+        }
+        if self.pen_down.shapes.contains_key(&key) {
+            return Ok(());
+        }
+        let made = match self.kept.get(&key) {
+            Some(_) => None,
+            None => Some(self.prediction_of_one(key)?),
+        };
+        let prediction = made
+            .as_ref()
+            .or_else(|| self.kept.get(&key))
+            .ok_or(Invariant::NoPenDownShape(key))?;
+        let mut shape = PenDownShape {
+            corrections,
+            bounds: None,
+        };
+        let PositionsBox(bounds) = PositionsBox::of(&shape.positions(prediction));
+        shape.bounds = bounds;
+        self.pen_down.bytes += shape.bytes() + ENTRY_BYTES;
+        self.pen_down.shapes.insert(key, shape);
+        self.pen_down.added.push(key);
+        Ok(())
     }
 
     /// What a worker needs to read tile `key` and take its pen-down shape

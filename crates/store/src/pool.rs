@@ -71,6 +71,11 @@ impl Budget {
         bytes.saturating_sub(spare)
     }
 
+    /// The limit the budget was made with, before anything was withheld.
+    pub(crate) const fn opened(&self) -> usize {
+        self.opened
+    }
+
     /// The limit.
     pub(crate) const fn limit(&self) -> usize {
         self.limit

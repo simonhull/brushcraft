@@ -690,6 +690,9 @@ const PLACE_EACH: u32 = 8;
 /// The most dabs the journal child places: once there, it waits for the kill.
 const JOURNAL_DABS: u32 = 400_000;
 
+/// The dab format the journal child's app sets.
+const JOURNAL_FORMAT: u32 = 1;
+
 /// The seed of the journal child's edits, those of its first step; each step's is the next.
 const JOURNAL_SEED: u64 = 4_000;
 
@@ -723,6 +726,7 @@ fn journal_child() {
         recovery_dir: dir.join("recovery"),
     };
     let mut project = Project::new((*mesh()).clone(), config).unwrap();
+    project.set_dab_format(JOURNAL_FORMAT);
     let mesh = project.store().working().mesh();
     project.begin_stroke_and_wait().unwrap();
     let start = Instant::now();
@@ -828,6 +832,70 @@ fn a_kill_keeps_every_dab_journalled_by_the_last_save_point() {
         assert_positions(
             project.store(),
             &dense(&mesh, &map),
+            &tiles(&mesh, 1, TOP),
+            &what,
+        );
+        project.close(false).unwrap();
+    }
+}
+
+/// The edits of the journal child's first `count` dabs: those of its steps, in order.
+fn journal_edits(mesh: &BaseMesh, count: u32) -> Vec<crate::fixture::Edit> {
+    let steps = count.div_ceil(PLACE_EACH);
+    let mut edits: Vec<crate::fixture::Edit> =
+        (0..steps).flat_map(|step| step_edits(mesh, step)).collect();
+    edits.truncate(count as usize);
+    edits
+}
+
+/// The resuming crash test's runs: kills at as many moments.
+const RESUME_RUNS: u32 = 20;
+
+/// The longest the resuming crash test waits after the child's first save point to kill it.
+const RESUME_KILL_WITHIN: Duration = Duration::from_millis(150);
+
+#[test]
+fn restoring_and_landing_the_rest_gives_the_bits_of_a_run_never_killed() {
+    let mesh = mesh();
+    for run in 0..RESUME_RUNS {
+        let dir = TestDir::new();
+        let delay = random_delay(RESUME_KILL_WITHIN);
+        let what = format!("run {run}, killed {delay:?} after its first save point");
+        run_and_kill(JOURNAL_CHILD_TEST, (JOURNAL, "1"), &dir, delay, &what);
+        let candidate = find_recoveries(&dir.path("recovery"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut project = Project::restore(&candidate, config(&dir)).unwrap();
+        let open = project.take_open_stroke().unwrap().unwrap();
+        assert_eq!(open.dab_format(), JOURNAL_FORMAT, "{what}: its format");
+        let (landed, rest) = (open.landed(), u32::try_from(open.dabs().len()).unwrap());
+        assert!(rest > 0, "{what}: dabs to land");
+        let placed = landed + rest;
+        let journalled: Vec<[u8; DAB_BYTES]> = (landed..placed).map(dab_at).collect();
+        assert_eq!(open.dabs(), journalled, "{what}: the dabs not landed");
+        let edits = journal_edits(&mesh, placed);
+        project.resume_stroke(open).unwrap();
+        assert!(project.may_land(), "{what}: it lands at once");
+        // The rest lands as the live landing would have, a few dabs at a time.
+        let mut done = landed;
+        while done < placed {
+            let next = (done + 3).min(placed);
+            apply_dabs(
+                project.store(),
+                &mut CorrectionMap::new(),
+                &edits[done as usize..next as usize],
+            );
+            project.journal_landed(next).unwrap();
+            done = next;
+        }
+        project.end_unrecorded_stroke().unwrap();
+        // A run never killed: every dab placed by the last save point, landed.
+        let mut never_killed = CorrectionMap::new();
+        record(&mesh, &mut never_killed, &edits);
+        assert_positions(
+            project.store(),
+            &dense(&mesh, &never_killed),
             &tiles(&mesh, 1, TOP),
             &what,
         );

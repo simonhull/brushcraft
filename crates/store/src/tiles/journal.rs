@@ -58,6 +58,14 @@
 //! behind its tiles; then it goes. The next stroke's journal is a new one meanwhile
 //! ([`TileStore::begin_journal`]), and a flush writes the ended strokes' batches before its own.
 //!
+//! # A restored stroke
+//!
+//! A restore finds the stroke still landing in the working file's batches (see
+//! `crate::project::resume`), and resuming it opens its journal again as they left it
+//! ([`TileStore::resume_journal`]): its landed count, its rows not landed (already written, so
+//! never written again), its pen-down where the batches name it and its rows' format. It goes on
+//! as any journal from there, its next batch carrying the landed count alone.
+//!
 //! # Memory and cost
 //!
 //! A journal keeps the rows of the dabs not landed, [`DAB_BYTES`] each: the landing's backlog,
@@ -172,8 +180,10 @@ struct Journal {
     /// [`crate::journal`]): every batch of it carries it.
     dab_format: u32,
     /// The store's latest write when the stroke began: a write since (of the stroke's, or of any
-    /// other op) changed the surface it found.
-    begun_at: Stamp,
+    /// other op) changed the surface it found. `None` for a stroke resumed after a restore
+    /// ([`TileStore::resume_journal`]), whose surface the store's tiles may hold some of its dabs
+    /// over already: a save never finds its pen-down surface in the saved state.
+    begun_at: Option<Stamp>,
 }
 
 impl Journal {
@@ -182,7 +192,7 @@ impl Journal {
     const fn new(op: OpId, pen_down: PenDownPoint, dab_format: u32, begun_at: Stamp) -> Self {
         Self {
             dab_format,
-            begun_at,
+            begun_at: Some(begun_at),
             op,
             placed: 0,
             landed: 0,
@@ -390,6 +400,45 @@ impl TileStore {
         self.journals.close();
         let dab_format = self.journals.dab_format;
         self.journals.open = Some(Journal::new(op, pen_down, dab_format, self.last_write));
+    }
+
+    /// The stroke made as `op`, restored after a crash, lands on (see
+    /// [`crate::Project::resume_stroke`]): opens its journal as the working file's batches left
+    /// it, closing any still open. `landed` of its dabs had landed, and `rows` are the rest, which
+    /// the batches hold already, so they are never written again: the next batch carries the
+    /// landed count alone, once it moves. Its pen-down surface stays where the batches name, and
+    /// its rows keep their format, `dab_format`, whatever the app has set since.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalCountError::PastLastIndex`] if the rows run past the last index a `u32` counts;
+    /// nothing is opened then.
+    pub(crate) fn resume_journal(
+        &mut self,
+        op: OpId,
+        landed: u32,
+        rows: Vec<[u8; DAB_BYTES]>,
+        pen_down: PenDown,
+        dab_format: u32,
+    ) -> Result<(), JournalCountError> {
+        let placed = u32::try_from(rows.len())
+            .ok()
+            .and_then(|count| landed.checked_add(count))
+            .ok_or(JournalCountError::PastLastIndex)?;
+        self.journals.close();
+        let written = Written { placed, landed };
+        self.journals.open = Some(Journal {
+            op,
+            placed,
+            landed,
+            rows: rows.into(),
+            written: Some(written),
+            in_flight: None,
+            pen_down: PenDownPoint::Known(pen_down),
+            dab_format,
+            begun_at: None,
+        });
+        Ok(())
     }
 
     /// The rows the app journals are laid out in dab format `dab_format`, the version of
@@ -623,7 +672,10 @@ impl TileStore {
         if let Some(journal) = &mut self.journals.open {
             journal.written = None;
             journal.in_flight = None;
-            let found = how == Rebase::Save && self.last_write <= journal.begun_at;
+            let found = how == Rebase::Save
+                && journal
+                    .begun_at
+                    .is_some_and(|begun_at| self.last_write <= begun_at);
             journal.pen_down = PenDownPoint::Known(if found {
                 PenDown::Base
             } else {
