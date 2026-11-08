@@ -480,8 +480,9 @@ fn stroke_payloads_never_panic_and_round_trip() {
 /// What generates a dab batch.
 ///
 /// The op's site and sequence, the first index, the landed count, the pen-down's kind and offset,
-/// and the dabs' bytes, cut into rows of [`DAB_BYTES`] (a part row left over is dropped).
-type BatchParts = ((u16, u64), u32, u32, (u8, u64), Vec<u8>);
+/// the dab format, and the dabs' bytes, cut into rows of [`DAB_BYTES`] (a part row left over is
+/// dropped).
+type BatchParts = ((u16, u64), u32, u32, (u8, u64), u32, Vec<u8>);
 
 /// The most dabs a generator makes: enough for every plane to be long.
 const FUZZ_DABS: usize = 200;
@@ -491,7 +492,7 @@ const FUZZ_DABS: usize = 200;
 /// Its dabs are cut at [`FUZZ_DABS`], the first index moved down so they end within a `u32`, the
 /// landed count wrapped to at most the dabs placed, and the pen-down's kind taken modulo three
 /// (an offset only where it takes one).
-fn batch_of((op, first, landed, (kind, offset), bytes): &BatchParts) -> DabBatch {
+fn batch_of((op, first, landed, (kind, offset), format, bytes): &BatchParts) -> DabBatch {
     let (rows, _) = bytes.as_chunks::<DAB_BYTES>();
     let dabs: Vec<[u8; DAB_BYTES]> = rows.iter().take(FUZZ_DABS).copied().collect();
     let count = u32::try_from(dabs.len()).unwrap();
@@ -503,7 +504,9 @@ fn batch_of((op, first, landed, (kind, offset), bytes): &BatchParts) -> DabBatch
         1 => PenDown::At(*offset),
         _ => PenDown::Unknown,
     };
-    DabBatch::new(op_of(op.0, op.1), first, landed, pen_down, dabs).unwrap()
+    DabBatch::new(op_of(op.0, op.1), first, landed, pen_down, dabs)
+        .unwrap()
+        .with_dab_format(*format)
 }
 
 /// The dab batch parser takes any bytes without panicking, and reads back what was written.
@@ -606,7 +609,10 @@ fn seed_batch(
     pen_down: PenDown,
 ) {
     let dabs: Vec<[u8; DAB_BYTES]> = (first..first + count).map(fixture::dab_at).collect();
-    let batch = DabBatch::new(op, first, landed, pen_down, dabs).unwrap();
+    // A realistic layout version: the app's first.
+    let batch = DabBatch::new(op, first, landed, pen_down, dabs)
+        .unwrap()
+        .with_dab_format(1);
     file.append_batches(&[frame_batch(&batch).unwrap()])
         .unwrap();
 }

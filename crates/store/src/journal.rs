@@ -19,6 +19,8 @@
 //! A dab-batch record (kind 7) holds, all numbers little-endian:
 //!
 //! - the record's version, `1`, as a `u8`, then three reserved zero bytes;
+//! - the dab format, a `u32`: the version of the rows' layout, as the app set it
+//!   ([`DabBatch::dab_format`]), which the store never reads;
 //! - the op, as `OpId::to_bits` packs it, a `u64`;
 //! - the stroke's index of the batch's first dab, a `u32`: dabs counted in placement order,
 //!   symmetry copies included;
@@ -36,6 +38,14 @@
 //! bytes after the frame), a frame that doesn't decompress to the stated size, a batch whose dabs
 //! run past the last `u32` index, and a landed count past the dabs placed: the first index plus
 //! the count.
+//!
+//! # The dab format
+//!
+//! The rows are `stroke::Dab`'s bytes as the app laid them out, native-endian and unversioned,
+//! and a stroke's record (which names the engine's version) is written only at its end: a crashed
+//! stroke has none. So each batch carries the version of the rows' layout the app set
+//! (`crate::Project::set_dab_format`), and a restore reports it, for the app to refuse rows of a
+//! layout it doesn't read. The store only carries it.
 //!
 //! # Where batches live
 //!
@@ -70,9 +80,9 @@ pub const MAX_JOURNAL_DABS: usize = 65_536;
 /// The record's version this build writes and reads.
 const VERSION: u8 = 1;
 
-/// Payload bytes before the compressed frame: version and reserved bytes, op, first index,
-/// landed count, dab count, and the pen-down's tag and offset.
-const FIXED: usize = 4 + 8 + 4 + 4 + 4 + 1 + 8;
+/// Payload bytes before the compressed frame: version and reserved bytes, dab format, op, first
+/// index, landed count, dab count, and the pen-down's tag and offset.
+const FIXED: usize = 4 + 4 + 8 + 4 + 4 + 4 + 1 + 8;
 
 /// The longest payload a writer makes: the fixed fields, then a zstd frame of the most dabs,
 /// which zstd never expands by more than 1/128 plus a small constant.
@@ -184,6 +194,8 @@ pub struct DabBatch {
     landed: u32,
     /// The save point holding the stroke's pen-down surface.
     pen_down: PenDown,
+    /// The version of the rows' layout, as the app set it (see the module notes).
+    dab_format: u32,
     /// Opaque rows of [`DAB_BYTES`], at most [`MAX_JOURNAL_DABS`], ending at or before the last
     /// `u32` index.
     dabs: Vec<[u8; DAB_BYTES]>,
@@ -191,7 +203,8 @@ pub struct DabBatch {
 
 impl DabBatch {
     /// The batch of the stroke made as `op` holding `dabs` (each a `stroke::Dab`'s bytes) from
-    /// its index `first`, with `landed` of its dabs landed, its pen-down surface at `pen_down`.
+    /// its index `first`, with `landed` of its dabs landed, its pen-down surface at `pen_down`, in
+    /// dab format 0 ([`DabBatch::with_dab_format`] gives another).
     ///
     /// # Errors
     ///
@@ -220,8 +233,23 @@ impl DabBatch {
             first,
             landed,
             pen_down,
+            dab_format: 0,
             dabs,
         })
+    }
+
+    /// The batch with its rows in dab format `dab_format` (see the module notes).
+    #[must_use]
+    pub const fn with_dab_format(mut self, dab_format: u32) -> Self {
+        self.dab_format = dab_format;
+        self
+    }
+
+    /// The version of the rows' layout the app set, which the store never reads (see the module
+    /// notes).
+    #[must_use]
+    pub const fn dab_format(&self) -> u32 {
+        self.dab_format
     }
 
     /// The stroke's op.
@@ -277,6 +305,7 @@ impl DabBatch {
         let packed = compress(&transpose(self.dabs.iter().copied()))?;
         let mut out = Vec::with_capacity(FIXED + packed.len());
         out.extend_from_slice(&[VERSION, 0, 0, 0]);
+        out.extend_from_slice(&self.dab_format.to_le_bytes());
         out.extend_from_slice(&self.op.to_bits().to_le_bytes());
         out.extend_from_slice(&self.first.to_le_bytes());
         out.extend_from_slice(&self.landed.to_le_bytes());
@@ -308,6 +337,7 @@ impl DabBatch {
         if (r0, r1, r2) != (0, 0, 0) {
             return Err(JournalError::Reserved);
         }
+        let dab_format = fields.u32().ok_or(JournalError::Short)?;
         let bits = fields.u64().ok_or(JournalError::Short)?;
         let op = OpId::from_bits(bits).ok_or(JournalError::ReservedSite)?;
         let mut next = || fields.u32().ok_or(JournalError::Short);
@@ -324,7 +354,7 @@ impl DabBatch {
         let dabs: Vec<[u8; DAB_BYTES]> = untranspose(&planes, count)
             .ok_or(JournalError::Frame)?
             .collect();
-        Self::new(op, first, landed, pen_down, dabs)
+        Ok(Self::new(op, first, landed, pen_down, dabs)?.with_dab_format(dab_format))
     }
 }
 
@@ -340,7 +370,9 @@ mod tests {
         let dabs: Vec<[u8; DAB_BYTES]> = (1..=3_u8)
             .map(|k| std::array::from_fn(|j| u8::try_from(j).unwrap().wrapping_mul(k) ^ k))
             .collect();
-        DabBatch::new(OpId::new(2, 9).unwrap(), 37, 12, PenDown::At(4_096), dabs).unwrap()
+        DabBatch::new(OpId::new(2, 9).unwrap(), 37, 12, PenDown::At(4_096), dabs)
+            .unwrap()
+            .with_dab_format(0x0102_0304)
     }
 
     #[test]
@@ -351,6 +383,7 @@ mod tests {
         assert_eq!(batch.placed(), 40, "placed");
         assert_eq!(batch.dabs().len(), 3, "dabs");
         assert_eq!(batch.pen_down(), PenDown::At(4_096), "pen-down");
+        assert_eq!(batch.dab_format(), 0x0102_0304, "dab format");
         let payload = batch.encode().unwrap();
         assert_eq!(DabBatch::decode(&payload), Ok(batch), "round trip");
     }
@@ -429,16 +462,16 @@ mod tests {
         refused(&|p| p[0] = 0, JournalError::Version(0));
         refused(&|p| p[3] = 1, JournalError::Reserved);
         refused(
-            &|p| p[4..12].copy_from_slice(&u64::MAX.to_le_bytes()),
+            &|p| p[8..16].copy_from_slice(&u64::MAX.to_le_bytes()),
             JournalError::ReservedSite,
         );
         let count = u32::try_from(MAX_JOURNAL_DABS + 1).unwrap();
         refused(
-            &|p| p[20..24].copy_from_slice(&count.to_le_bytes()),
+            &|p| p[24..28].copy_from_slice(&count.to_le_bytes()),
             JournalError::TooManyDabs(MAX_JOURNAL_DABS + 1),
         );
         refused(
-            &|p| p[20..24].copy_from_slice(&4_u32.to_le_bytes()),
+            &|p| p[24..28].copy_from_slice(&4_u32.to_le_bytes()),
             JournalError::Frame,
         );
         refused(&|p| p.truncate(p.len() - 1), JournalError::Frame);
@@ -449,30 +482,47 @@ mod tests {
         );
         refused(&|p| p.extend_from_slice(&SKIPPABLE), JournalError::Frame);
         refused(
-            &|p| p[16..20].copy_from_slice(&41_u32.to_le_bytes()),
+            &|p| p[20..24].copy_from_slice(&41_u32.to_le_bytes()),
             JournalError::LandedPastPlaced {
                 landed: 41,
                 placed: 40,
             },
         );
         refused(
-            &|p| p[12..16].copy_from_slice(&u32::MAX.to_le_bytes()),
+            &|p| p[16..20].copy_from_slice(&u32::MAX.to_le_bytes()),
             JournalError::PastLastIndex,
         );
         refused(&|p| p.truncate(FIXED - 1), JournalError::Short);
-        refused(&|p| p[24] = 3, JournalError::PenDown);
-        refused(&|p| p[24] = u8::MAX, JournalError::PenDown);
+        refused(&|p| p[28] = 3, JournalError::PenDown);
+        refused(&|p| p[28] = u8::MAX, JournalError::PenDown);
         // The tests' batch is at an offset, which neither of the others takes.
-        refused(&|p| p[24] = 0, JournalError::PenDown);
-        refused(&|p| p[24] = 2, JournalError::PenDown);
+        refused(&|p| p[28] = 0, JournalError::PenDown);
+        refused(&|p| p[28] = 2, JournalError::PenDown);
         refused(
             &|p| {
-                p[24] = 0;
-                p[25..33].copy_from_slice(&0_u64.to_le_bytes());
-                p[32] = 1;
+                p[28] = 0;
+                p[29..37].copy_from_slice(&0_u64.to_le_bytes());
+                p[36] = 1;
             },
             JournalError::PenDown,
         );
+    }
+
+    #[test]
+    fn the_dab_format_is_carried_as_set() {
+        let op = OpId::new(1, 3).unwrap();
+        let plain = DabBatch::new(op, 0, 0, PenDown::Base, vec![[1; DAB_BYTES]; 2]).unwrap();
+        assert_eq!(plain.dab_format(), 0, "format 0 unless set");
+        for format in [0, 1, 77, u32::MAX] {
+            let batch = plain.clone().with_dab_format(format);
+            let payload = batch.encode().unwrap();
+            assert_eq!(
+                payload[4..8],
+                format.to_le_bytes(),
+                "{format}: after the reserved bytes"
+            );
+            assert_eq!(DabBatch::decode(&payload), Ok(batch), "{format}: read back");
+        }
     }
 
     #[test]
@@ -489,9 +539,9 @@ mod tests {
             let batch = DabBatch::new(op, 2, 1, pen_down, vec![[5; DAB_BYTES]; 2]).unwrap();
             let payload = batch.encode().unwrap();
             let (tag, offset) = pen_down.to_parts();
-            assert_eq!(payload[24], tag, "{pen_down:?}'s tag");
+            assert_eq!(payload[28], tag, "{pen_down:?}'s tag");
             assert_eq!(
-                payload[25..33],
+                payload[29..37],
                 offset.to_le_bytes(),
                 "{pen_down:?}'s offset"
             );

@@ -708,3 +708,28 @@ fn an_ended_stroke_whose_cut_fails_writes_its_last_count_only_if_a_batch_is_in_t
     assert_eq!(batches(&mut project), last, "once");
     project.close(false).unwrap();
 }
+
+#[test]
+fn every_batch_carries_the_dab_format_the_app_set() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut stroke = Stroke::begin(&mut project, 20, 49);
+    stroke.place(&mut project, 4);
+    flush(&mut project);
+    project.set_dab_format(7);
+    stroke.place(&mut project, 3);
+    stroke.land(&mut project, &mut map, 2);
+    flush(&mut project);
+    let formats: Vec<u32> = batches(&mut project)
+        .iter()
+        .map(DabBatch::dab_format)
+        .collect();
+    assert_eq!(formats, vec![0, 7], "0 until set, then the one set");
+    assert_eq!(
+        batches(&mut project)[1],
+        batch(stroke.op, 4..7, 2).with_dab_format(7),
+        "the rest of the batch as ever"
+    );
+    project.close(false).unwrap();
+}
