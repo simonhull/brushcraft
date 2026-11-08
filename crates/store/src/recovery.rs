@@ -272,14 +272,14 @@ enum Reply {
 }
 
 /// Counts `n` down unless it is zero; whether it did.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn count_down(n: &std::sync::atomic::AtomicUsize) -> bool {
     n.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
 }
 
 /// Test hooks shared with the writer thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Default)]
 struct Hooks {
     /// Syncs still to run before the failing ones start, counting down.
@@ -306,16 +306,19 @@ struct Hooks {
 }
 
 /// Which requests the writer thread is held back from, in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct Pause {
     /// Every request.
     all: bool,
     /// Syncs only: a flush encodes, then waits in its tile sync.
     syncs: bool,
+    /// Whether `syncs` lasts only until a stroke waits for its cut
+    /// ([`RecoveryWriter::wait_for_cut`]), which clears it.
+    until_waited: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Hooks {
     /// Whether this sync is to fail, counting it down.
     fn sync_fails(&self) -> bool {
@@ -420,7 +423,7 @@ pub struct RecoveryWriter {
     /// Those of them gone from memory too ([`RecoveryWriter::take_lost`]).
     lost: Vec<TileKey>,
     /// Test hooks shared with the writer thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: Arc<Hooks>,
     /// Test record: the tiles each flush's snapshot copied, in the order taken.
     #[cfg(test)]
@@ -437,13 +440,13 @@ impl RecoveryWriter {
         let (requests, inbox) = mpsc::channel();
         let (outbox, replies) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let hooks = Arc::new(Hooks::default());
         let worker = Worker {
             requests: inbox,
             replies: outbox,
             stop: Arc::clone(&stop),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hooks: Arc::clone(&hooks),
         };
         let thread = thread::Builder::new()
@@ -466,7 +469,7 @@ impl RecoveryWriter {
             generation: store.generation(),
             skipped: Vec::new(),
             lost: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hooks,
             #[cfg(test)]
             copied: Vec::new(),
@@ -556,6 +559,16 @@ impl RecoveryWriter {
         Ok(PenDownPoint::Next)
     }
 
+    /// Holds the writer thread back before its syncs, as the tests' `pause_syncs` does,
+    /// until a stroke waits for its cut ([`RecoveryWriter::wait_for_cut`]), which lets it go.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn pause_syncs_until_waited(&self) {
+        self.hooks.pause(|pause| {
+            pause.syncs = true;
+            pause.until_waited = true;
+        });
+    }
+
     /// Blocks until the open stroke may land ([`TileStore::may_land`]): its pen-down flush,
     /// queued behind the one in flight, has taken its cut, or the flushes were abandoned (the
     /// pen-down is then unknown). For a landing that can't wait for frames: a close's or a save's.
@@ -565,6 +578,13 @@ impl RecoveryWriter {
     ///
     /// As [`RecoveryWriter::poll`]; the stroke may land then too, its pen-down unknown.
     pub(crate) fn wait_for_cut(&mut self, store: &mut TileStore) -> Result<(), RecoveryError> {
+        // A test holding the syncs until a stroke waits: this one does.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.hooks.pause(|pause| {
+            if std::mem::take(&mut pause.until_waited) {
+                pause.syncs = false;
+            }
+        });
         while !store.may_land() {
             if matches!(self.phase, Phase::Idle | Phase::Failed) {
                 // Nothing will take the cut: only a bug leaves a pen-down waiting with no flush
@@ -749,7 +769,7 @@ impl RecoveryWriter {
                     left_valid_out: false,
                 };
                 if !snapshots.is_empty() || !batches.is_empty() {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     self.hooks.sent(&snapshots);
                     self.flight = Some(flight);
                     self.send(Request::Encode(snapshots, batches))
@@ -940,6 +960,22 @@ impl RecoveryWriter {
 /// Test-only controls.
 #[cfg(test)]
 impl RecoveryWriter {
+    /// Holds the writer thread back before it takes its next request, or lets it go.
+    ///
+    /// While it is held, a flush stays where the owner left it, with no reply to advance it,
+    /// however the threads are scheduled: a trigger then meets the flush in flight and queues
+    /// the next one. Dropping the writer lets the thread go.
+    pub(crate) fn pause(&self, paused: bool) {
+        self.hooks.pause(|pause| pause.all = paused);
+    }
+
+    /// Holds the writer thread back before it takes its next sync, or lets it go: a flush
+    /// encodes, then stays in its tile sync once the owner has appended its records, whatever
+    /// the owner polls.
+    pub(crate) fn pause_syncs(&self, paused: bool) {
+        self.hooks.pause(|pause| pause.syncs = paused);
+    }
+
     /// Lets the writer thread's next `pass` syncs run, then makes the `fail` after them fail
     /// with an I/O error.
     pub(crate) fn fail_syncs(&self, pass: usize, fail: usize) {
@@ -959,22 +995,6 @@ impl RecoveryWriter {
         self.hooks
             .failing_batch_encodes
             .store(fail, Ordering::SeqCst);
-    }
-
-    /// Holds the writer thread back before it takes its next request, or lets it go.
-    ///
-    /// While it is held, a flush stays where the owner left it, with no reply to advance it,
-    /// however the threads are scheduled: a trigger then meets the flush in flight and queues
-    /// the next one. Dropping the writer lets the thread go.
-    pub(crate) fn pause(&self, paused: bool) {
-        self.hooks.pause(|pause| pause.all = paused);
-    }
-
-    /// Holds the writer thread back before it takes its next sync, or lets it go: a flush
-    /// encodes, then stays in its tile sync once the owner has appended its records, whatever
-    /// the owner polls.
-    pub(crate) fn pause_syncs(&self, paused: bool) {
-        self.hooks.pause(|pause| pause.syncs = paused);
     }
 
     /// The tiles each flush's snapshot so far copied, in the order taken.
@@ -1041,7 +1061,7 @@ impl Drop for RecoveryWriter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         drop(self.requests.take());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         self.hooks.pause(|pause| *pause = Pause::default());
         if let Some(thread) = self.thread.take() {
             // A thread that panicked has nothing left to clean up; its panic was reported on
@@ -1060,7 +1080,7 @@ struct Worker {
     /// Set when the owner drops the writer.
     stop: Arc<AtomicBool>,
     /// Test hooks shared with the owner.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: Arc<Hooks>,
 }
 
@@ -1069,13 +1089,13 @@ impl Worker {
     /// listening.
     fn run(self) {
         while let Ok(request) = self.requests.recv() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             self.hooks
                 .wait_while_paused(matches!(request, Request::Sync(_)));
             let reply = match request {
                 Request::Encode(snapshots, batches) => {
                     let encoded = self.encode(&snapshots);
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     self.hooks.dropped(&snapshots);
                     drop(snapshots);
                     let Some((framed, broken)) = encoded else {
@@ -1088,7 +1108,7 @@ impl Worker {
                 }
                 Request::Sync(syncer) => Reply::Synced(sync(
                     &syncer,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     &self.hooks,
                 )),
             };
@@ -1109,7 +1129,7 @@ impl Worker {
             }
             let encoded =
                 frame_displacement(snapshot.key, snapshot.op, snapshot.stamp, &snapshot.slot);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             let encoded = if self.hooks.encode_fails() {
                 Err(io::Error::other("a failing encode, for the test").into())
             } else {
@@ -1132,7 +1152,7 @@ impl Worker {
                 return None;
             }
             let encoded = frame_batch(batch);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             let encoded = if self.hooks.batch_encode_fails() {
                 Err(io::Error::other("a failing batch encode, for the test").into())
             } else {
@@ -1160,8 +1180,11 @@ fn latest_save_point(store: &TileStore) -> PenDown {
 /// # Errors
 ///
 /// As [`FileSyncer::sync_data`].
-fn sync(syncer: &FileSyncer, #[cfg(test)] hooks: &Hooks) -> Result<(), FileError> {
-    #[cfg(test)]
+fn sync(
+    syncer: &FileSyncer,
+    #[cfg(any(test, feature = "test-hooks"))] hooks: &Hooks,
+) -> Result<(), FileError> {
+    #[cfg(any(test, feature = "test-hooks"))]
     if hooks.sync_fails() {
         return Err(io::Error::other("a failing sync, for the test").into());
     }

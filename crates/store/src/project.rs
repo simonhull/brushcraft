@@ -1141,6 +1141,19 @@ impl Project {
         Ok(op)
     }
 
+    /// Holds the recovery writer's thread back before its syncs until a stroke waits for its cut
+    /// ([`Project::wait_to_land`], and every landing that waits): a flush in flight encodes and
+    /// then stays in its tile sync, whatever the project's calls poll, so a stroke begun meanwhile
+    /// after edits since its cut certainly waits for the cut of the flush behind it, and the wait
+    /// lets the thread go. For other crates' tests, through the `test-hooks` feature; nothing with
+    /// no writer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hold_recovery_syncs_until_waited(&self) {
+        if let Some(writer) = &self.writer {
+            writer.pause_syncs_until_waited();
+        }
+    }
+
     /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut (see
     /// [`Project::begin_stroke`]). While it may not, the app places, journals and shows its
     /// dabs ahead, but applies none; the frame loop's [`Project::tick`] and [`Project::poll`] drive

@@ -177,13 +177,15 @@ impl Journalling {
     }
 
     /// Two strokes back to back, the second waiting to begin: the first (`Down` to `Up`) is
-    /// shown and none of it lands; a tick cuts the journal, its flush left in flight (nothing
-    /// polls the project); the second's `Down` to `Up` waits for the first to land. Whatever
-    /// lands the first lands it after that cut, so the second begins waiting for the next
-    /// flush's.
+    /// shown and none of it lands; a tick cuts the journal, its flush held in its tile sync until
+    /// a stroke waits for its cut ([`Project::hold_recovery_syncs_until_waited`]), so it is in
+    /// flight whatever polls and however the threads are scheduled; the second's `Down` to `Up`
+    /// waits for the first to land. Whatever lands the first lands it after that cut, so the
+    /// second begins waiting for the next flush's, and its wait lets the held flush go.
     fn second_waits(&mut self) {
         let first = self.frame(&stroke(ACROSS, 12));
         assert!(first.dabs_shown > 0, "{first:?}");
+        self.project.hold_recovery_syncs_until_waited();
         self.ticked = self.ticked.max(Instant::now()) + FLUSH_INTERVAL * 2;
         self.project.tick(self.ticked).expect("ticked");
         self.frame(&below());

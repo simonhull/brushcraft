@@ -20,6 +20,10 @@ bench = []
 # `SpatialIndex::raycast_exhaustive`, the raycast testing every triangle of each candidate
 # tile: the oracle the fast raycast is checked against, for other crates' tests only.
 test-oracle = []
+# `Project::hold_recovery_syncs_until_waited`, which holds the recovery writer's thread back
+# before its syncs until a stroke waits for its cut, so a flush stays in flight while a test acts:
+# for other crates' tests only.
+test-hooks = []
 
 [dependencies]
 bytemuck.workspace = true
