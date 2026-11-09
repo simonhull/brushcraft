@@ -32,9 +32,10 @@
 //!   is the same however fast the finest work went. Past the open strokes' memory share, or if that
 //!   surface can't be had, it waits instead, with every event after it, and is taken once they have
 //!   all ended ([`Sculpting::admit`]). Whether such a `Down` brushes or navigates is decided as it
-//!   comes, from the surface as it is then (the earlier strokes' dabs landed so far), as a `Down`
-//!   on a fresh ridge means to brush ([`Brush::route`]). A `Down` after Ctrl+S waits for the save
-//!   ([`crate::saving`]).
+//!   comes, on the surface the stroke would read, their futures, as a `Down` on a fresh ridge their
+//!   dabs still to land raise means to brush ([`Brush::route`], [`Sculpting::route_on_futures`]);
+//!   where those can't be had, on the surface as it is then (their dabs landed so far). A `Down`
+//!   after Ctrl+S waits for the save ([`crate::saving`]).
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -2235,6 +2236,51 @@ impl Sculpting {
         Begin::Done
     }
 
+    /// Where `ray` meets the surface a stroke begun now over the strokes under way would read:
+    /// their futures (see "Strokes over strokes still landing" in the module notes), so a `Down`
+    /// on a ridge their dabs still to land raise brushes, and one where their dabs carved the
+    /// surface away navigates ([`Brush::route`]).
+    ///
+    /// It is read as the stroke's own first raycast is ([`Sculpting::begin_after`]): an op is
+    /// reserved behind theirs, the futures the ray reads installed for it ([`on_futures`]), and
+    /// the op given back at once, its journal empty. Its futures go with it: the stroke the
+    /// `Down` begins installs its own.
+    ///
+    /// `None` with no stroke under way, while strokes a restore found wait to resume (a fresh op
+    /// would end them), while the newest's pen is down (its `Up` lost: the `Down` lifts it first,
+    /// placing more), or if the futures can't be had (past the open strokes' share, say): the
+    /// caller decides on the surface as it is.
+    fn route_on_futures(
+        &mut self,
+        scene: &mut Scene<'_>,
+        ray: &Ray,
+    ) -> Option<Result<Option<Hit>, SculptError>> {
+        if self.strokes.is_empty() || !self.restored.is_empty() || self.pen_on_stroke() {
+            return None;
+        }
+        #[cfg(test)]
+        if matches!(self.knob, Knob::WaitsOverLanding | Knob::FuturesFail) {
+            return None;
+        }
+        self.make_remaining(scene).ok()?;
+        let token = scene.project.begin_stroke_after().ok()?;
+        let mut installed: BTreeSet<TileKey> = BTreeSet::new();
+        let cast = on_futures(
+            scene,
+            &self.state,
+            &self.strokes,
+            &token,
+            &mut installed,
+            |surface| surface.raycast(ray),
+        );
+        drop(scene.project.drop_stroke_after(token));
+        match cast {
+            Ok(hit) => Some(Ok(hit)),
+            Err(OnFutures::Surface(error)) => Some(Err(error)),
+            Err(OnFutures::Futures) => None,
+        }
+    }
+
     /// Brings what a later stroke reads of each stroke under way ([`Remaining`]) up to the dabs
     /// it has placed, oldest first: off the pen's path in [`Brush::prepare`], and for what was
     /// placed since, as a stroke begins over them.
@@ -3536,7 +3582,7 @@ impl Brush for Sculpting {
     fn route(&mut self, context: BrushContext<'_>, down: &PenSample) -> Route {
         self.routed = None;
         self.route_missed = false;
-        let Some(scene) = Scene::of(context) else {
+        let Some(mut scene) = Scene::of(context) else {
             return Route::Navigate;
         };
         let Some(ray) = ScreenPoint::new(down.at.x, down.at.y)
@@ -3545,6 +3591,19 @@ impl Brush for Sculpting {
         else {
             return Route::Navigate;
         };
+        match self.route_on_futures(&mut scene, &ray) {
+            Some(Ok(Some(_))) => return Route::Brush,
+            Some(Ok(None)) => {
+                self.route_missed = true;
+                return Route::Navigate;
+            }
+            Some(Err(error)) => {
+                self.fail("picking under the pen", &error);
+                return Route::Navigate;
+            }
+            // No stroke to begin over, or its surface can't be had: decided as it is.
+            None => {}
+        }
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let hit = surface.raycast(&ray);
         if let Err(error) = surface.finish() {
@@ -3556,8 +3615,9 @@ impl Brush for Sculpting {
                 self.routed = Some((ray, hit));
                 Route::Brush
             }
-            // A `Down` that waits for a stroke still landing begins on what that stroke leaves:
-            // one on its fresh ridge, off the surface it began on, brushes too.
+            // A `Down` over strokes still landing whose futures can't be had waits for them, and
+            // begins on what they leave: one on their fresh ridge, off the surface the oldest
+            // began on, brushes too, as far as their dabs have landed.
             None if !self.strokes.is_empty() || !self.deferred.is_empty() => {
                 let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32());
                 let landed = narrow
