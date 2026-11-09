@@ -1076,6 +1076,22 @@ impl Project {
         first_failure.map_err(ProjectError::from)
     }
 
+    /// Closes the project leaving its recovery file exactly as its last durable save point left
+    /// it: the recovery writer stops where it is, with no flush, no roll-over and no stroke ended,
+    /// and the file is kept, its locks released. For work whose handling went wrong after a
+    /// restore, so the next restore finds it as this one did: unlike [`Project::close`] (and the
+    /// project's drop), which flush what the store holds now, a stroke the failure ended among it,
+    /// its dabs not landed counted landed.
+    ///
+    /// Whatever came after that save point is gone from the file, as a crash would leave it;
+    /// the store's own appends past it (tiles written back) are never read, as no save point
+    /// names them. An old recovery file still held is kept too.
+    pub fn close_untouched(mut self) {
+        if let Some(writer) = self.writer.take() {
+            writer.abandon(&mut self.store);
+        }
+    }
+
     /// Whether the project has work no save holds: any edit since the last save (or, for a
     /// project never saved, any edit at all), dabs the open stroke placed and hasn't landed, or
     /// a stroke a restore found still landing and nobody has resumed or closed yet. The last two

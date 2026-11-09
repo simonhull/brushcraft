@@ -2157,7 +2157,9 @@ impl Sculpting {
 /// # Errors
 ///
 /// If the spatial index can't be loaded, or landing it dropped dabs: what it would hold isn't all
-/// there.
+/// there. The stroke has ended then, its dabs not landed counted landed, so a close that flushes
+/// would leave a recovery file a retry finds no stroke in: close the project with
+/// [`Project::close_untouched`] to keep the found work as it was.
 pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
     let Some(found) = project.take_open_stroke() else {
         return Ok(LastStroke::Whole);

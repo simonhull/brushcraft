@@ -506,7 +506,8 @@ impl ProjectToOpen {
     /// the work was still landing lands first, whole ([`sculpting::finish_restored`]), so the copy
     /// holds every dab of it; one that can't be finished leaves the restored tiles, and the
     /// [`LastStroke`] returned says so. On an error the restored project closes again, keeping
-    /// the recovery file.
+    /// the recovery file: as it was found if the landing failed ([`Project::close_untouched`]), so
+    /// a retry finds the same stroke to land.
     ///
     /// # Errors
     ///
@@ -520,8 +521,10 @@ impl ProjectToOpen {
         let last = match sculpting::finish_restored(&mut project) {
             Ok(last) => last,
             Err(error) => {
-                let failed = error.context("finishing the last stroke of the work found");
-                return said_too(Err(failed), project.close(true).map_err(Into::into));
+                // As found, for a retry: a close would flush the stroke the failure ended, its
+                // dabs not landed counted landed, and the partial landing with it.
+                project.close_untouched();
+                return Err(error.context("finishing the last stroke of the work found"));
             }
         };
         let path = copy_path(&self.path);
@@ -1505,6 +1508,10 @@ mod tests {
         left: Vec<Vec<Vec3>>,
         /// The surface of every dab landed on the save the work was made on, never killed.
         whole: Vec<Vec<Vec3>>,
+        /// The stroke's op.
+        op: store::OpId,
+        /// The stroke's rows not landed, as journalled: those after its first 3.
+        rows: Vec<[u8; store::DAB_BYTES]>,
     }
 
     /// What the stroke [`left_landing_on_an_earlier_save`] leaves is like.
@@ -1536,7 +1543,7 @@ mod tests {
         }
         let level = crashed.store().display_finest().expect("a display layer");
         let (mut index, _) = crashed.load_index(level, |_, _| {}).expect("an index");
-        crashed.begin_stroke_and_wait().expect("begun");
+        let op = crashed.begin_stroke_and_wait().expect("begun");
         let journalled: Vec<[u8; store::DAB_BYTES]> =
             dabs.iter().map(|dab| bytemuck::cast(*dab)).collect();
         crashed.journal(&journalled).expect("journalled");
@@ -1573,7 +1580,14 @@ mod tests {
         edit(&mut later);
         drop(later.save().expect("saved"));
         later.close(false).expect("closed");
-        LeftLanding { file, left, whole }
+        let unlanded = journalled.get(3..).expect("rows").to_vec();
+        LeftLanding {
+            file,
+            left,
+            whole,
+            op,
+            rows: unlanded,
+        }
     }
 
     #[test]
@@ -1670,6 +1684,19 @@ mod tests {
         assert!(found.file.exists(), "the work kept where it was found");
         let beside = dir.path().join("first-sculpt-recovered.bcrf");
         assert!(!beside.exists(), "and no copy left behind");
+
+        // As it was found: a retry restores the same stroke, its dabs not landed all there.
+        let again = listed(&opening)
+            .into_iter()
+            .find(|found_again| found_again.path == found.file);
+        let again = again.expect("still listed");
+        let mut restored = Project::restore(&again, opening.config).expect("restored");
+        let open = restored.take_open_stroke().expect("a stroke found");
+        let open = open.expect("its journal usable");
+        assert_eq!(open.op(), found.op, "the same stroke");
+        assert_eq!(open.landed(), 3, "landed as the crash left it");
+        assert_eq!(open.dabs(), found.rows.as_slice(), "the same rows");
+        drop(restored.close(true));
     }
 
     /// Makes `dir`'s directory read-only, or writable again.
