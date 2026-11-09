@@ -5,28 +5,15 @@
 //! replayed; a journal that refuses ends the stroke cleanly; and (in `resume`) a stroke a restore
 //! found still landing is taken on and finished.
 
-use store::{DabBatch, FLUSH_INTERVAL, SaveAhead};
+use store::{DabBatch, FLUSH_INTERVAL};
 use stroke::{MirrorPlanes, Symmetry};
 
 use super::*;
+use crate::testing::settle;
 
 mod resume;
 #[cfg(target_os = "linux")]
 mod takeover;
-
-/// Waits until `project`'s recovery writer has no flush under way: every cut taken so far is in
-/// the recovery file, durable. A saved project's [`Project::save_ahead`] says so, and copies
-/// nothing a reader sees.
-fn settle(project: &mut Project) {
-    let began = Instant::now();
-    while matches!(
-        project.save_ahead(Instant::now()).expect("a slice"),
-        SaveAhead::Flushing
-    ) {
-        std::thread::sleep(Duration::from_millis(1));
-        assert!(began.elapsed() < Duration::from_secs(60), "the flush ends");
-    }
-}
 
 /// Has `project` cut its journal now, between brush calls as the frame loop does.
 ///

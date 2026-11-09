@@ -6144,14 +6144,7 @@ fn left_landing(dir: &TestDir, format: u32) -> ProjectConfig {
     project
         .tick(Instant::now() + store::FLUSH_INTERVAL * 2)
         .expect("ticked");
-    let began = Instant::now();
-    while matches!(
-        project.save_ahead(Instant::now()).expect("a slice"),
-        SaveAhead::Flushing
-    ) {
-        std::thread::sleep(Duration::from_millis(1));
-        assert!(began.elapsed() < Duration::from_secs(60), "the flush ends");
-    }
+    crate::testing::settle(&mut project);
     drop(project);
     ProjectConfig {
         store: StoreConfig::new(512 << 20, 1).with_display(Level::new(FINEST).expect("a level")),

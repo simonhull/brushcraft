@@ -52,7 +52,7 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(300);
 /// The brush goes on landing a dab a batch, so the finisher looks for a takeover between every
 /// dab: the app's batches land a 4,000-dab backlog on these small projects in a fifth of a second,
 /// too soon to be caught midway.
-fn saved_to_finish(owner: &mut Owner<Sculpting, NoUploads>) {
+fn close_and_save_to_finish(owner: &mut Owner<Sculpting, NoUploads>) {
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     let saved = Instant::now();
     assert!(owner.key(UiKey::Enter, saved), "Save");
@@ -130,7 +130,7 @@ fn the_new_window_restores_what_the_finisher_left() {
     let (dir, mut finisher) = backlogged_in(TestDir::new(), IN_PROCESS_PASSES, Instant::now());
     let backlog = finisher.landing();
     assert!(backlog > 64, "{backlog} dabs to land");
-    saved_to_finish(&mut finisher);
+    close_and_save_to_finish(&mut finisher);
     let mut looks = 0;
     let outcome = finisher.finish_unseen_unless(
         |summary, body| panic!("{summary}: {body}"),
@@ -177,7 +177,7 @@ fn finishing_child() {
     // The parent's directory: it stays when the child is done.
     let _parents = ManuallyDrop::new(dir);
     let backlog = owner.landing();
-    saved_to_finish(&mut owner);
+    close_and_save_to_finish(&mut owner);
     let sockets = SocketDir::at(sockets.into());
     let listener = crate::listen(owner.project_path(), Some(&sockets));
     assert!(listener.is_some(), "it listens");

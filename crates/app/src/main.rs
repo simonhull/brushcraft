@@ -65,6 +65,8 @@ mod sculpting;
 mod takeover;
 #[cfg(test)]
 mod test_dir;
+#[cfg(test)]
+mod testing;
 mod uploads;
 mod window;
 
@@ -1552,14 +1554,7 @@ mod tests {
         crashed
             .tick(Instant::now() + store::FLUSH_INTERVAL * 2)
             .expect("ticked");
-        let began = Instant::now();
-        while matches!(
-            crashed.save_ahead(Instant::now()).expect("a slice"),
-            store::SaveAhead::Flushing
-        ) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            assert!(began.elapsed().as_secs() < 60, "the flush ends");
-        }
+        testing::settle(&mut crashed);
         let left = every_surface(&mut crashed);
         let file = crashed.recovery_path().expect("protected").to_owned();
         // A crash: nothing closes it.
