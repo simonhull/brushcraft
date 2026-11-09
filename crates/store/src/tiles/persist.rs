@@ -127,11 +127,7 @@ impl TileStore {
         let since_rebase = unsaved_in(&working);
         let bounds = book_of(&working, base.as_ref())?;
         let display = display_book_of(&working, base.as_ref(), config.display, mesh.face_count());
-        let workers = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.worker_threads())
-            .thread_name(|n| format!("tile-eval-{n}"))
-            .build()
-            .map_err(|e| CacheError::Workers(StartWorkersError::new(e)))?;
+        let workers = start_workers(&config)?;
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         let mut store = Self {
@@ -1174,4 +1170,17 @@ fn check_open(
     }
     check_layers(working.meta(), base)?;
     Ok(mesh_hash)
+}
+
+/// The store's evaluation workers, as many as `config` asks for on this machine.
+///
+/// # Errors
+///
+/// [`CacheError::Workers`] if their threads can't be started.
+fn start_workers(config: &StoreConfig) -> Result<rayon::ThreadPool, CacheError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(config.worker_threads())
+        .thread_name(|n| format!("tile-eval-{n}"))
+        .build()
+        .map_err(|e| CacheError::Workers(StartWorkersError::new(e)))
 }
