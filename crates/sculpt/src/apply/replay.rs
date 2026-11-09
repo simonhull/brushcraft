@@ -34,7 +34,7 @@ pub(crate) enum Plan {
 }
 
 /// For each tile, the grant of its stroke state at each dab of a run that edited it, in dab
-/// order (dabs counted from the run's first).
+/// order, one a dab (dabs counted from the run's first): [`Plan::decide`] makes them so.
 pub(crate) type Grants = BTreeMap<TileKey, Vec<(usize, Grant)>>;
 
 impl Plan {
@@ -60,14 +60,18 @@ impl Plan {
     /// [`Stroke`], which depend on nothing else.
     ///
     /// What [`Plan::of`] makes of a replay's outcomes, and a tile's future
-    /// ([`crate::FuturePlan`]) of the tiles each remaining dab edits, found without writing.
-    pub(crate) fn decide(book: &Book, edited: Vec<Vec<TileKey>>) -> (Grants, Book, usize) {
+    /// ([`crate::Futures`]) of the tiles each remaining dab edits, found without writing.
+    pub(crate) fn decide<T: AsRef<[TileKey]>>(
+        book: &Book,
+        edited: impl IntoIterator<Item = T>,
+    ) -> (Grants, Book, usize) {
         let mut book = book.clone();
         let mut grants = Grants::new();
         let mut released = Vec::new();
         let mut without = 0;
         let per_dab = edited.into_iter().enumerate();
-        for (dab, mut tiles) in per_dab {
+        for (dab, edits) in per_dab {
+            let mut tiles: Vec<TileKey> = edits.as_ref().to_vec();
             tiles.sort_unstable();
             let given = book.begin_dab(&tiles, &mut released);
             let granted = tiles.into_iter().zip(given);
@@ -87,7 +91,10 @@ impl Plan {
             Self::Continuous => Grant::Held,
             Self::Granted(grants) => grants
                 .get(key)
-                .and_then(|grants| grants.iter().find(|&&(at, _)| at == dab))
+                .and_then(|grants| {
+                    let at = grants.binary_search_by_key(&dab, |&(at, _)| at).ok()?;
+                    grants.get(at)
+                })
                 .map_or(Grant::Held, |&(_, grant)| grant),
         }
     }
@@ -99,21 +106,29 @@ impl Plan {
             return false;
         };
         grants.get(key).is_some_and(|grants| {
-            grants.iter().any(|&(at, grant)| {
-                grant == Grant::Taken && after.is_none_or(|after| at > after) && at <= dab
-            })
+            // A tile's grants are in dab order, one a dab ([`Plan::decide`]): the dabs in the
+            // span are found by search, so a future over thousands of dabs isn't quadratic.
+            let from = after.map_or(0, |after| grants.partition_point(|&(at, _)| at <= after));
+            let to = grants.partition_point(|&(at, _)| at <= dab);
+            grants
+                .get(from..to)
+                .is_some_and(|span| span.iter().any(|&(_, grant)| grant == Grant::Taken))
         })
     }
 }
 
 /// What every tile of a run reads: its dabs, the plan, the stroke and the mesh.
 ///
-/// A tile's future ([`crate::FuturePlan`]) is a run too, its dabs those of an open stroke not
+/// A tile's future ([`crate::Futures`]) is a run too, its dabs those of an open stroke not
 /// landed yet, replayed by the same [`replay_tile`] and written nowhere.
 #[derive(Clone, Copy)]
 pub(crate) struct Run<'a> {
     /// The run's dabs, in order.
     pub(crate) imprints: &'a [Imprint],
+    /// Each dab's number in the count the plan's grants are made in, aligned with `imprints`
+    /// (increasing): a future replays only the dabs that touch its tile, numbered as among all
+    /// its stroke's remaining dabs. `None`: each dab's place in `imprints`, as a run's.
+    pub(crate) numbers: Option<&'a [usize]>,
     /// What the replay assumes of the stroke state's grants.
     pub(crate) plan: &'a Plan,
     /// The stroke, as the run begins: the state each tile and each vertex starts from. `None`
@@ -127,6 +142,15 @@ pub(crate) struct Run<'a> {
     /// applied one dab at a time ([`Fault::BreakTwins`]).
     #[cfg(test)]
     pub(crate) break_twins: bool,
+}
+
+impl Run<'_> {
+    /// The number of the dab at `place` in the run's imprints: see [`Run::numbers`].
+    fn number(&self, place: usize) -> usize {
+        self.numbers
+            .and_then(|numbers| numbers.get(place).copied())
+            .unwrap_or(place)
+    }
 }
 
 /// A fault the tests inject into the runs over one store (see [`inject`]).
@@ -400,7 +424,7 @@ struct Owner {
 /// One tile's replay of the run: see "Tile by tile" in the module notes of [`super`].
 ///
 /// The one per-tile arithmetic of a run's dabs: a run lands its tiles' outcomes, and a tile's
-/// future ([`crate::FuturePlan`]) is its outcome over the dabs not landed yet, kept apart.
+/// future ([`crate::Futures`]) is its outcome over the dabs not landed yet, kept apart.
 pub(crate) fn replay_tile(run: Run<'_>, input: TileInput<'_>) -> TileOutcome {
     let mut tile = Replay::new(run, input);
     let stopped = tile.dabs().err();
@@ -526,7 +550,8 @@ impl<'a> Replay<'a> {
     /// Why it stopped (see [`Stopped`]).
     fn dabs(&mut self) -> Result<(), Stopped> {
         let imprints = self.run.imprints.iter().enumerate();
-        for (dab, imprint) in imprints {
+        for (place, imprint) in imprints {
+            let dab = self.run.number(place);
             if self.brush(imprint)? > 0 {
                 self.reached = true;
                 self.apply(dab, imprint)?;

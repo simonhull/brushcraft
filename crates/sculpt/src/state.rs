@@ -169,6 +169,19 @@ impl Book {
         self.held.contains_key(key)
     }
 
+    /// Whether dabs that edit only tiles of `edited` give every tile they edit state without
+    /// releasing any: the tiles of `edited` (distinct) holding none number at most the buffers
+    /// free.
+    ///
+    /// Then every grant they make is [`Grant::Held`] for a tile holding state, and
+    /// [`Grant::Taken`] at the first edit of one that doesn't, never [`Grant::Without`]: a buffer
+    /// is released only when none is free and an edited tile needs one, and each tile takes at
+    /// most one. Which dabs edit which tiles, and in what order, doesn't matter.
+    pub(crate) fn has_room_for<'k>(&self, edited: impl IntoIterator<Item = &'k TileKey>) -> bool {
+        let unheld = edited.into_iter().filter(|key| !self.holds(key)).count();
+        unheld <= self.free
+    }
+
     /// Releases every tile: a new stroke begins.
     fn release_all(&mut self) {
         self.free += self.held.len();

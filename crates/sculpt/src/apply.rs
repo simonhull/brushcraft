@@ -161,7 +161,7 @@ use crate::state::{Book, Stroke, TileStroke};
 
 mod replay;
 
-/// Why [`apply_dabs`], [`draw_step`](crate::draw_step) or [`FuturePlan`](crate::FuturePlan) failed.
+/// Why [`apply_dabs`], [`draw_step`](crate::draw_step) or [`Futures`](crate::Futures) failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SculptError {
@@ -181,7 +181,7 @@ pub enum SculptError {
     /// The spatial index couldn't be brought up to date.
     #[error("updating the spatial index failed")]
     Index(#[from] IndexError),
-    /// A tile's future couldn't be made ([`crate::FuturePlan`]).
+    /// A tile's future couldn't be made ([`crate::Futures`]).
     #[error("a tile's future couldn't be made")]
     Future(#[from] FutureError),
 }
@@ -749,6 +749,7 @@ fn replay_run(
     let inputs = replay::inputs(store, keys, given)?;
     let run = Run {
         imprints,
+        numbers: None,
         plan,
         stroke: Some(stroke),
         topology: store.mesh().topology(),
