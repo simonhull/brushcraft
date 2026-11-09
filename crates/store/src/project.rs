@@ -1493,8 +1493,21 @@ impl Project {
         if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
             return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
         }
-        let mut shapes = stroke.shapes().iter().enumerate();
-        let installed = shapes.try_for_each(|(nth, shape)| self.install_shape(nth, shape));
+        // The test hook's shape, found by its index before the loop, so the loop carries no index.
+        #[cfg(test)]
+        let failing = self
+            .fail_install_at
+            .and_then(|nth| stroke.shapes().get(nth))
+            .map(|shape| shape.key);
+        let mut shapes = stroke.shapes().iter();
+        let installed = shapes.try_for_each(|shape| {
+            #[cfg(test)]
+            if failing == Some(shape.key) {
+                self.fail_install_at = None;
+                return Err(CacheError::NotATile(shape.key));
+            }
+            self.install_shape(shape)
+        });
         if let Err(e) = installed {
             self.store.release_pen_down();
             return Err(NotResumed::new(stroke, e.into()));
@@ -1521,24 +1534,13 @@ impl Project {
         Ok(())
     }
 
-    /// Installs `shape`, the `nth` of a restored stroke's ([`TileStore::install_pen_down`]), a
-    /// step of [`Project::resume_stroke`].
+    /// Installs `shape`, one of a restored stroke's ([`TileStore::install_pen_down`]), a step of
+    /// [`Project::resume_stroke`].
     ///
     /// # Errors
     ///
     /// As [`TileStore::install_pen_down`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            unused_variables,
-            reason = "the test hook that fails one reads which this is"
-        )
-    )]
-    fn install_shape(&mut self, nth: usize, shape: &FoundShape) -> Result<(), CacheError> {
-        #[cfg(test)]
-        if self.fail_install_at.take_if(|at| *at == nth).is_some() {
-            return Err(CacheError::NotATile(shape.key));
-        }
+    fn install_shape(&mut self, shape: &FoundShape) -> Result<(), CacheError> {
         self.store
             .install_pen_down(shape.key, shape.corrections.clone(), shape.op)
     }
