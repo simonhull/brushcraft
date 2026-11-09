@@ -49,12 +49,11 @@ impl Project {
     /// budget (the stroke waits for those before it to land, and begins its own then), or
     /// [`CacheError::OpsExhausted`] if the site's ops are used up.
     pub fn begin_stroke_after(&mut self) -> Result<ReservedOp, ProjectError> {
-        let after = self
-            .store
-            .newest_open_stroke()
-            .ok_or(ProjectError::NoStroke)?;
+        if self.store.newest_open_stroke().is_none() {
+            return Err(ProjectError::NoStroke);
+        }
         let reserved = self.store.reserve_op()?;
-        self.store.begin_journal_after(reserved.op(), after);
+        self.store.begin_journal_after(reserved.op());
         Ok(reserved)
     }
 

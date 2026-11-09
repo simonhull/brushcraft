@@ -776,15 +776,18 @@ impl TileStore {
     /// become the current stroke's (any left of the op before are let go), and its stroke keeps
     /// them as any stroke does from now on.
     ///
-    /// Only once the op before has ended, or with no op current: so ops edit one at a time, in
-    /// order.
+    /// Only once the op before has ended, or with no op current, and the stroke before's journal
+    /// has closed: so ops edit one at a time, in order, and one stroke at a time writes (see
+    /// `crate::tiles::journal`). A stroke whose op a save moved off ([`TileStore::current_op`]
+    /// then `None`) still holds the journal open until it ends.
     ///
     /// # Errors
     ///
     /// [`NotBegun`], with `reserved` given back and the store unchanged, for
     /// [`CacheError::NotReserved`] if it isn't reserved on this store,
     /// [`CacheError::OpReserved`] if an older op is reserved (it begins first),
-    /// [`CacheError::OpBegun`] if an op is current, or [`CacheError::Internal`] with
+    /// [`CacheError::OpBegun`] if an op is current, or a stroke's journal whose op has begun is
+    /// still open (the op named is that stroke's), or [`CacheError::Internal`] with
     /// [`Invariant::ReadingReserved`] while a reserved op's pen-down shapes are read
     /// ([`TileStore::read_pen_down_of`]).
     pub fn begin_reserved_op(&mut self, reserved: ReservedOp) -> Result<OpId, NotBegun> {
@@ -796,7 +799,9 @@ impl TileStore {
         } else if let Some(oldest) = self.reserved.oldest().filter(|&oldest| oldest != op) {
             Some(CacheError::OpReserved(oldest))
         } else {
-            self.op.map(CacheError::OpBegun)
+            self.op
+                .or_else(|| self.begun_stroke())
+                .map(CacheError::OpBegun)
         };
         if let Some(error) = refused {
             return Err(NotBegun { reserved, error });

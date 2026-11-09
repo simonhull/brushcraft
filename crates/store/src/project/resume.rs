@@ -296,7 +296,9 @@ pub enum JournalUnusable {
 /// another site says nothing either way, and the closing batch alone says whether the stroke
 /// ended. The head is the greatest op over every site, so a greater site's op hides a later op
 /// of the stroke's own: that can't happen while every edit comes from one site, as now. When
-/// edits of several sites are merged, the file must keep its head per site for this check.
+/// edits of several sites are merged, the file must keep its head per site for this check; and
+/// a batch's [`PenDown::After`], which names an op of its own site before its own (the store
+/// reserves every op on its own site), would need an order across sites too.
 pub(super) fn find(store: &TileStore) -> Option<Result<OpenStroke, JournalUnusable>> {
     let file = store.working();
     let locations: Vec<Loc> = file.batch_locations().collect();
@@ -338,8 +340,10 @@ fn open_stroke(
     let earlier_point = match pen_down {
         PenDown::Base => None,
         PenDown::At(offset) => Some(offset),
-        // A stroke begun while the one before it landed, whose own cut never became durable:
-        // its surface is what that stroke leaves, which this restore doesn't land first.
+        // A stroke begun while the one before it landed names that stroke until its own cut is
+        // durable. Restoring a chain of strokes, the earlier landed first, isn't done here: one
+        // whose batches name only `After` is unusable, and one whose cut became durable
+        // meanwhile already fails above, as its batches disagree on their pen-down.
         PenDown::Unknown | PenDown::After(_) => return Err(JournalUnusable::PenDownUnknown),
     };
     let rows = run.iter().flat_map(|batch| {

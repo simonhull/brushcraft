@@ -45,6 +45,7 @@ mod evaluate;
 mod feed;
 mod floor;
 mod invalidate;
+mod journal;
 mod layered;
 mod prefetch;
 mod queued;

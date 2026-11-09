@@ -366,3 +366,193 @@ fn a_roll_over_writes_a_reserved_stroke_s_dabs_again_after_the_stroke_before() {
     assert_eq!(b.begin_op_after_end(&mut project), b_op, "it begins");
     project.close(false).unwrap();
 }
+
+#[test]
+fn a_save_waits_while_a_stroke_is_reserved_even_with_no_dabs() {
+    let dir = TestDir::new();
+    let path = dir.path("saved.bcp");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut a = Stroke::begin(&mut project, 20, 82);
+    a.place(&mut project, 4);
+    a.land(&mut project, &mut map, 4);
+    let b = Later::begin(&mut project, 20, 83);
+    assert!(
+        matches!(project.save_as(&path), Err(ProjectError::StillLanding)),
+        "the reserved stroke begins first"
+    );
+    assert_eq!(project.store().current_op(), Some(a.op), "a goes on");
+    let b_op = b.op();
+    assert_eq!(b.begin_op_after_end(&mut project), b_op, "b begins");
+    assert_saved(project.save_as(&path));
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_reserved_stroke_s_dabs_alone_are_unsaved_work() {
+    let dir = TestDir::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let a = Stroke::begin(&mut project, 4, 84);
+    assert!(!project.has_unsaved_edits(), "nothing yet");
+    let mut b = Later::begin(&mut project, 4, 85);
+    b.place(&mut project, 2);
+    assert!(project.has_unsaved_edits(), "the reserved stroke's dabs");
+    assert!(a.op < b.op());
+    b.begin_op_after_end(&mut project);
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_roll_over_after_the_stroke_before_ended_leaves_a_reserved_stroke_unknown() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut a = Stroke::begin(&mut project, 20, 86);
+    a.place(&mut project, 6);
+    let mut b = Later::begin(&mut project, 20, 87);
+    b.place(&mut project, 3);
+    a.land(&mut project, &mut map, 6);
+    project.end_unrecorded_stroke().unwrap();
+    flush(&mut project);
+    assert!(project.open_stroke_restorable(), "after a, which ended");
+    let old = project.recovery_path().unwrap().to_path_buf();
+    b.place(&mut project, 1);
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.finish_flushes().unwrap();
+    assert_ne!(project.recovery_path().unwrap(), old, "rolled over");
+    flush(&mut project);
+    assert_eq!(
+        pen_downs_of(&mut project, b.op()),
+        vec![PenDown::Unknown],
+        "no save point named for the surface a left"
+    );
+    assert!(!project.open_stroke_restorable(), "and said so");
+    b.begin_op(&mut project);
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_roll_over_as_a_reserved_stroke_begins_carries_it_and_its_pen_down_stands() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut a = Stroke::begin(&mut project, 20, 88);
+    a.place(&mut project, 6);
+    let mut b = Later::begin(&mut project, 20, 89);
+    b.place(&mut project, 3);
+    a.land(&mut project, &mut map, 6);
+    project.end_unrecorded_stroke().unwrap();
+    flush(&mut project);
+    // The writer fails a sync, and nothing rolls over yet.
+    b.place(&mut project, 2);
+    let writer = project.writer.as_mut().unwrap();
+    writer.fail_syncs(0, 1);
+    writer.request(&mut project.store, Instant::now()).unwrap();
+    while writer.phase() != "failed" {
+        drop(writer.step_blocking(&mut project.store));
+    }
+    let old = project.recovery_path().unwrap().to_path_buf();
+    let found = map.clone();
+    let mut b = b.begin_op(&mut project);
+    assert_ne!(project.recovery_path().unwrap(), old, "its cut rolled over");
+    let PenDown::At(carried) = pen_downs_of(&mut project, b.op)[0] else {
+        panic!("carried, its pen-down cut in the fresh file");
+    };
+    assert!(project.may_land(), "its surface is in the file");
+    b.place(&mut project, 1);
+    b.land(&mut project, &mut map, 2);
+    flush(&mut project);
+    let named = pen_downs_of(&mut project, b.op);
+    assert!(
+        named
+            .iter()
+            .all(|pen_down| *pen_down == PenDown::At(carried)),
+        "the carried pen-down, every batch: {named:?}"
+    );
+    let recovery = project.recovery_path().unwrap().to_path_buf();
+    project.close(true).unwrap();
+    assert_save_point(&recovery, carried, &found, "the surface a left");
+}
+
+#[test]
+fn an_abandoned_cut_as_a_reserved_stroke_begins_leaves_it_unknown_never_at() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut a = Stroke::begin(&mut project, 20, 90);
+    a.place(&mut project, 6);
+    let mut b = Later::begin(&mut project, 20, 91);
+    b.place(&mut project, 3);
+    flush(&mut project);
+    a.land(&mut project, &mut map, 6);
+    project.end_unrecorded_stroke().unwrap();
+    flush(&mut project);
+    // Rows waiting, the writer idle: its cut starts a flush, which fails as it cuts.
+    b.place(&mut project, 2);
+    project.fail_next_cut();
+    let mut b = b.begin_op(&mut project);
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "no save point holds it"
+    );
+    assert!(!project.open_stroke_restorable(), "and said so");
+    b.land(&mut project, &mut map, 5);
+    flush(&mut project);
+    let named = pen_downs_of(&mut project, b.op);
+    assert_eq!(
+        named,
+        vec![PenDown::After(a.op), PenDown::Unknown],
+        "after a, then unknown, never a save point"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_reserved_stroke_begun_behind_a_flush_in_flight_with_no_write_since_is_held_by_it() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut a = Stroke::begin(&mut project, 20, 92);
+    a.place(&mut project, 10);
+    let mut b = Later::begin(&mut project, 20, 93);
+    b.place(&mut project, 4);
+    a.land(&mut project, &mut map, 10);
+    // The stroke's end starts a flush, held in flight with its cut taken; nothing writes after.
+    project.writer.as_ref().unwrap().pause(true);
+    project.end_unrecorded_stroke().unwrap();
+    assert!(!project.writer.as_ref().unwrap().is_idle(), "in flight");
+    let found = map.clone();
+    let mut b = b.begin_op(&mut project);
+    assert!(
+        matches!(
+            project.store().open_pen_down(),
+            Some(PenDownPoint::Flush(_))
+        ),
+        "the flush in flight holds it: {:?}",
+        project.store().open_pen_down()
+    );
+    assert!(project.may_land(), "it lands at once");
+    b.land(&mut project, &mut map, 3);
+    let landed = map.clone();
+    project.writer.as_ref().unwrap().pause(false);
+    crash::poll_until_idle(&mut project);
+    flush(&mut project);
+    let points = project.store().working().save_points().unwrap();
+    let named = pen_downs_of(&mut project, b.op);
+    assert_eq!(
+        named,
+        vec![PenDown::After(a.op), PenDown::At(points[0])],
+        "after a in the flush that holds its surface, then that save point: {points:?}"
+    );
+    let last = *points.last().unwrap();
+    let recovery = project.recovery_path().unwrap().to_path_buf();
+    project.close(true).unwrap();
+    assert_save_point(&recovery, points[0], &found, "the surface a left");
+    assert_save_point(
+        &recovery,
+        last,
+        &landed,
+        "a, and b's dabs its count says landed",
+    );
+}

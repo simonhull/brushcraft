@@ -260,9 +260,11 @@ pub enum ProjectError {
     /// passes the dabs placed, or dabs past the last index a stroke counts. Nothing changed.
     #[error("the stroke's dab journal refused it")]
     Journal(#[from] JournalCountError),
-    /// [`Project::save`] or [`Project::save_as`] while the open stroke has dabs journalled and not
-    /// landed: a save lands every dab first, so the project file never depends on a journal.
-    /// Nothing was written; land them (or end the stroke), then save.
+    /// [`Project::save`] or [`Project::save_as`] while an open stroke has dabs journalled and not
+    /// landed, or a stroke is reserved behind the open one ([`Project::begin_stroke_after`]): a
+    /// save lands every dab first, so the project file never depends on a journal, and a save
+    /// moves the store off the open stroke's op, which the reserved stroke's waits behind.
+    /// Nothing was written; land them (or end the strokes), then save.
     #[error("the stroke's dabs are still landing")]
     StillLanding,
     /// [`Project::resume_stroke`] was given a stroke it can't resume: another op began since the
@@ -837,7 +839,7 @@ impl Project {
     /// the one before, and the next save saves its edits again.
     pub fn save(&mut self) -> Result<SaveOutcome, ProjectError> {
         let path = self.path.clone().ok_or(ProjectError::NoPath)?;
-        if self.store.is_landing() {
+        if self.must_land_first() {
             return Err(ProjectError::StillLanding);
         }
         let mut kept = self.prepare_save()?;
@@ -914,7 +916,7 @@ impl Project {
     /// [`Project::save`] once the new file is in place and durable: the project goes on with
     /// the old one then.
     pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome, ProjectError> {
-        if self.store.is_landing() {
+        if self.must_land_first() {
             return Err(ProjectError::StillLanding);
         }
         let path = std::path::absolute(path)?;
@@ -949,6 +951,14 @@ impl Project {
         self.file = Some(project);
         self.path = Some(path);
         Ok(self.outcome(kept))
+    }
+
+    /// Whether a save must wait ([`ProjectError::StillLanding`]): an open stroke's dabs still
+    /// land, or a stroke is reserved behind the open one. A save ends the store's op, so the open
+    /// stroke could land no more before the reserved one's op began, and that one would begin
+    /// with the open stroke's journal still open: two strokes writing.
+    fn must_land_first(&self) -> bool {
+        self.store.is_landing() || self.store.oldest_reserved_op().is_some()
     }
 
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles

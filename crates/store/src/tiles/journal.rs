@@ -284,8 +284,8 @@ impl Journal {
     }
 
     /// Whether the stroke's op is reserved and hasn't begun: it lands nothing.
-    fn is_reserved(&self) -> bool {
-        self.pen_down == PenDownPoint::Reserved
+    const fn is_reserved(&self) -> bool {
+        matches!(self.pen_down, PenDownPoint::Reserved)
     }
 
     /// Whether the stroke's pen-down waits on a flush to cut it or settle it.
@@ -544,18 +544,24 @@ impl TileStore {
     }
 
     /// The stroke made as `op`, an op just reserved ([`TileStore::reserve_op`]), begins behind
-    /// the stroke made as `after`, the newest open one, which still lands: opens its journal, its
-    /// batches naming [`PenDown::After`] `after` until its own pen-down cut, taken as its op
-    /// begins ([`TileStore::journal_op_began`]), settles (see the module notes).
-    pub(crate) fn begin_journal_after(&mut self, op: OpId, after: OpId) {
-        debug_assert_eq!(
-            self.newest_open_stroke(),
-            Some(after),
-            "a stroke begins behind the newest open one"
+    /// the newest open stroke, which still lands: opens its journal, its batches naming
+    /// [`PenDown::After`] that stroke until its own pen-down cut, taken as its op begins
+    /// ([`TileStore::journal_op_began`]), settles (see the module notes).
+    ///
+    /// The stroke before is of `op`'s site and an earlier op, as a batch's [`PenDown::After`]
+    /// must name (a debug assertion says so): every op is the store's own site's, and reserved
+    /// after every open one. Edits merged from several sites would need an order of their own
+    /// here, as the restore's head does (see `crate::project::resume`). With no stroke open,
+    /// which the caller rules out first, its batches wait for its own cut instead.
+    pub(crate) fn begin_journal_after(&mut self, op: OpId) {
+        let after = self.newest_open_stroke();
+        debug_assert!(
+            after.is_some_and(|after| after.site() == op.site() && after < op),
+            "a stroke begins behind an open stroke of its site, before it: {after:?}, {op:?}"
         );
         let dab_format = self.journals.dab_format;
         let mut journal = Journal::new(op, PenDownPoint::Reserved, dab_format, self.last_write);
-        journal.before_cut = Some(PenDown::After(after));
+        journal.before_cut = after.map(PenDown::After);
         self.journals.push(journal);
     }
 
@@ -564,15 +570,20 @@ impl TileStore {
     /// until then they go on naming the stroke before. A roll-over while the cut was taken, which
     /// carried the stroke and so settled its pen-down already, keeps that. Its writes from now on
     /// are its own, which a save in its middle looks for, as for any stroke
-    /// ([`TileStore::rebase_journal`]). Nothing for an op whose journal isn't open and reserved.
+    /// ([`TileStore::rebase_journal`]). Nothing for an op whose journal isn't open.
     pub(crate) fn journal_op_began(&mut self, op: OpId, pen_down: PenDownPoint) {
         let last_write = self.last_write;
-        if let Ok(journal) = self.journals.open(op)
-            && journal.is_reserved()
-        {
-            journal.pen_down = pen_down;
+        if let Ok(journal) = self.journals.open(op) {
             journal.begun_at = Some(last_write);
+            if journal.is_reserved() {
+                journal.pen_down = pen_down;
+            }
         }
+    }
+
+    /// The op of the writing stroke, if its journal is open: the one stroke whose op has begun.
+    pub(super) fn begun_stroke(&self) -> Option<OpId> {
+        self.journals.begun().map(|journal| journal.op)
     }
 
     /// The stroke made as `op`, restored after a crash, lands on (see
