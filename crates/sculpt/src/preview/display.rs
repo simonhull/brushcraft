@@ -31,6 +31,20 @@
 //! with each other, with the finest previews (which move the same bits by the same dabs) and with
 //! a renderer's stand-ins where nothing still to land moves them.
 //!
+//! # A later stroke's
+//!
+//! A display preview is one stroke's (the parent module's "Display tiles"), made over that
+//! stroke's pen-down surface. For a stroke whose op is reserved behind strokes still landing, its
+//! pen-down blocks are the futures of the tiles they change, each the tile as they will leave it,
+//! bit for bit, every one under the display tile and around those installed before it is made;
+//! the vertices replaced are those inside a finest tile changed since the record or reading one it
+//! has the future of. Nothing of the stroke has landed, so its base is its pen-down tile itself
+//! ([`Base::PenDown`]), and every dab of it is still to land. The rest holds as for a stroke alone,
+//! with `F₀` the surface the strokes before it leave: that is the surface its finest work moves.
+//! The strengths `ε` is bounded by, and the overlaps that cap the moves' part, are summed over the
+//! dabs of every stroke shown, larger than its own: each plane's final step is then bounded from
+//! its scale before any of them lands, every stroke's dabs over it growing it.
+//!
 //! # Normals
 //!
 //! A vertex's pen-down normal `n0` is its record's (averaged, the same bits in every tile holding
@@ -95,7 +109,7 @@ use geom::{DisplayTile, GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, DisplayPreview, Evaluation, TileStore};
 
 use super::dabs::DabIndex;
-use super::{bounds_of_points, touches};
+use super::{Tag, bounds_of_points, touches};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -129,26 +143,56 @@ struct Quad {
     terms: Vec<f64>,
 }
 
-/// A stroke's dabs as a display preview takes them.
+/// A stroke's dabs as a display preview takes them: those of `stroke` numbered from `first` up to
+/// `end`, one open stroke's among the dabs of every stroke the previews hold.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StrokeDabs<'a> {
-    /// Every dab of the stroke, in order.
+    /// Every dab the previews hold, of every stroke, in order.
     stroke: &'a [Imprint],
     /// Which of them can reach a place.
     index: &'a DabIndex,
-    /// The number of the first still to land.
+    /// The number of the first still to land, of any stroke.
     first_pending: usize,
+    /// The number of the stroke's first dab.
+    first: usize,
+    /// The number after the stroke's last dab.
+    end: usize,
 }
 
 impl<'a> StrokeDabs<'a> {
-    /// The dabs of `stroke`, its last `pending` still to land.
-    pub(super) const fn of(stroke: &'a [Imprint], index: &'a DabIndex, pending: usize) -> Self {
+    /// The dabs of `stroke` numbered in `range`, the last `pending` of `stroke` still to land.
+    pub(super) const fn of(
+        stroke: &'a [Imprint],
+        index: &'a DabIndex,
+        pending: usize,
+        range: Range<usize>,
+    ) -> Self {
         Self {
             stroke,
             index,
             first_pending: stroke.len().saturating_sub(pending),
+            first: range.start,
+            end: range.end,
         }
     }
+
+    /// The numbers of the stroke's dabs from `from` on that can reach `bounds`, ascending.
+    fn near(&self, bounds: &Aabb, from: usize) -> Vec<usize> {
+        let mut near = self.index.near(bounds, from.max(self.first));
+        near.retain(|&n| n < self.end);
+        near
+    }
+}
+
+/// What a display preview's vertices are drawn from before the dabs still to land move them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Base {
+    /// The store's tiles as they are now: the stroke's op is begun, and the dabs it has landed are
+    /// there.
+    Store,
+    /// The pen-down tile: the stroke's op is reserved behind strokes still landing, nothing of it
+    /// has landed, and its pen-down shapes are those strokes' futures.
+    PenDown,
 }
 
 /// One display tile's preview as the brush keeps it while its stroke lasts (see the module
@@ -195,6 +239,9 @@ pub(super) struct DisplayState {
     replayed: usize,
     /// Whether it was last handed to the store held.
     pub(super) published_held: Option<bool>,
+    /// The open stroke whose dabs it shows, made over that stroke's pen-down surface: the newest
+    /// whose dabs reach it (the parent module's "Strokes over strokes still landing").
+    pub(super) op: Tag,
 }
 
 /// Where display vertex `(i, j)` of `key` lies on the finest level `finest`: the finest tile
@@ -472,10 +519,11 @@ impl Blocks {
 }
 
 impl DisplayState {
-    /// Makes the previews of display tiles `keys` over the store as it holds it now: each its
-    /// pen-down tile and base (module notes), moved by those of `dabs` still to land, its normals
-    /// and bound over every dab of the stroke that can reach it. A tile the store has no record
-    /// of to draw (nor does a renderer) is left out.
+    /// Makes the previews of display tiles `keys` over the store as it holds it now, its pen-down
+    /// reads at the stroke's shapes: each its pen-down tile and base (module notes; the pen-down
+    /// tile itself for [`Base::PenDown`]), moved by those of `dabs` still to land, its normals and
+    /// bound over every dab of the stroke that can reach it. A tile the store has no record of to
+    /// draw (nor does a renderer) is left out.
     ///
     /// The records are decoded together and the finest blocks gathered once for all of them;
     /// the previews are made on the store's workers.
@@ -488,6 +536,7 @@ impl DisplayState {
         keys: &[TileKey],
         dabs: StrokeDabs<'_>,
         readers: &BTreeMap<TileKey, BTreeSet<TileKey>>,
+        base: Base,
     ) -> Result<Vec<Self>, CacheError> {
         let Some(finest_level) = store.display_finest() else {
             return Ok(Vec::new());
@@ -531,13 +580,15 @@ impl DisplayState {
                     finest_level,
                     blocks,
                     dabs,
+                    base,
                 )
             }),
         )
     }
 
     /// Display tile `tile`'s preview (see [`DisplayState::make_many`]), its record's own bound
-    /// `recorded_bound`, the steps since moving a finest vertex under it `displacement` at most.
+    /// `recorded_bound`, the steps since moving a finest vertex under it `displacement` at most,
+    /// drawn from `base`.
     fn build(
         tile: &DisplayTile,
         recorded_bound: f32,
@@ -545,6 +596,7 @@ impl DisplayState {
         finest_level: Level,
         blocks: &Blocks,
         dabs: StrokeDabs<'_>,
+        base: Base,
     ) -> Self {
         let key = *tile.key();
         let side = usize::try_from(key.side()).unwrap_or(0);
@@ -572,7 +624,12 @@ impl DisplayState {
         } else {
             f64::from(tile.error())
         };
-        let Replaced { base, p0, .. } = made;
+        let Replaced { base: now, p0, .. } = made;
+        // A reserved stroke's base is its pen-down tile: the strokes before it, as they will land.
+        let drawn = match base {
+            Base::Store => now,
+            Base::PenDown => p0.clone(),
+        };
         let frames: Vec<[Vec3; 2]> = n0.iter().copied().map(frame_of).collect();
         let cell_growth = growth_of(pen_down_bound);
         let quads = quads_of(&p0, side, cell_growth);
@@ -598,7 +655,7 @@ impl DisplayState {
             turn: vec![[Vec3::ZERO; 2]; p0.len()],
             normals: n0.clone(),
             turned: vec![false; p0.len()],
-            drawn: base,
+            drawn,
             p0,
             n0,
             frames,
@@ -613,10 +670,11 @@ impl DisplayState {
             cells_held: 0,
             replayed: 0,
             published_held: None,
+            op: None,
         };
         // A dab that misses the tile's box takes nothing: only those near it are walked.
         if let Some(whole) = state.bounds {
-            let near = dabs.index.near(&whole, 0);
+            let near = dabs.near(&whole, 0);
             state.replayed = near.len();
             for n in near {
                 if let Some(dab) = dabs.stroke.get(n) {
@@ -795,9 +853,8 @@ impl DisplayState {
                 .iter()
                 .filter_map(|&(v, ..)| self.p0.get(v).copied());
             let starts: Vec<Vec3> = starts.collect();
-            let near = bounds_of_points(&starts).map_or_else(Vec::new, |bounds| {
-                dabs.index.near(&bounds, dabs.first_pending)
-            });
+            let near = bounds_of_points(&starts)
+                .map_or_else(Vec::new, |bounds| dabs.near(&bounds, dabs.first_pending));
             let near = near.iter().filter_map(|&n| dabs.stroke.get(n));
             let pending: Vec<&Imprint> = near.collect();
             for (v, col, row) in vertices {

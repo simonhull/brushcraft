@@ -5,7 +5,8 @@
 //! samples, placed once every earlier stroke has landed, give the same dabs, bit for bit, and the
 //! same tiles once everything has landed.
 
-use store::{DabBatch, FLUSH_INTERVAL, PenDown};
+use geom::Vec3;
+use store::{DabBatch, DisplayPreview, FLUSH_INTERVAL, PenDown};
 
 use super::*;
 use crate::testing::settle;
@@ -121,6 +122,22 @@ impl Chain {
         self.ticked = self.ticked.max(Instant::now()) + FLUSH_INTERVAL * 2;
         self.project.tick(self.ticked).expect("ticked");
         settle(&mut self.project);
+    }
+
+    /// Builds the project's display layer, as a renderer's first frames have it built: what its
+    /// display previews are made over.
+    fn build_display(&mut self) {
+        let store = self.project.store();
+        store.queue_display_rebuild(Level::new(LEVEL).expect("a level"));
+        for _ in 0..10_000 {
+            store
+                .run_jobs(Instant::now() + Duration::from_millis(50))
+                .expect("the jobs run");
+            if !store.has_jobs() {
+                return;
+            }
+        }
+        panic!("the display layer never finished");
     }
 
     /// Every tile's evaluated positions, then closes the project (keeping no recovery file).
@@ -398,4 +415,348 @@ fn a_stroke_whose_futures_cant_be_had_waits_its_samples_and_places_them_as_waiti
         "the second's dabs, bit for bit"
     );
     assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+/// What the previews show while strokes are under way.
+struct Previews {
+    /// Each previewed finest tile's own positions (its block without the ring), row-major.
+    finest: BTreeMap<TileKey, Vec<Vec3>>,
+    /// Each display preview.
+    display: BTreeMap<TileKey, DisplayPreview>,
+}
+
+impl Previews {
+    /// What `store` previews now.
+    fn of(store: &TileStore) -> Self {
+        let finest = store.previewed().map(|&key| {
+            let block = store.preview(&key).expect("previewed");
+            let q = i64::from(block.quads());
+            let rows = (0..=q).flat_map(|j| (0..=q).map(move |i| (i, j)));
+            let own: Vec<Vec3> = rows.map(|(i, j)| block.get(i, j)).collect();
+            (key, own)
+        });
+        let finest: BTreeMap<TileKey, Vec<Vec3>> = finest.collect();
+        let display = store.display_previewed().filter_map(|&key| {
+            let preview = store.display_preview(&key)?;
+            Some((key, preview.clone()))
+        });
+        let display: BTreeMap<TileKey, DisplayPreview> = display.collect();
+        Self { finest, display }
+    }
+}
+
+/// `bits` as positions.
+fn from_bits(bits: &[[u32; 3]]) -> Vec<Vec3> {
+    let points = bits
+        .iter()
+        .map(|&[x, y, z]| Vec3::new(f32::from_bits(x), f32::from_bits(y), f32::from_bits(z)));
+    points.collect()
+}
+
+/// The point display tile `key`'s triangles over `positions` draw at finest grid place
+/// `(gx, gy)` of level `finest`, in `f64`: its quad there, split along its `(i, j)`–`(i+1, j+1)`
+/// diagonal, as every level is drawn.
+fn drawn_at(key: &TileKey, positions: &[Vec3], finest: Level, gx: u32, gy: u32) -> [f64; 3] {
+    let quads = key.side() - 1;
+    let step = f64::from(1_u32 << (finest.get() - key.level().get()));
+    let across = f64::from(gx) / step - f64::from(u32::from(key.tx()) * quads);
+    let down = f64::from(gy) / step - f64::from(u32::from(key.ty()) * quads);
+    let last = f64::from(quads - 1);
+    let (col, row) = (
+        across.floor().clamp(0.0, last),
+        down.floor().clamp(0.0, last),
+    );
+    let (fx, fy) = (across - col, down - row);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a quad index within the tile, clamped"
+    )]
+    let (i, j) = (col as usize, row as usize);
+    let side = usize::try_from(key.side()).expect("a side");
+    let p = |a: usize, b: usize| {
+        let v = positions[b * side + a];
+        [f64::from(v.x), f64::from(v.y), f64::from(v.z)]
+    };
+    let (p00, p10, p01, p11) = (p(i, j), p(i + 1, j), p(i, j + 1), p(i + 1, j + 1));
+    let mut out = [0.0; 3];
+    for c in 0..3 {
+        out[c] = if fx >= fy {
+            p00[c] + fx * (p10[c] - p00[c]) + fy * (p11[c] - p10[c])
+        } else {
+            p00[c] + fy * (p01[c] - p00[c]) + fx * (p11[c] - p01[c])
+        };
+    }
+    out
+}
+
+/// The farthest a finest vertex of `tiles` (every tile of the finest level `finest`) under
+/// display tile `key` lies from what `preview` draws at its place.
+fn farthest(
+    tiles: &BTreeMap<TileKey, Vec<Vec3>>,
+    finest: Level,
+    key: &TileKey,
+    preview: &DisplayPreview,
+) -> f64 {
+    let quads = key.side() - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let tile_quads = finest.tile_quads();
+    let span = (quads * step / tile_quads).max(1);
+    let side = tile_quads + 1;
+    let mut worst = 0.0_f64;
+    for fy in 0..span {
+        for fx in 0..span {
+            let (tx, ty) = (
+                u32::from(key.tx()) * span + fx,
+                u32::from(key.ty()) * span + fy,
+            );
+            let tile = TileKey::displacement(
+                key.face(),
+                finest,
+                u16::try_from(tx).expect("a tile"),
+                u16::try_from(ty).expect("a tile"),
+            )
+            .expect("a tile");
+            let positions = &tiles[&tile];
+            for b in 0..side {
+                for a in 0..side {
+                    let f = positions[usize::try_from(b * side + a).expect("a vertex")];
+                    let (gx, gy) = (tx * tile_quads + a, ty * tile_quads + b);
+                    let d = drawn_at(key, &preview.positions, finest, gx, gy);
+                    let gap = (f64::from(f.x) - d[0])
+                        .hypot(f64::from(f.y) - d[1])
+                        .hypot(f64::from(f.z) - d[2]);
+                    worst = worst.max(gap);
+                }
+            }
+        }
+    }
+    worst
+}
+
+/// The farthest a vertex of `positions`, display tile `key`'s, lies from the finest vertex of
+/// `tiles` (every tile of the finest level `finest`) it subsamples.
+fn farthest_vertex(
+    tiles: &BTreeMap<TileKey, Vec<Vec3>>,
+    finest: Level,
+    key: &TileKey,
+    positions: &[Vec3],
+) -> f32 {
+    let side = key.side();
+    let quads = side - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let tile_quads = finest.tile_quads();
+    let last = finest.tiles_per_side() - 1;
+    let place = |t: u16, v: u32| {
+        let g = (u32::from(t) * quads + v) * step;
+        let tile = (g / tile_quads).min(last);
+        (tile, g - tile * tile_quads)
+    };
+    let mut worst = 0.0_f32;
+    for j in 0..side {
+        for i in 0..side {
+            let (tx, a) = place(key.tx(), i);
+            let (ty, b) = place(key.ty(), j);
+            let tile = TileKey::displacement(
+                key.face(),
+                finest,
+                u16::try_from(tx).expect("a tile"),
+                u16::try_from(ty).expect("a tile"),
+            )
+            .expect("a tile");
+            let at = usize::try_from(b * (tile_quads + 1) + a).expect("a vertex");
+            let drawn = positions[usize::try_from(j * side + i).expect("a vertex")];
+            worst = worst.max((tiles[&tile][at] - drawn).length());
+        }
+    }
+    worst
+}
+
+/// Every display tile's record, as a renderer draws it: how far its vertices lie from the finest
+/// vertices of `tiles` (every tile, in bits) they subsample.
+fn record_errors(
+    store: &mut TileStore,
+    tiles: &BTreeMap<TileKey, Vec<[u32; 3]>>,
+) -> BTreeMap<TileKey, f32> {
+    let finest = Level::new(LEVEL).expect("a level");
+    let tiles: BTreeMap<TileKey, Vec<Vec3>> = tiles
+        .iter()
+        .map(|(key, bits)| (*key, from_bits(bits)))
+        .collect();
+    let faces: Vec<geom::FaceId> = store.mesh().faces().collect();
+    let levels = (0..LEVEL).map(|level| Level::new(level).expect("a level"));
+    let mut keys: Vec<TileKey> = Vec::new();
+    for level in levels {
+        let per_side = u16::try_from(level.tiles_per_side()).expect("a few");
+        for &face in &faces {
+            for ty in 0..per_side {
+                for tx in 0..per_side {
+                    keys.push(TileKey::display(face, level, tx, ty).expect("a display tile"));
+                }
+            }
+        }
+    }
+    let records = store.display_for_draw(&keys).expect("the records");
+    let errors = keys.iter().zip(records).filter_map(|(key, record)| {
+        let record = record?;
+        Some((
+            *key,
+            farthest_vertex(&tiles, finest, key, record.positions()),
+        ))
+    });
+    errors.collect()
+}
+
+/// Asserts that `shown`, the previews while strokes were under way, show `landed`, every tile
+/// once they had all landed, within the previews' bounds.
+///
+/// A finest preview differs from what lands only by the stored encoding (under a thousandth of
+/// how far the strokes moved the tiles shown), and a display preview lies within its bound of
+/// every finest vertex under it.
+///
+/// A display preview's bound is loose on these coarse tiles, so its vertices are held closer:
+/// each within twice its record's error before the strokes (`records`) of the finest vertex it
+/// subsamples, and the encoding. A vertex drawn from its record is weighed where the record has
+/// it, and moves as the finest vertex does but for the slope of the dabs over that error; a
+/// stroke's dabs weighed elsewhere, or left out, put it a dab's move away. `before` is every tile
+/// before the strokes.
+fn assert_shown_as_landed(
+    shown: &Previews,
+    before: &BTreeMap<TileKey, Vec<[u32; 3]>>,
+    records: &BTreeMap<TileKey, f32>,
+    landed: &BTreeMap<TileKey, Vec<[u32; 3]>>,
+    what: &str,
+) {
+    assert!(!shown.finest.is_empty(), "{what}: finest previews");
+    assert!(!shown.display.is_empty(), "{what}: display previews");
+    let landed: BTreeMap<TileKey, Vec<Vec3>> = landed
+        .iter()
+        .map(|(key, bits)| (*key, from_bits(bits)))
+        .collect();
+    let (mut moved, mut off, mut worst) = (0.0_f32, 0.0_f32, None);
+    for (key, drawn) in &shown.finest {
+        let was = from_bits(&before[key]);
+        for ((p, l), b) in drawn.iter().zip(&landed[key]).zip(&was) {
+            moved = moved.max((*l - *b).length());
+            let gap = (*p - *l).length();
+            if gap > off {
+                off = gap;
+                worst = Some(*key);
+            }
+        }
+    }
+    assert!(
+        moved > 0.01,
+        "{what}: the strokes moved the surface: {moved}"
+    );
+    assert!(
+        off < moved * 1e-3,
+        "{what}: a finest preview ({worst:?}) is {off} from what landed, of {moved} moved"
+    );
+    let finest = Level::new(LEVEL).expect("a level");
+    for (key, preview) in &shown.display {
+        let error = farthest(&landed, finest, key, preview);
+        let bound = f64::from(preview.bound);
+        assert!(
+            error <= bound,
+            "{what}: display {key:?} is {error} from what landed, past its bound {bound}"
+        );
+        let vertex = farthest_vertex(&landed, finest, key, &preview.positions);
+        let recorded = 2.0 * records[key] + moved * 1e-3;
+        assert!(
+            vertex <= recorded,
+            "{what}: a vertex of display {key:?} is {vertex} from what landed, past {recorded}"
+        );
+    }
+}
+
+#[test]
+fn a_later_strokes_previews_show_both_strokes_as_they_will_land() {
+    // The second crosses the first: tiles the first previewed that the second's dabs reach.
+    let mut run = Chain::new(Instant::now(), None);
+    run.build_display();
+    let before = positions(&mut run.project);
+    let records = record_errors(run.project.store(), &before);
+    run.frame(&stroke(ACROSS, 12));
+    run.frame(&crossing());
+    assert_eq!(run.ops().len(), 2, "both under way");
+    let shown = Previews::of(run.project.store());
+    run.cut();
+    for _ in 0..3 {
+        assert_eq!(run.land_one().dabs_applied, 1, "the first lands a dab");
+    }
+    let part_landed = Previews::of(run.project.store());
+    // The first lands whole: the second's op begins, its previews carried on over what landed.
+    let mut steps = 0;
+    while run.ops().len() > 1 {
+        run.land_one();
+        steps += 1;
+        assert!(steps < 10_000, "the first lands");
+    }
+    let first_landed = Previews::of(run.project.store());
+    run.cut();
+    assert_eq!(run.land_one().dabs_applied, 1, "the second lands a dab");
+    let second_landing = Previews::of(run.project.store());
+    run.land_all();
+    let landed = run.close();
+    assert_shown_as_landed(&shown, &before, &records, &landed, "shown");
+    assert_shown_as_landed(&part_landed, &before, &records, &landed, "part landed");
+    assert_shown_as_landed(&first_landed, &before, &records, &landed, "first landed");
+    assert_shown_as_landed(
+        &second_landing,
+        &before,
+        &records,
+        &landed,
+        "second landing",
+    );
+}
+
+/// A stroke along the crest of the ridge a stroke along [`ACROSS`] raises.
+const ALONG_THE_RIDGE: ((f64, f64), (f64, f64)) = ((140.0, 101.5), (180.0, 108.5));
+
+#[test]
+fn a_small_stroke_on_a_ridge_taller_than_its_radius_is_shown_on_the_ridge() {
+    // A broad stroke raises a ridge many times the small brush's radius; the small one draws
+    // along its crest while the ridge lands, and is shown on it, then as part of it lands.
+    let mut run = Chain::new(Instant::now(), None);
+    run.build_display();
+    let before = positions(&mut run.project);
+    let records = record_errors(run.project.store(), &before);
+    run.brush.set_radius(24.0);
+    run.frame(&to_and_fro(3));
+    run.frame(&[sample(Phase::Up, ACROSS.0, 0.0)]);
+    let ridge = Previews::of(run.project.store());
+    let raised = ridge.finest.iter().flat_map(|(key, shown)| {
+        let was = from_bits(&before[key]);
+        let gaps = shown.iter().zip(was).map(|(p, b)| (*p - b).length());
+        let gaps: Vec<f32> = gaps.collect();
+        gaps
+    });
+    let height = raised.fold(0.0_f32, f32::max);
+    run.brush.set_radius(3.0);
+    run.frame(&stroke(ALONG_THE_RIDGE, 10));
+    assert_eq!(run.ops().len(), 2, "both under way");
+    let small: Vec<DabRow> = run.rows().last().cloned().unwrap_or_default();
+    let radius = small
+        .iter()
+        .map(|row| {
+            let dab: Dab = bytemuck::cast(*row);
+            dab.radius
+        })
+        .fold(0.0_f32, f32::max);
+    assert!(radius > 0.0, "the small stroke placed dabs");
+    assert!(
+        height > 2.0 * radius,
+        "a ridge {height} high, past the small brush's radius {radius}"
+    );
+    let shown = Previews::of(run.project.store());
+    run.cut();
+    for _ in 0..3 {
+        assert_eq!(run.land_one().dabs_applied, 1, "the ridge lands a dab");
+    }
+    let part_landed = Previews::of(run.project.store());
+    run.land_all();
+    let landed = run.close();
+    assert_shown_as_landed(&shown, &before, &records, &landed, "shown");
+    assert_shown_as_landed(&part_landed, &before, &records, &landed, "part landed");
 }

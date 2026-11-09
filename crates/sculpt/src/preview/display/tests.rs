@@ -686,11 +686,11 @@ fn the_previews_a_renderer_waits_for_are_made_a_few_a_call() {
         "{} tiles wait",
         waiting.len()
     );
-    preview.make_waiting(store, &waiting).unwrap();
+    preview.make_waiting(store, &index, &waiting).unwrap();
     assert_eq!(previews(store).len(), WAITING_A_CALL, "a few a call");
     let mut calls = 1;
     while waiting.iter().any(|key| store.preview_wanted(key)) {
-        preview.make_waiting(store, &waiting).unwrap();
+        preview.make_waiting(store, &index, &waiting).unwrap();
         calls += 1;
         assert!(calls <= waiting.len(), "each call makes some");
     }
@@ -870,7 +870,7 @@ fn a_held_tile_with_a_state_and_no_preview_gets_it_handed_over_again() {
     let (key, want) = shown.iter().next().expect("a preview");
     store.clear_display_preview(key);
     assert!(store.preview_wanted(key), "held, with none");
-    let made = preview.make_waiting(store, &[*key]).unwrap();
+    let made = preview.make_waiting(store, &index, &[*key]).unwrap();
     assert_eq!(made.gathered, 0, "nothing made again");
     let got = store.display_preview(key).expect("handed over");
     assert_eq!(got.positions, want.positions);
@@ -910,9 +910,9 @@ fn tiles_that_get_no_preview_starve_none_behind_them() {
         .expect("a display tile waiting");
     let mut keys = stuck.clone();
     keys.push(waits);
-    preview.make_waiting(store, &keys).unwrap();
+    preview.make_waiting(store, &index, &keys).unwrap();
     assert!(!store.preview_wanted(&waits), "made behind the stuck tiles");
-    let again = preview.make_waiting(store, &keys).unwrap();
+    let again = preview.make_waiting(store, &index, &keys).unwrap();
     assert_eq!(again.gathered, 0, "the stuck tiles aren't tried again");
     for key in &stuck {
         store.release_preview(key);
