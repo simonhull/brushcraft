@@ -197,40 +197,65 @@
 //!   view or a size changed while the pen is down would place them otherwise than at once.
 //! - **A store error** while the oldest lands drops its dabs left, and every later stroke with
 //!   them, their reserved ops given back ([`Project::drop_stroke_after`]): they read the surface
-//!   those dabs were to leave.
+//!   those dabs were to leave. It is one error that dropped dabs, however many strokes go with it,
+//!   so the save after it owns up to it once ("A stroke didn't finish"; a finisher's notification,
+//!   "Part of a stroke is gone").
+//! - **A close with Save** lets the window go while a chain lands (the dab journal spec,
+//!   "Closing"): every stroke of it is journalled, the later ones after the one before, which a
+//!   restore resumes in turn ("Strokes a restore found" below), so the finisher lands them one
+//!   after another as the frames would, and a takeover between its batches finds the chain whole in
+//!   the recovery file.
 //!
-//! # A stroke a restore found
+//! # Strokes a restore found
 //!
-//! A crash during a landing leaves the stroke's journal in the recovery file. A restore finds it
-//! ([`Project::take_open_stroke`]), and the frame loop hands it to the brush before its first
-//! frame ([`crate::frame::Owner::resume_stroke`], [`Brush::resume`]; the dab journal spec,
-//! "Restoring a journalled stroke"):
+//! A crash during a landing leaves the strokes' journals in the recovery file: the one landing,
+//! and any begun over it. A restore finds them in op order ([`Project::take_open_strokes`]), and
+//! the frame loop hands those it can use to the brush before its first frame
+//! ([`crate::frame::Owner::resume_stroke`], [`Brush::resume`]; the dab journal spec, "Restoring a
+//! journalled stroke"; the stroke-while-landing spec, "Showing and landing"):
 //!
-//! - **Taken on:** its rows are read back as dabs (each is a [`Dab`]'s bytes, in the layout
-//!   [`stroke::DAB_FORMAT`] names), and the project resumes it ([`Project::resume_stroke`]): its op
-//!   reopened, its pen-down shapes installed, its journal counting on from its landed count. The
-//!   brush holds it as a stroke whose pen has lifted, with no engine stroke and nothing to record:
-//!   its dabs queued, each with the tiles it touches, as placed dabs are, and never journalled
-//!   again (the file holds them).
+//! - **Taken on:** the first stroke's rows are read back as dabs (each is a [`Dab`]'s bytes, in the
+//!   layout [`stroke::DAB_FORMAT`] names), and the project resumes it ([`Project::resume_stroke`]):
+//!   its op reopened, its pen-down shapes installed, its journal counting on from its landed count.
+//!   The brush holds it as a stroke whose pen has lifted, with no engine stroke and nothing to
+//!   record: its dabs queued, each with the tiles it touches, as placed dabs are, and never
+//!   journalled again (the file holds them).
 //! - **Shown at once,** every dab ahead of its finest work ([`Preview::show`], over what the
 //!   renderer draws from the start: its floor), so the whole stroke is on screen in the first
 //!   frame, which reports them shown.
-//! - **Landed as a lifted stroke:** the catch-up lands it as any stroke whose pen has lifted, and a
-//!   `Down` meanwhile begins over it, as over any landing. Once every dab has landed its op ends
-//!   unrecorded ([`Project::end_unrecorded_stroke`]): the journal holds no pen samples, and a
-//!   stroke record is history, never needed to open.
+//! - **Landed as a lifted stroke:** the catch-up lands it as any stroke whose pen has lifted. Once
+//!   every dab has landed its op ends unrecorded ([`Project::end_unrecorded_stroke`]): the journal
+//!   holds no pen samples, and a stroke record is history, never needed to open.
+//! - **The rest of the chain, in turn:** each later stroke (begun over the one before it, its
+//!   pen-down that one's surface, [`store::OpenStroke::after`]) waits, kept as found, and resumes
+//!   as the one before it ends ([`Sculpting::resume_next`]), in that same call: on the surface it
+//!   left, the store's own then, so it is read exactly with no futures; its dabs are queued and
+//!   shown then, as the first's were, and it lands once its pen-down cut is taken, as any stroke
+//!   begun behind another. So a later stroke is on screen from when it resumes, not from the first
+//!   frame: the simplest exact way, as its futures would need its op reserved, which a restored
+//!   stroke's isn't. A stroke that drops dabs takes those after it with it
+//!   ([`Project::end_stroke_dropping_later`]), and one the project won't resume ends the chain
+//!   there, both kept as an error that dropped dabs.
+//! - **A `Down` meanwhile:** with only the first, it begins over it, as over any landing. With
+//!   later strokes still waiting to resume it waits, deferred ([`Begin::Waits`]): its op, a fresh
+//!   one, would end them ([`Project::begin_stroke_after`]). It is taken as the last of them
+//!   resumes, and begins over that one ([`Sculpting::deferred_ready`]).
 //! - **Not taken on** with rows of another layout ([`OtherDabFormat`](resume::OtherDabFormat)), a
 //!   row that can't be a dab of the model (a damaged or hostile file,
-//!   [`HostileDab`](resume::HostileDab)), or by a project that won't resume it (asked twice if the
-//!   first refusal is the cache's): the restored tiles stand, and the project's next stroke closes
-//!   it in the file. The restore note says so.
-//! - **With no window** (a copy of found work, [`finish_restored`]) it is taken on the same way and
-//!   landed whole at once, blocking, before the copy is saved.
+//!   [`HostileDab`](resume::HostileDab): a later stroke's against the model as it resumes, its
+//!   numbers before), or by a project that won't resume it (asked twice if the first refusal is the
+//!   cache's): that stroke and every one after it, which land on its surface. The restored tiles
+//!   stand, with what the strokes before it land, and once the last taken has resumed the project
+//!   lets the rest go, closing them in the file ([`Project::let_go_of_restored_strokes`]). The
+//!   restore note says so, in the plural for more than one.
+//! - **With no window** (a copy of found work, [`finish_restored`]) they are taken on the same way
+//!   and landed whole at once, one after another, blocking, before the copy is saved.
 //!
-//! It lands close to what the live landing would have made, not bit for bit: the stroke state
-//! ([`sculpt::Stroke`]) starts each vertex it touches from the stored, rounded value, where the
-//! live one kept it unrounded, so each is rounded once more, by at most half its tile's
-//! quantization step.
+//! They land close to what the live landing would have made, not bit for bit: the stroke state
+//! ([`sculpt::Stroke`]) starts each vertex the first touches from the stored, rounded value, where
+//! the live one kept it unrounded, so each is rounded once more, by at most half its tile's
+//! quantization step. A later stroke lands on what the first left, so the bound holds per stroke,
+//! on the surface it lands on; its own landing starts afresh from stored values live too.
 //!
 //! # Warming under a hovering pen
 //!
@@ -290,7 +315,7 @@ pub(crate) use self::resume::{finish_restored, unseen_view};
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
     Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
-    Landing, STROKE_QUIET, SampleTimes, recovery_report,
+    Landing, NotTakenOn, STROKE_QUIET, SampleTimes, recovery_report,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 use crate::saving::DabsDropped;
@@ -1615,6 +1640,17 @@ enum Begin {
     Waits,
 }
 
+/// What a `Down` deferred first waits for before it is taken ([`Sculpting::deferred_ready`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownAwaits {
+    /// Every stroke under way to end: it couldn't begin over them ([`Begin::Waits`]), or it came
+    /// behind events deferred themselves.
+    Landed,
+    /// Only the strokes a restore found to resume (a fresh op would end them): it is taken as the
+    /// last of them resumes, and begins over it.
+    Resumed,
+}
+
 /// What the warming under a hovering pen is doing.
 #[derive(Debug, Default)]
 struct Warm {
@@ -1662,6 +1698,13 @@ pub(crate) struct Sculpting {
     /// behind it, and only the newest's pen ever down (see "Strokes over strokes still landing" in
     /// the module notes). A stroke that can't begin over them waits in `deferred`.
     strokes: Vec<Pending>,
+    /// The strokes a restore found still landing, after the one under way, in op order: each
+    /// resumes once the one before it has landed and ended ([`Sculpting::resume_next`]), and a
+    /// `Down` waits until none is left (see "Strokes a restore found" in the module notes).
+    restored: VecDeque<OpenStroke>,
+    /// What a `Down` deferred first waits for: every stroke under way to end, or only `restored`
+    /// to resume, when it is taken as the last of them resumes and begins over it.
+    down_awaits: DownAwaits,
     /// What the stroke keeps of the surface it began on, as the last step left it.
     kept: Kept,
     /// What applying dabs costs: how a step's time becomes dabs.
@@ -1758,6 +1801,8 @@ impl Sculpting {
             strength_factor: 1.0,
             state,
             strokes: Vec::new(),
+            restored: VecDeque::new(),
+            down_awaits: DownAwaits::Landed,
             kept: Kept::default(),
             cost: DabCost::CALIBRATED,
             preview: Some(Preview::new()),
@@ -1851,11 +1896,11 @@ impl Sculpting {
         self.last
     }
 
-    /// Whether a stroke is in progress or its dabs are still being applied, or a stroke waits to
-    /// begin.
+    /// Whether a stroke is in progress or its dabs are still being applied, a stroke a restore
+    /// found waits to resume, or a stroke waits to begin.
     #[cfg(test)]
     pub(crate) fn stroking(&self) -> bool {
-        !self.strokes.is_empty() || !self.deferred.is_empty()
+        !self.strokes.is_empty() || !self.restored.is_empty() || !self.deferred.is_empty()
     }
 
     /// Whether a stroke is under way (not one that waits to begin).
@@ -1873,6 +1918,20 @@ impl Sculpting {
     /// Dabs placed and not yet applied.
     fn queued(&self) -> usize {
         self.strokes.iter().map(|stroke| stroke.dabs.len()).sum()
+    }
+
+    /// The dabs of the strokes a restore found that wait to resume, none of them landed: part of
+    /// what a close or a save waits for.
+    fn restored_dabs(&self) -> usize {
+        self.restored.iter().map(|stroke| stroke.dabs().len()).sum()
+    }
+
+    /// What the strokes the brush holds have left to land, counted for a close or a save: their
+    /// dabs (those of the strokes a restore found that wait to resume included), and at least one
+    /// for each stroke, whose op is still to end.
+    fn held_to_land(&self) -> usize {
+        let strokes = self.strokes.len() + self.restored.len();
+        (self.queued() + self.restored_dabs()).max(strokes)
     }
 
     /// Dabs placed and neither applied nor shown: the stroke's lag.
@@ -1914,7 +1973,7 @@ impl Sculpting {
     fn finish_report(&self, report: &mut BrushReport) {
         report.dabs_carried = self.unshown();
         report.dabs_catching_up = self.catching_up();
-        report.busy = self.queued() > 0 || !self.deferred.is_empty();
+        report.busy = self.queued() > 0 || !self.restored.is_empty() || !self.deferred.is_empty();
         report.open = self.pen_on_stroke() || !self.deferred.is_empty();
         report.kept = self.kept;
     }
@@ -2007,22 +2066,25 @@ impl Sculpting {
             return;
         }
         let deferred = std::mem::take(&mut self.deferred);
+        self.down_awaits = DownAwaits::Landed;
         for event in &deferred {
             self.admit(scene, event.as_ref());
         }
     }
 
     /// Whether the events deferred may be taken now: a stroke's `Down` once every stroke before it
-    /// has ended (and not one waiting for the save under way); the rest of the open stroke's
-    /// samples, deferred because the futures it reads couldn't be had ([`Placing::Waits`]), once
-    /// the strokes before it have ended and its own op has begun, so they are placed on its own
-    /// pen-down surface, the one those strokes left.
+    /// has ended, or, for one that waited only for the strokes a restore found to resume, once
+    /// the last of them has (and not one waiting for the save under way); the rest of the open
+    /// stroke's samples, deferred because the futures it reads couldn't be had
+    /// ([`Placing::Waits`]), once the strokes before it have ended and its own op has begun, so
+    /// they are placed on its own pen-down surface, the one those strokes left.
     fn deferred_ready(&self) -> bool {
         let Some(next) = self.deferred.first() else {
             return false;
         };
         if next.is_some_and(|sample| sample.phase == Phase::Down) {
-            return self.strokes.is_empty() && !self.deferred_for_save();
+            let before = self.strokes.is_empty() || self.down_awaits == DownAwaits::Resumed;
+            return before && self.restored.is_empty() && !self.deferred_for_save();
         }
         match self.strokes.as_slice() {
             [] => true,
@@ -2065,8 +2127,15 @@ impl Sculpting {
     /// ([`Sculpting::begin_after`]). It lands once it may (see "The journal" in the module notes).
     ///
     /// Returns [`Begin::Waits`] for a stroke that can't begin over those landing: nothing of it is
-    /// done, its number not taken, and the caller defers it.
+    /// done, its number not taken, and the caller defers it. So does one while strokes a restore
+    /// found wait to resume: its op, a fresh one, would end them ([`Project::begin_stroke_after`]),
+    /// so it waits until the last has resumed, and begins over it then.
     fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) -> Begin {
+        if !self.restored.is_empty() {
+            // Nothing is deferred before it (else it would be deferred behind them, not begun).
+            self.down_awaits = DownAwaits::Resumed;
+            return Begin::Waits;
+        }
         self.warm = Warm::default();
         let routed = self.routed.take();
         let Some(first) = self.engine_sample(down) else {
@@ -2892,7 +2961,9 @@ impl Sculpting {
     ///
     /// The previews end with the last stroke: a later stroke's dabs shown stay. The op ends with
     /// its record; unrecorded if it has none (a stroke a restore found), if the record can't be
-    /// made or the project refuses it, so its edits are flushed all the same.
+    /// made or the project refuses it, so its edits are flushed all the same. With none left
+    /// under way, the next stroke a restore found resumes, on the surface `over` left
+    /// ([`Sculpting::resume_next`]).
     fn end(&mut self, scene: &mut Scene<'_>, over: &Pending) {
         if self.strokes.is_empty() {
             self.end_previews(scene.project);
@@ -2904,6 +2975,9 @@ impl Sculpting {
                 // The next couldn't begin, and went with every one after it.
                 self.end_previews(scene.project);
             }
+        }
+        if self.strokes.is_empty() {
+            self.resume_next(scene);
         }
     }
 
@@ -2917,10 +2991,13 @@ impl Sculpting {
     }
 
     /// Ends `over`'s op (see [`Sculpting::end`]). One that dropped dabs ends letting every stroke
-    /// behind it go with it ([`Project::end_stroke_dropping_later`]), and their tokens are given
-    /// back after.
+    /// behind it go with it ([`Project::end_stroke_dropping_later`]): those reserved behind it,
+    /// whose tokens are given back after, and those a restore found that wait to resume, which
+    /// the project closes in the file.
     fn end_op(&mut self, project: &mut Project, over: &Pending) {
         if let Some(tokens) = self.dropping_later.take() {
+            // Read on the surface `over` was to leave: none of them resumes.
+            self.restored.clear();
             self.end_dropping_later(project, over);
             for token in tokens {
                 // Let go already: given back, letting nothing more go.
@@ -3591,8 +3668,12 @@ impl Brush for Sculpting {
         self.before_next_sample().filter(|_| self.pen_moving())
     }
 
-    fn resume(&mut self, context: BrushContext<'_>, stroke: OpenStroke) -> Result<()> {
-        self.take_on(context, stroke)
+    fn resume(
+        &mut self,
+        context: BrushContext<'_>,
+        strokes: Vec<OpenStroke>,
+    ) -> Result<(), NotTakenOn> {
+        self.take_on(context, strokes)
     }
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
@@ -3615,19 +3696,19 @@ impl Brush for Sculpting {
     }
 
     fn landing(&self) -> usize {
-        self.queued().max(self.strokes.len()) + self.deferred.len() + self.held.len()
+        self.held_to_land() + self.deferred.len() + self.held.len()
     }
 
     fn journals(&self) -> bool {
         true
     }
 
-    /// The events held or deferred, and every stroke reserved over one still landing: its dabs
-    /// are journalled, but no restore takes a stroke behind another yet, so the window stays for
-    /// the save as it does for a stroke not placed.
+    /// The events held or deferred that the save holds. A stroke reserved over one still landing
+    /// isn't among them: its dabs are journalled behind that one's, and a restore takes the chain
+    /// in op order. Nor are the strokes a restore found that wait to resume: the recovery file
+    /// holds them already.
     fn unplaced_for_save(&self) -> usize {
-        let reserved = self.strokes.len().saturating_sub(1);
-        self.deferred_in_save().count() + self.held.len() + reserved
+        self.deferred_in_save().count() + self.held.len()
     }
 
     fn begin_saving(&mut self, asked: Instant) {
@@ -3651,7 +3732,7 @@ impl Brush for Sculpting {
     }
 
     fn landing_for_save(&self) -> usize {
-        self.queued().max(self.strokes.len()) + self.deferred_in_save().count() + self.held.len()
+        self.held_to_land() + self.deferred_in_save().count() + self.held.len()
     }
 
     fn save_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
@@ -3676,6 +3757,8 @@ impl Brush for Sculpting {
                 token.abandon_with_store_gone();
             }
         }
+        self.restored.clear();
+        self.down_awaits = DownAwaits::Landed;
         self.held.clear();
         self.deferred.clear();
         self.landing = Landing::InFrames;
@@ -3714,10 +3797,10 @@ impl Brush for Sculpting {
             loop {
                 self.unframed = false;
                 let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
-                let before = (self.strokes.len(), self.queued());
+                let before = (self.strokes.len(), self.queued(), self.restored.len());
                 self.work(&mut scene, &mut BrushReport::default(), Some(&budget));
-                // A stroke ending, and the next beginning, is progress too.
-                if (self.strokes.len(), self.queued()) == before {
+                // A stroke ending, and the next beginning (or resuming), is progress too.
+                if (self.strokes.len(), self.queued(), self.restored.len()) == before {
                     break;
                 }
             }
@@ -3726,9 +3809,19 @@ impl Brush for Sculpting {
                 // Samples deferred behind strokes that have landed since are placed first.
                 self.release_deferred(&mut scene);
                 self.lift(&mut scene, None);
-                let before = (self.strokes.len(), self.queued(), self.deferred.len());
+                let before = (
+                    self.strokes.len(),
+                    self.queued(),
+                    self.restored.len(),
+                    self.deferred.len(),
+                );
                 self.work(&mut scene, &mut BrushReport::default(), None);
-                let after = (self.strokes.len(), self.queued(), self.deferred.len());
+                let after = (
+                    self.strokes.len(),
+                    self.queued(),
+                    self.restored.len(),
+                    self.deferred.len(),
+                );
                 // Each work lands the oldest stroke whole, and begins the next's op.
                 if after == before && !self.deferred_ready() {
                     break;

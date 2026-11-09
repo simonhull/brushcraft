@@ -1218,12 +1218,20 @@ fn save_on_a_large_backlog_lets_the_window_go_before_any_dab_lands() {
     );
 }
 
-/// A stroke begun over the landing is journalled behind it, which no restore takes yet: Save waits
-/// in the window until both strokes are saved, and never lets the window go first.
-#[test]
-fn a_stroke_begun_over_the_landing_keeps_the_window_until_it_is_saved() {
-    let dir = TestDir::new();
-    let mut owner = slow_owner(&dir);
+/// The frame loop over a saved project in `dir` with a chain under way.
+///
+/// Its brush lands a dab at a time, its sample times counted from `epoch`: a stroke along
+/// [`ACROSS`] shown and none of it landed, and a second begun over it, its pen lifted too.
+fn chain_owner(dir: &TestDir, epoch: Instant) -> Owner<Sculpting, NoUploads> {
+    let mut owner = owner_of(
+        saved_project(dir),
+        |project| {
+            Sculpting::new(project)
+                .with_cost(DabCost::one_at_a_time())
+                .with_epoch(epoch)
+        },
+        setup(),
+    );
     run(&mut owner, 10_000);
     queue(&mut owner, stroke(ACROSS, 12));
     run(&mut owner, 1);
@@ -1231,6 +1239,20 @@ fn a_stroke_begun_over_the_landing_keeps_the_window_until_it_is_saved() {
     run(&mut owner, 1);
     assert_eq!(owner.brush().strokes.len(), 2, "the second began over it");
     assert!(!owner.brush().pen_down(), "its pen has lifted");
+    owner
+}
+
+/// Save on the close bar while a chain lands: the window goes, and the finisher saves every dab.
+///
+/// Both strokes' dabs are journalled, the later one's after the earlier, which a restore takes in
+/// turn, so the window goes before any dab lands, and the finisher lands them in order and saves
+/// them, bit for bit what a save waited for in the window holds.
+#[test]
+fn a_stroke_begun_over_the_landing_finishes_unseen_with_every_dab() {
+    let epoch = Instant::now();
+    let dir = TestDir::new();
+    let mut owner = chain_owner(&dir, epoch);
+    let backlog = owner.landing();
     let now = Instant::now();
     assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
     assert!(owner.key(UiKey::Enter, now), "Save");
@@ -1244,11 +1266,63 @@ fn a_stroke_begun_over_the_landing_keeps_the_window_until_it_is_saved() {
         asked = owner.take_request();
         assert!(began.elapsed() < Duration::from_secs(60), "it ends");
     }
-    assert_eq!(asked, Some(WindowRequest::Exit), "saved in the window");
-    assert_eq!(owner.landing(), 0, "both landed first");
-    owner.close().expect("closed");
+    assert_eq!(asked, Some(WindowRequest::Finish), "the window goes first");
+    assert_eq!(owner.landing(), backlog, "nothing waited for the landing");
+    assert!(owner.project().flushed(), "every dab placed is durable");
+    owner
+        .finish_unseen(|summary, body| panic!("{summary}: {body}"))
+        .expect("finished");
     assert_eq!(records_on_disk(&dir), 2, "both strokes");
-    assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
+    assert_eq!(recovery_files(&dir), 0, "saved, the recovery file gone");
+
+    let waited_dir = TestDir::new();
+    let mut waited = chain_owner(&waited_dir, epoch);
+    waited.request_save(Instant::now());
+    finish_save(&mut waited);
+    waited.close().expect("closed");
+    assert_eq!(
+        tiles_on_disk(&dir),
+        tiles_on_disk(&waited_dir),
+        "bit for bit"
+    );
+}
+
+/// An earlier stroke that drops dabs takes the strokes begun over it with it: one drop, said once,
+/// by the save after it, which holds the rest of the work.
+#[test]
+fn a_chain_whose_first_drops_dabs_is_said_once_by_the_save() {
+    let dir = TestDir::new();
+    let mut owner = chain_owner(&dir, Instant::now());
+    owner.brush_mut().knob = Knob::LandingFails;
+    let began = Instant::now();
+    while owner.brush().stroking() {
+        run(&mut owner, 1);
+        assert!(began.elapsed() < Duration::from_secs(60), "they end");
+    }
+    owner.brush_mut().knob = Knob::None;
+    assert_eq!(
+        owner.brush().drops(),
+        1,
+        "one drop, for every stroke of the chain"
+    );
+    owner.request_save(Instant::now());
+    finish_save(&mut owner);
+    let bar = owner.bar().expect("the save says so");
+    assert_eq!(bar.title(), "A stroke didn't finish");
+    assert_eq!(bar.details(), ["The rest of your work was saved."]);
+    // Told: a stroke and a save after it are a stroke and a save.
+    queue(&mut owner, stroke(((140.0, 90.0), (180.0, 90.0)), 8));
+    run(&mut owner, 10_000);
+    owner.brush_mut().cost = DabCost::default();
+    let landing = Instant::now();
+    while owner.brush().stroking() {
+        run(&mut owner, 1);
+        assert!(landing.elapsed() < Duration::from_secs(60), "it lands");
+    }
+    owner.request_save(Instant::now());
+    finish_save(&mut owner);
+    assert_eq!(owner.saving_succeeded(), Some(true), "said once");
+    owner.close().expect("closed");
 }
 
 /// [`slow_owner`] whose strokes never begin over one still landing: each waits for it, as past

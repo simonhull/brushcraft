@@ -11,6 +11,7 @@ use stroke::{MirrorPlanes, Symmetry};
 use super::*;
 use crate::testing::settle;
 
+mod chained;
 mod resume;
 #[cfg(target_os = "linux")]
 mod takeover;

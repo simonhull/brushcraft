@@ -53,7 +53,7 @@ fn restore_in(dir: &TestDir) -> Project {
 
 /// The frame loop over the project restored in `dir` with the brush `brush` makes, the stroke a
 /// restore found handed to it as the app does.
-fn resumed_in(
+pub(super) fn resumed_in(
     dir: &TestDir,
     brush: impl FnOnce(&mut Project) -> Sculpting,
 ) -> Owner<Sculpting, NoUploads> {

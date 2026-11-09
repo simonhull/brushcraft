@@ -86,7 +86,7 @@ use store::{
 use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
-use crate::dialogs::LastStroke;
+use crate::dialogs::{LastStroke, Unfinished};
 use crate::frame::schedule::Next;
 use crate::frame::{Brush, Finished, GpuWait, NoPen, Owner, Reopen, Setup, Uploads};
 use crate::pace::{Pacer, SystemTimer};
@@ -130,7 +130,8 @@ pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, mut setup: Setup) -> Re
                 Some(picker) => owner.with_picker(picker).framed(),
                 None => owner,
             };
-            // A stroke a restore found still landing, before any frame: on screen in the first.
+            // The strokes a restore found still landing, before any frame: the first on screen in
+            // the first frame.
             owner.resume_stroke();
             Ok(owner)
         }
@@ -254,9 +255,9 @@ pub(crate) enum OpenNote {
         /// What was found.
         candidate: RecoveryCandidate,
     },
-    /// Found work went to a copy, saved, and its last stroke couldn't be finished: the copy holds
-    /// the rest ([`sculpting::finish_restored`]).
-    CopyUnfinished,
+    /// Found work went to a copy, saved, and its last strokes, or some of them, couldn't be
+    /// finished: the copy holds the rest ([`sculpting::finish_restored`]).
+    CopyUnfinished(Unfinished),
 }
 
 /// Whether `one` and `other` are one file, however they are spelled: through a symbolic link, with
@@ -485,7 +486,12 @@ impl ProjectToOpen {
             Reopen::LastSave { kept } => (self.clone().open()?, Some(kept), None, None, None),
             Reopen::Copy { candidate } => match self.open_copy(&candidate) {
                 Ok((project, saved, last)) => {
-                    let note = (last == LastStroke::Unfinished).then_some(OpenNote::CopyUnfinished);
+                    let note = match last {
+                        LastStroke::Whole => None,
+                        LastStroke::Unfinished(unfinished) => {
+                            Some(OpenNote::CopyUnfinished(unfinished))
+                        }
+                    };
                     (project, None, Some(saved), None, note)
                 }
                 Err(error) => {
@@ -505,15 +511,15 @@ impl ProjectToOpen {
 
     /// Restores `candidate` and saves it beside the project, which goes unwritten: the copy is
     /// the project from then on, and its recovery file gives way to one of the copy's. A stroke
-    /// the work was still landing lands first, whole ([`sculpting::finish_restored`]), so the copy
-    /// holds every dab of it; one that can't be finished leaves the restored tiles, and the
-    /// [`LastStroke`] returned says so. On an error the restored project closes again, keeping
-    /// the recovery file: as it was found if the landing failed ([`Project::close_untouched`]), so
-    /// a retry finds the same stroke to land.
+    /// the work was still landing lands first, whole, and every stroke begun over it after it
+    /// ([`sculpting::finish_restored`]), so the copy holds every dab of them; those that can't be
+    /// finished leave the restored tiles, and the [`LastStroke`] returned says so. On an error the
+    /// restored project closes again, keeping the recovery file: as it was found if the landing
+    /// failed ([`Project::close_untouched`]), so a retry finds the same strokes to land.
     ///
     /// # Errors
     ///
-    /// If it can't be restored, its last stroke landed, or the copy saved.
+    /// If it can't be restored, its last strokes landed, or the copy saved.
     fn open_copy(
         &self,
         candidate: &RecoveryCandidate,
@@ -1610,6 +1616,82 @@ mod tests {
         assert!(!found.file.exists(), "in the copy, so no longer found");
     }
 
+    /// A crash with a chain landing on `opening`, the project saved by a later session since.
+    ///
+    /// The first half of [`dabs_on_the_edited_tile`] a stroke with 3 of them landed, the second
+    /// half a stroke begun over it ([`Project::begin_stroke_after`]), journalled, none landed.
+    /// Returns its recovery file, the surface the crash left, and the surface of both landed in
+    /// turn.
+    fn left_a_chain_landing_on_an_earlier_save(
+        opening: &ProjectToOpen,
+    ) -> (PathBuf, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>) {
+        let rows_of = |dabs: &[stroke::Dab]| -> Vec<[u8; store::DAB_BYTES]> {
+            dabs.iter().map(|dab| bytemuck::cast(*dab)).collect()
+        };
+        let mut crashed = opening.clone().open().expect("opened");
+        crashed.set_dab_format(stroke::DAB_FORMAT);
+        let dabs = dabs_on_the_edited_tile(&mut crashed);
+        let (first, second) = dabs.split_at(dabs.len() / 2);
+        assert!(first.len() > 3, "dabs left to land: {}", first.len());
+        let level = crashed.store().display_finest().expect("a display layer");
+        let (mut index, _) = crashed.load_index(level, |_, _| {}).expect("an index");
+        crashed.begin_stroke_and_wait().expect("begun");
+        crashed.journal_placed(&rows_of(first)).expect("journalled");
+        land(&mut crashed, &mut index, first.get(..3).expect("dabs"));
+        crashed.journal_landed(3).expect("counted");
+        let later = crashed.begin_stroke_after().expect("reserved");
+        crashed
+            .journal_placed_after(&later, &rows_of(second))
+            .expect("journalled");
+        crashed
+            .tick(Instant::now() + store::FLUSH_INTERVAL * 2)
+            .expect("ticked");
+        testing::settle(&mut crashed);
+        let left = every_surface(&mut crashed);
+        let file = crashed.recovery_path().expect("protected").to_owned();
+        // A crash: nothing closes it, and the reserved op goes with its store.
+        later.abandon_with_store_gone();
+        drop(crashed);
+        let mut never_killed = opening.clone().open().expect("opened");
+        let (mut whole_index, _) = never_killed.load_index(level, |_, _| {}).expect("an index");
+        never_killed.begin_stroke_and_wait().expect("begun");
+        land(&mut never_killed, &mut whole_index, first);
+        never_killed.end_unrecorded_stroke().expect("ended");
+        never_killed.begin_stroke_and_wait().expect("begun");
+        land(&mut never_killed, &mut whole_index, second);
+        let whole = every_surface(&mut never_killed);
+        never_killed.close(false).expect("closed");
+        let mut session = opening.clone().open().expect("opened");
+        edit(&mut session);
+        drop(session.save().expect("saved"));
+        session.close(false).expect("closed");
+        (file, left, whole)
+    }
+
+    #[test]
+    fn open_as_a_copy_lands_every_stroke_of_a_chain_first() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let (file, left, whole) = left_a_chain_landing_on_an_earlier_save(&opening);
+        assert!(
+            farthest(&left, &whole) > 1e-3,
+            "the dabs not landed move the surface"
+        );
+        let copy = Reopen::Copy {
+            candidate: candidate(&opening, &file),
+        };
+        let reopened = opening.reopen(copy).expect("reopened");
+        assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
+        assert!(reopened.copied.is_some(), "said as a save");
+        assert_eq!(reopened.note, None, "nothing more to say");
+        let mut project = reopened.project;
+        assert!(!project.has_unsaved_edits(), "it's saved");
+        let apart = farthest(&every_surface(&mut project), &whole);
+        assert!(apart < 1e-4, "the copy holds both strokes: {apart} off");
+        project.close(false).expect("closed");
+        assert!(!file.exists(), "in the copy, so no longer found");
+    }
+
     #[test]
     fn a_copy_whose_last_stroke_cant_be_finished_has_the_tiles_and_says_so() {
         let dir = TestDir::new();
@@ -1623,7 +1705,7 @@ mod tests {
         assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
         assert!(reopened.copied.is_some(), "said as a save");
         let note = reopened.note.as_ref().expect("a note");
-        assert_eq!(*note, OpenNote::CopyUnfinished);
+        assert_eq!(*note, OpenNote::CopyUnfinished(Unfinished::One));
         // The copy is saved: the bar offers no way back, and says what's missing.
         let now = Instant::now();
         let mut dialogs = dialogs::Dialogs::new(

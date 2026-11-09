@@ -130,24 +130,69 @@ impl Status {
     }
 }
 
-/// What became of the stroke a restore found still landing, which the restore note tells of (the
-/// dab journal spec, "Errors").
+/// What became of the strokes a restore found still landing, which the restore note tells of (the
+/// dab journal spec, "Errors"; the stroke-while-landing spec, "Showing and landing").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LastStroke {
-    /// None was found still landing, or one was and the brush took it on to finish: the note says
-    /// only when the work dates from.
+    /// None was found still landing, or the brush took on every one found, to finish them: the
+    /// note says only when the work dates from.
     #[default]
     Whole,
-    /// One was found and can't be finished (its journal unusable, its dabs of another layout, or
-    /// the brush unable to take it on): the tiles as the restored save point holds them stand,
-    /// and the note says so ([`UNFINISHED_STROKE`]).
-    Unfinished,
+    /// Some were found that can't be finished (a journal unusable, dabs of another layout, the
+    /// brush unable to take one on, or one after a stroke that can't be): the tiles as the
+    /// restored save point holds them stand, with what the strokes before landed, and the note
+    /// says so ([`Unfinished::said`]).
+    Unfinished(Unfinished),
+}
+
+impl LastStroke {
+    /// What `count` strokes found still landing and not to be finished make of the note.
+    pub(crate) const fn of(count: usize) -> Self {
+        match Unfinished::of(count) {
+            Some(unfinished) => Self::Unfinished(unfinished),
+            None => Self::Whole,
+        }
+    }
+}
+
+/// How many of the strokes a restore found still landing can't be finished, as the note says it:
+/// one, or more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unfinished {
+    /// One: [`UNFINISHED_STROKE`].
+    One,
+    /// More than one: [`UNFINISHED_STROKES`].
+    Several,
+}
+
+impl Unfinished {
+    /// `count` strokes that can't be finished; `None` for none.
+    pub(crate) const fn of(count: usize) -> Option<Self> {
+        match count {
+            0 => None,
+            1 => Some(Self::One),
+            _ => Some(Self::Several),
+        }
+    }
+
+    /// The note's line for them.
+    pub(crate) const fn said(self) -> &'static str {
+        match self {
+            Self::One => UNFINISHED_STROKE,
+            Self::Several => UNFINISHED_STROKES,
+        }
+    }
 }
 
 /// The restore note's line under its time when the last stroke can't be finished
-/// ([`LastStroke::Unfinished`]).
+/// ([`Unfinished::One`]).
 pub(crate) const UNFINISHED_STROKE: &str =
     "Your last stroke couldn't be finished; the rest of your work is back.";
+
+/// The restore note's line under its time when more than one of the last strokes can't be
+/// finished ([`Unfinished::Several`]): a chain of them found still landing.
+pub(crate) const UNFINISHED_STROKES: &str =
+    "Your last strokes couldn't be finished; the rest of your work is back.";
 
 /// What the bottom bar is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,10 +226,12 @@ enum Prompt {
         /// When the note goes by itself.
         until: Instant,
     },
-    /// "Your work is saved as a copy", with [`UNFINISHED_STROKE`] under it: found work went to a
-    /// copy, saved, and its last stroke couldn't be finished. The copy is saved, so nothing is
-    /// offered but putting it away.
+    /// "Your work is saved as a copy", with [`Unfinished::said`] under it: found work went to a
+    /// copy, saved, and its last strokes, or some of them, couldn't be finished. The copy is
+    /// saved, so nothing is offered but putting it away.
     CopyUnfinished {
+        /// How many of the strokes couldn't be finished.
+        unfinished: Unfinished,
         /// When the note goes by itself.
         until: Instant,
     },
@@ -259,13 +306,13 @@ impl Prompt {
                 );
                 Some(match last {
                     LastStroke::Whole => bar,
-                    LastStroke::Unfinished => bar.with_detail(UNFINISHED_STROKE),
+                    LastStroke::Unfinished(unfinished) => bar.with_detail(unfinished.said()),
                 })
             }
-            Self::CopyUnfinished { .. } => {
+            Self::CopyUnfinished { unfinished, .. } => {
                 let controls = vec![quiet("Dismiss", Action::Dismiss)];
                 let bar = Bar::new("Your work is saved as a copy", controls);
-                Some(bar.with_detail(UNFINISHED_STROKE))
+                Some(bar.with_detail(unfinished.said()))
             }
             Self::EarlierVersion { said, .. } => {
                 let copy = Control {
@@ -577,7 +624,7 @@ impl Dialogs {
         self.show_prompt(now);
     }
 
-    /// Says what opening found, `last` what became of the stroke a restore found still landing (a
+    /// Says what opening found, `last` what became of the strokes a restore found still landing (a
     /// note of work not restored has none to tell of); with the bar saying a failure, once that
     /// is answered.
     pub(crate) fn note(&mut self, note: &OpenNote, last: LastStroke, now: Instant) {
@@ -591,7 +638,8 @@ impl Dialogs {
                 said: said_now(candidate.modified),
                 candidate: candidate.clone(),
             },
-            OpenNote::CopyUnfinished => Prompt::CopyUnfinished {
+            OpenNote::CopyUnfinished(unfinished) => Prompt::CopyUnfinished {
+                unfinished: *unfinished,
                 until: now + Theme::GLASS.note_hold,
             },
         };
@@ -606,7 +654,7 @@ impl Dialogs {
     /// When the note goes by itself, if one showing does.
     const fn note_until(&self) -> Option<Instant> {
         match self.prompt {
-            Prompt::Restored { until, .. } | Prompt::CopyUnfinished { until } => Some(until),
+            Prompt::Restored { until, .. } | Prompt::CopyUnfinished { until, .. } => Some(until),
             Prompt::None
             | Prompt::AskClose { .. }
             | Prompt::Finishing { .. }
@@ -1704,7 +1752,7 @@ mod tests {
         let now = Instant::now();
         let when = SystemTime::now();
         let mut dialogs = dialogs(now);
-        dialogs.note(&restored(when), LastStroke::Unfinished, now);
+        dialogs.note(&restored(when), LastStroke::of(1), now);
         let last_save = Control {
             label: "Use last save instead".to_owned(),
             action: Action::UseLastSave,
@@ -1715,6 +1763,24 @@ mod tests {
             .with_detail(said)
             .with_detail("Your last stroke couldn't be finished; the rest of your work is back.");
         assert_eq!(dialogs.bar(), Some(bar));
+    }
+
+    #[test]
+    fn several_strokes_that_cant_be_finished_are_said_in_the_plural() {
+        let now = Instant::now();
+        let mut restoring = dialogs(now);
+        restoring.note(&restored(SystemTime::now()), LastStroke::of(2), now);
+        let bar = restoring.bar().expect("the note");
+        assert_eq!(
+            bar.details().last().map(String::as_str),
+            Some("Your last strokes couldn't be finished; the rest of your work is back.")
+        );
+        let mut copied = dialogs(now);
+        let several = Unfinished::of(3).expect("some");
+        copied.note(&OpenNote::CopyUnfinished(several), LastStroke::Whole, now);
+        let copy_bar = copied.bar().expect("the note");
+        assert_eq!(copy_bar.details(), [UNFINISHED_STROKES]);
+        assert_eq!(LastStroke::of(0), LastStroke::Whole);
     }
 
     #[test]

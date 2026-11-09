@@ -3,7 +3,9 @@
 //! A finisher stopped mid-landing leaves its recovery file holding every dab placed and the count
 //! of those landed; the next instance restores it, resumes the stroke, and lands the rest, ending
 //! where a landing never interrupted does, within the restore's bound. Once in process, and once
-//! with the finisher a process of its own, asked through its socket as the app asks.
+//! with the finisher a process of its own, asked through its socket as the app asks; each with one
+//! stroke, and with a chain (a stroke begun over the one landing), whose later stroke the opener
+//! resumes once the first has landed.
 
 use std::mem::ManuallyDrop;
 
@@ -29,6 +31,10 @@ const CHILD_DIR: &str = "BRUSHCRAFT_TAKEOVER_DIR";
 /// The variable holding the directory the child's takeover socket goes in: a test's, never the
 /// real `$XDG_RUNTIME_DIR/brushcraft`.
 const SOCKETS: &str = "BRUSHCRAFT_TAKEOVER_SOCKETS";
+
+/// The variable that, set, has the child build a chain ([`Backlog::Chain`]) rather than one
+/// stroke.
+const CHAIN: &str = "BRUSHCRAFT_TAKEOVER_CHAIN";
 
 /// The child test's full path, as libtest names it.
 const CHILD_TEST: &str = "sculpting::tests::journal::takeover::finishing_child";
@@ -103,15 +109,49 @@ fn landed_and_saved(owner: &mut Owner<Sculpting, NoUploads>) -> BTreeMap<TileKey
     corrections(owner.project())
 }
 
-/// A landing never interrupted, from the same stroke of `passes` passes: every finest tile's
-/// corrections.
-fn never_interrupted(passes: u32) -> BTreeMap<TileKey, Corrections> {
-    let (dir, mut owner) = backlogged_in(TestDir::new(), passes, Instant::now());
+/// What a finisher has to land: one stroke, or a chain of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backlog {
+    /// A stroke of many passes.
+    Stroke,
+    /// That stroke, and a short one begun over it while it lands, none of either landed.
+    Chain,
+}
+
+/// [`backlogged_in`] `dir` with `passes` passes, and as `backlog` says, a second stroke begun over
+/// the first: the dabs of both journalled, none landed.
+fn backlog_in(
+    dir: TestDir,
+    passes: u32,
+    backlog: Backlog,
+) -> (TestDir, Owner<Sculpting, NoUploads>) {
+    let (dir, mut owner) = backlogged_in(dir, passes, Instant::now());
+    if backlog == Backlog::Chain {
+        queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
+        run(&mut owner, 1);
+        assert_eq!(owner.brush().strokes.len(), 2, "the second began over it");
+    }
+    (dir, owner)
+}
+
+/// A landing never interrupted, from the same strokes of `passes` passes as `backlog` says: every
+/// finest tile's corrections.
+fn never_interrupted(passes: u32, backlog: Backlog) -> BTreeMap<TileKey, Corrections> {
+    let (dir, mut owner) = backlog_in(TestDir::new(), passes, backlog);
     owner.brush_mut().cost = DabCost::default();
     let expected = landed_and_saved(&mut owner);
     owner.close().expect("closed");
     drop(dir);
     expected
+}
+
+/// Asserts that `owner`'s brush, just restored from a finisher of `backlog`, keeps the rest of
+/// the chain waiting to resume behind the stroke it took on: none for one stroke, the second of a
+/// chain.
+fn assert_rest_waits(owner: &Owner<Sculpting, NoUploads>, backlog: Backlog) {
+    let waiting = owner.brush().restored.len();
+    let chained = usize::from(backlog == Backlog::Chain);
+    assert_eq!(waiting, chained, "the chain's later stroke waits to resume");
 }
 
 /// The dabs `owner`'s resumed stroke still has to land.
@@ -127,7 +167,19 @@ fn left_to_land(owner: &Owner<Sculpting, NoUploads>) -> usize {
 
 #[test]
 fn the_new_window_restores_what_the_finisher_left() {
-    let (dir, mut finisher) = backlogged_in(TestDir::new(), IN_PROCESS_PASSES, Instant::now());
+    restores_what_the_finisher_left(Backlog::Stroke);
+}
+
+#[test]
+fn the_new_window_restores_the_chain_the_finisher_left() {
+    restores_what_the_finisher_left(Backlog::Chain);
+}
+
+/// A finisher of `backlog_of` stopped in this process mid-landing: the next window resumes where
+/// it stopped, and lands and saves what a landing never interrupted does, within the restore's
+/// bound.
+fn restores_what_the_finisher_left(backlog_of: Backlog) {
+    let (dir, mut finisher) = backlog_in(TestDir::new(), IN_PROCESS_PASSES, backlog_of);
     let backlog = finisher.landing();
     assert!(backlog > 64, "{backlog} dabs to land");
     close_and_save_to_finish(&mut finisher);
@@ -146,6 +198,7 @@ fn the_new_window_restores_what_the_finisher_left() {
 
     let mut owner = reopened(&dir);
     let left = left_to_land(&owner);
+    assert_rest_waits(&owner, backlog_of);
     assert!(
         0 < left && left < backlog,
         "it resumes where the finisher stopped: {left} of {backlog} left"
@@ -153,7 +206,7 @@ fn the_new_window_restores_what_the_finisher_left() {
     let got = landed_and_saved(&mut owner);
     owner.close().expect("closed");
     assert_eq!(recovery_files(&dir), 0, "saved: nothing left to restore");
-    let apart = steps_apart(&got, &never_interrupted(IN_PROCESS_PASSES));
+    let apart = steps_apart(&got, &never_interrupted(IN_PROCESS_PASSES, backlog_of));
     assert!(
         apart <= 1.5,
         "{apart} steps from a landing never interrupted"
@@ -167,13 +220,18 @@ fn the_new_window_restores_what_the_finisher_left() {
 /// and finishes unseen as [`crate::finish_heard`] does, saying how many batches it has landed
 /// ([`LANDED`]) as it goes. Without its variables it does nothing.
 #[test]
-#[ignore = "reopening_while_finishing_takes_over_and_loses_nothing runs it as its child"]
+#[ignore = "the takeover tests across processes run it as their child"]
 fn finishing_child() {
     let (Some(dir), Some(sockets)) = (std::env::var_os(CHILD_DIR), std::env::var_os(SOCKETS))
     else {
         return;
     };
-    let (dir, mut owner) = backlogged_in(TestDir::adopt(dir.into()), PASSES, Instant::now());
+    let backlog_of = if std::env::var_os(CHAIN).is_some() {
+        Backlog::Chain
+    } else {
+        Backlog::Stroke
+    };
+    let (dir, mut owner) = backlog_in(TestDir::adopt(dir.into()), PASSES, backlog_of);
     // The parent's directory: it stays when the child is done.
     let _parents = ManuallyDrop::new(dir);
     let backlog = owner.landing();
@@ -213,12 +271,18 @@ fn heard(line: &str) -> Option<Said> {
         .or_else(|| number(LANDED).map(Said::Landed))
 }
 
-/// The finishing child, running in `dir` with its socket in `sockets`, its output read on
-/// threads of its own; returns it once it is [`LISTENING`], with its backlog.
-fn finishing(dir: &TestDir, sockets: &std::path::Path) -> (Child, usize) {
+/// The finishing child, landing `backlog_of`, running in `dir` with its socket in `sockets`.
+///
+/// Its output is read on threads of its own; returns it once it is [`LISTENING`], with its
+/// backlog.
+fn finishing(dir: &TestDir, sockets: &std::path::Path, backlog_of: Backlog) -> (Child, usize) {
     use std::io::{BufRead as _, BufReader};
     use std::process::{Command, Stdio};
-    let mut child = Command::new(std::env::current_exe().expect("the test binary"))
+    let mut command = Command::new(std::env::current_exe().expect("the test binary"));
+    if backlog_of == Backlog::Chain {
+        command.env(CHAIN, "1");
+    }
+    let mut child = command
         .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
         .args(["--test-threads", "1"])
         .env(CHILD_DIR, dir.path())
@@ -332,10 +396,23 @@ impl Drop for Child {
 
 #[test]
 fn reopening_while_finishing_takes_over_and_loses_nothing() {
+    takes_over_and_loses_nothing(Backlog::Stroke);
+}
+
+#[test]
+fn reopening_while_finishing_a_chain_takes_over_and_loses_nothing() {
+    takes_over_and_loses_nothing(Backlog::Chain);
+}
+
+/// A finisher of `backlog_of`, a process of its own, stopped mid-landing through its socket.
+///
+/// The next window takes over at once, and lands and saves what a landing never interrupted
+/// does, within the restore's bound.
+fn takes_over_and_loses_nothing(backlog_of: Backlog) {
     let dir = TestDir::new();
     let sockets = TestDir::new();
     let socket_dir = sockets.path().join("brushcraft");
-    let (mut child, backlog) = finishing(&dir, &socket_dir);
+    let (mut child, backlog) = finishing(&dir, &socket_dir, backlog_of);
     assert!(backlog >= 4_000, "{backlog} dabs to land");
     let into = |said| matches!(said, Said::Landed(batches) if batches >= LANDED_BEFORE_ASKING);
     if child.next(into).is_none() {
@@ -357,6 +434,7 @@ fn reopening_while_finishing_takes_over_and_loses_nothing() {
     let mut owner = reopened(&dir);
     let sculpting = asked.elapsed();
     let left = left_to_land(&owner);
+    assert_rest_waits(&owner, backlog_of);
     println!(
         "takeover: the finisher stopped {stopped:?} after the ask; sculpting {sculpting:?} after \
          it, {left} dabs left to land"
@@ -375,7 +453,7 @@ fn reopening_while_finishing_takes_over_and_loses_nothing() {
     let got = landed_and_saved(&mut owner);
     owner.close().expect("closed");
     assert_eq!(recovery_files(&dir), 0, "saved: nothing left to restore");
-    let apart = steps_apart(&got, &never_interrupted(PASSES));
+    let apart = steps_apart(&got, &never_interrupted(PASSES, backlog_of));
     println!("takeover: {apart} quantization steps from a landing never interrupted");
     assert!(
         apart <= 1.5,

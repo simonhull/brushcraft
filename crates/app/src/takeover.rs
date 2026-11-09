@@ -13,7 +13,7 @@
 //! for that save point to be durable, closes the project keeping the recovery file, writes
 //! `stopped\n`, removes the socket and exits with success: a takeover is no failure, and nobody
 //! is notified. The opener then waits for the locks to be free and opens the project as usual,
-//! restoring the recovery file, the stroke still landing resumed with it
+//! restoring the recovery file, the strokes still landing resumed with it, in op order
 //! ([`crate::frame::Owner::resume_stroke`]).
 //!
 //! **Before any window** ([`make_way`]): the opener asks and waits before it opens the project, so

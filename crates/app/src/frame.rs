@@ -193,6 +193,24 @@ pub(crate) struct BrushContext<'a> {
     pub(crate) waiting: &'a [TileKey],
 }
 
+/// Strokes a restore found still landing that the brush didn't take on ([`Brush::resume`]): the
+/// last of those it was given, from the first it wouldn't take, and why it wouldn't.
+#[derive(Debug)]
+pub(crate) struct NotTakenOn {
+    /// How many: never none.
+    pub(crate) strokes: std::num::NonZeroUsize,
+    /// Why the first of them wasn't taken on; the rest land on its surface, so they can't be.
+    pub(crate) why: anyhow::Error,
+}
+
+impl NotTakenOn {
+    /// `strokes` not taken on, for `why`; `None` for none.
+    pub(crate) fn new(strokes: usize, why: anyhow::Error) -> Option<Self> {
+        let strokes = std::num::NonZeroUsize::new(strokes)?;
+        Some(Self { strokes, why })
+    }
+}
+
 /// Whether the renderer holds or wants a tile ([`Uploads::draws`]): what a brush's previews are
 /// made of.
 #[derive(Clone, Copy)]
@@ -512,17 +530,24 @@ pub(crate) trait Brush {
         None
     }
 
-    /// Takes on `stroke`, the stroke a restore found still landing ([`Project::take_open_stroke`]),
-    /// before any step: resumed in the project ([`Project::resume_stroke`]), its dabs shown at
-    /// once and landing as a stroke whose pen has lifted, a new stroke waiting behind it. One it
-    /// doesn't take on is closed by the project's next stroke, its dabs not landed lost. The
-    /// context's size may be a stand-in's, before a window has one: the dabs are placed already.
+    /// Takes on `strokes`, the strokes a restore found still landing that the project can use, in
+    /// op order ([`Project::take_open_strokes`]), before any step: the first resumed in the
+    /// project ([`Project::resume_stroke`]), its dabs shown at once and landing as a stroke whose
+    /// pen has lifted; each later one resumed and shown once the one before has landed and ended,
+    /// on the surface it left. A new stroke waits until every one has resumed. Those it doesn't
+    /// take on are closed by the project, their dabs not landed lost. The context's size may be a
+    /// stand-in's, before a window has one: the dabs are placed already.
     ///
     /// # Errors
     ///
-    /// Why it isn't taken on. By default none is.
-    fn resume(&mut self, _context: BrushContext<'_>, _stroke: OpenStroke) -> Result<()> {
-        Err(anyhow!("this brush takes no stroke on"))
+    /// [`NotTakenOn`]: the last of `strokes`, from the first it won't take on (and every one
+    /// after it, which lands on that one's surface), and why. By default none is taken on.
+    fn resume(
+        &mut self,
+        _context: BrushContext<'_>,
+        strokes: Vec<OpenStroke>,
+    ) -> Result<(), NotTakenOn> {
+        NotTakenOn::new(strokes.len(), anyhow!("this brush takes no stroke on")).map_or(Ok(()), Err)
     }
 
     /// The window was asked to close: lifts the pen of any open stroke, and has the brush land
@@ -552,9 +577,11 @@ pub(crate) trait Brush {
     }
 
     /// How many of the pen events a save holds the brush hasn't placed as dabs yet: a stroke
-    /// waiting behind the one landing, held as raw samples. They aren't in the journal until they
-    /// are placed, so the window can't go before the save is written while any is left
-    /// ([`Owner::finish_unseen_unless`]). None by default.
+    /// waiting to begin behind those landing, or samples waiting for the futures they read, held
+    /// as raw samples. They aren't in the journal until they are placed, so the window can't go
+    /// before the save is written while any is left ([`Owner::finish_unseen_unless`]). A stroke
+    /// begun over those landing isn't among them: its dabs are journalled behind theirs, and a
+    /// restore takes the chain in turn. None by default.
     fn unplaced_for_save(&self) -> usize {
         0
     }
@@ -1341,8 +1368,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// A recovery file set aside by Use last save: removed by a stroke or a save, which end the
     /// way back to it, and only then.
     kept_recovery: Option<PathBuf>,
-    /// What became of the stroke a restore found still landing ([`Owner::resume_stroke`]): the
-    /// restore note says if it can't be finished.
+    /// What became of the strokes a restore found still landing ([`Owner::resume_stroke`]): the
+    /// restore note says if any can't be finished, and whether one or several.
     last_stroke: LastStroke,
     /// What the UI shows.
     dialogs: Dialogs,
@@ -1825,51 +1852,61 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         !self.pen_queued(now) && (guarded || !self.unsaved())
     }
 
-    /// Says at `now` what opening found, and of a restore, whether its last stroke can be
+    /// Says at `now` what opening found, and of a restore, whether its last strokes can be
     /// finished ([`Owner::resume_stroke`]).
     pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
         self.dialogs.note(note, self.last_stroke, now);
         self.scheduler.want(Reason::Overlay);
     }
 
-    /// Hands the brush the stroke a restore found still landing, if there was one
-    /// ([`Project::take_open_stroke`], [`Brush::resume`]): before any frame, so it is on screen
-    /// in the first, and no stroke or edit can come before it. A journal the project can't use,
-    /// or a stroke the brush doesn't take on, leaves the restored tiles standing, as without a
-    /// journal: it is said on stderr, and the restore note says the last stroke couldn't be
-    /// finished ([`LastStroke::Unfinished`]). The project's next stroke closes it in the file.
+    /// Hands the brush the strokes a restore found still landing, if there were any
+    /// ([`Project::take_open_strokes`], [`Brush::resume`]), in op order: before any frame, so the
+    /// first is on screen in the first, and no stroke or edit can come before them; each later
+    /// one resumes once the one before has landed. A journal the project can't use, or a stroke
+    /// the brush doesn't take on (and every stroke after it, which lands on its surface), leaves
+    /// the restored tiles standing, with what the strokes before it land, as without a journal:
+    /// it is said on stderr, and the restore note says the last strokes couldn't be finished,
+    /// one or several ([`LastStroke::Unfinished`]). The project closes them in the file.
     ///
     /// Every project the app starts on goes through here ([`crate::start`]); one not restored has
     /// no stroke to take.
     pub(crate) fn resume_stroke(&mut self) {
-        let Some(found) = self.project.take_open_stroke() else {
+        let found = self.project.take_open_strokes();
+        if found.is_empty() {
             return;
-        };
-        let resumed = match found {
-            Ok(stroke) => {
-                // A window minimised, or not yet configured, has no size: a stand-in's does, as
-                // nothing of the stroke is placed through it.
-                let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
-                let size = size.map_or_else(crate::sculpting::unseen_view, Ok);
-                let taken = size.and_then(|size| {
-                    self.with_brush(size, |brush, context| brush.resume(context, stroke))
-                });
-                if let Err(why) = &taken {
-                    saving::log(&format!(
-                        "brushcraft: the last stroke can't be finished: {why:#}"
-                    ));
-                }
-                taken.is_ok()
-            }
-            Err(why) => {
-                let why = anyhow::Error::new(why);
-                saving::log(&format!("brushcraft: the last stroke's journal: {why:#}"));
-                false
-            }
-        };
-        if !resumed {
-            self.last_stroke = LastStroke::Unfinished;
         }
+        let mut unfinished = 0;
+        let mut usable: Vec<OpenStroke> = Vec::with_capacity(found.len());
+        for stroke in found {
+            match stroke {
+                Ok(stroke) => usable.push(stroke),
+                Err(why) => {
+                    let why = anyhow::Error::new(why);
+                    saving::log(&format!("brushcraft: a last stroke's journal: {why:#}"));
+                    unfinished += 1;
+                }
+            }
+        }
+        if !usable.is_empty() {
+            let count = usable.len();
+            // A window minimised, or not yet configured, has no size: a stand-in's does, as
+            // nothing of the strokes is placed through it.
+            let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
+            let size = size.map_or_else(crate::sculpting::unseen_view, Ok);
+            let not_taken = match size {
+                Ok(size) => self
+                    .with_brush(size, |brush, context| brush.resume(context, usable))
+                    .err(),
+                Err(why) => NotTakenOn::new(count, why),
+            };
+            if let Some(NotTakenOn { strokes, why }) = not_taken {
+                saving::log(&format!(
+                    "brushcraft: {strokes} of the last strokes can't be finished: {why:#}"
+                ));
+                unfinished += strokes.get();
+            }
+        }
+        self.last_stroke = LastStroke::of(unfinished);
         self.scheduler.want(Reason::Stroke);
     }
 

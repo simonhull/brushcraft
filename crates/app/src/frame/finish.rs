@@ -32,11 +32,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Whether a durable journal would keep everything the save holds, as far as the frame loop
     /// knows: crash protection is running, no flush has failed or fallen short since the last
-    /// save, the open stroke's pen-down surface is (or will be) in a save point
-    /// ([`Project::open_stroke_restorable`](store::Project::open_stroke_restorable)), and the brush
-    /// has placed every pen event the save holds as dabs. A stroke waiting behind the one
-    /// landing is raw pen samples ([`Brush::unplaced_for_save`]), which no journal holds until
-    /// they are placed; with crash protection paused, or a flush failed or short, the journal
+    /// save, every open stroke's pen-down surface is (or will be) in a save point, or is the one
+    /// the stroke before it leaves
+    /// ([`Project::open_stroke_restorable`](store::Project::open_stroke_restorable), over every
+    /// open journal: a chain is restored in op order), and the brush has placed every pen event
+    /// the save holds as dabs. A stroke begun over those landing is journalled behind them, and
+    /// counts as placed; one waiting to begin, or samples waiting for the futures they read, are
+    /// raw pen samples ([`Brush::unplaced_for_save`]), which no journal holds until they are
+    /// placed; with crash protection paused, or a flush failed or short, the journal
     /// can't be trusted to keep what a failure would leave; and a journal whose pen-down is
     /// unknown restores nothing, which not every way there reports (a cut failing as the stroke
     /// began, a roll-over that couldn't carry it), so
@@ -195,6 +198,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let Self {
             mut project,
             cursor,
+            mut brush,
             ..
         } = self;
         project.store().unsubscribe_stale(cursor);
@@ -205,6 +209,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ));
             flushed = false;
         }
+        // The store is gone: what the brush still holds (a chain's later strokes, their ops
+        // reserved) is the journal's now, for the opener to restore.
+        brush.abandon();
         Finished::Stopped { flushed }
     }
 
