@@ -113,11 +113,23 @@
 //! flushes ([`Project::request_flush`]); once every dab placed is in a durable save point of the
 //! recovery file ([`Project::flushed`], milliseconds), the window is asked to go
 //! ([`WindowRequest::Finish`]), and the process **finishes unseen** after it
-//! ([`Owner::finish_unseen`]): it lands in full batches with no frames, ticking the project between
-//! them so a kill loses about a second, writes the save, and removes the recovery file. A failure
-//! keeps the recovery file and is said in a desktop notification. That needs a brush that journals
-//! its dabs ([`Brush::journals`]) and a recovery file that guards the work; otherwise, or after
-//! Cancel, the window waits for the save as for any.
+//! ([`Owner::finish_unseen_unless`]): it lands in full batches with no frames, ticking the project
+//! between them so a kill loses about a second, writes the save, and removes the recovery file. A
+//! failure keeps the recovery file and is said in a desktop notification. That needs a brush that
+//! journals its dabs ([`Brush::journals`]) and a recovery file that guards the work; otherwise, or
+//! after Cancel, the window waits for the save as for any.
+//!
+//! **A finisher can be asked to stop** ([`Owner::finish_unseen_unless`]): reopening the project
+//! takes over from it ([`crate::takeover`]). Before each batch, its recovery writer just tended, it
+//! looks whether it has been asked; once it has, it lands nothing more, flushes, waits up to
+//! [`STOP_FLUSH_LIMIT`] for that save point to be durable, and closes the project keeping the
+//! recovery file, which releases both locks. The journal holds every dab placed and the count
+//! landed at that cut, so the opener restores the stroke and lands the rest. Nothing is saved and
+//! nobody is notified ([`Finished::Stopped`]). A flush that can't be made durable (crash
+//! protection paused, the writer failed, the disk stalled past the limit), or a close that fails,
+//! leaves the recovery file at its last durable save point, as a crash would; the stop says so,
+//! and the caller says it on stderr. The finisher looks only between batches: a stop asked during
+//! a batch, or during the save that follows the landing, waits for it.
 
 pub(crate) mod schedule;
 
@@ -530,7 +542,7 @@ pub(crate) trait Brush {
     /// Whether every dab the brush places is journalled in the recovery file
     /// ([`Project::journal`]), so a crash keeps what hasn't landed, and the close bar's Save can
     /// let the window go as soon as the journal is durable, the landing finishing unseen
-    /// ([`Owner::finish_unseen`]). A brush that doesn't keeps the window until the save is
+    /// ([`Owner::finish_unseen_unless`]). A brush that doesn't keeps the window until the save is
     /// written. None does by default.
     fn journals(&self) -> bool {
         false
@@ -539,7 +551,7 @@ pub(crate) trait Brush {
     /// How many of the pen events a save holds the brush hasn't placed as dabs yet: a stroke
     /// waiting behind the one landing, held as raw samples. They aren't in the journal until they
     /// are placed, so the window can't go before the save is written while any is left
-    /// ([`Owner::finish_unseen`]). None by default.
+    /// ([`Owner::finish_unseen_unless`]). None by default.
     fn unplaced_for_save(&self) -> usize {
         0
     }
@@ -976,7 +988,8 @@ enum AfterSave {
     /// It exits: Save on the close bar, or a close during a save. Cancelling takes that back, and
     /// the save carries on, harmless.
     Exit,
-    /// It exits before the save is written, which finishes unseen ([`Owner::finish_unseen`]).
+    /// It exits before the save is written, which finishes unseen
+    /// ([`Owner::finish_unseen_unless`]).
     ///
     /// The close bar's Save while dabs still land: the window goes once every dab placed is in a
     /// durable save point of the recovery file (the dab journal spec, "Closing"). Cancelling takes
@@ -1038,8 +1051,9 @@ pub(crate) enum CloseAnswer {
 pub(crate) enum WindowRequest {
     /// Close: everything is saved.
     Exit,
-    /// Close at once, the save under way finishing with no window ([`Owner::finish_unseen`]):
-    /// every dab placed is in a durable save point of the recovery file.
+    /// Close at once, the save under way finishing with no window
+    /// ([`Owner::finish_unseen_unless`]): every dab placed is in a durable save point of the
+    /// recovery file.
     Finish,
     /// Close, dropping what isn't saved: the user said so on the close bar.
     ExitDiscarding,
@@ -3998,11 +4012,26 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// body ([`SaveFailure::notice`]), once the project has closed, so it says what the recovery
     /// file kept; and it is the run's error, as a close's is.
     ///
+    /// **Asked to stop** (a takeover, [`crate::takeover`]): before each batch it looks whether
+    /// `asked` says so. Once it does, the finisher stops where it is ([`Owner::stop_unseen`]): it
+    /// flushes, waits for the save point to be durable, and closes the project keeping the
+    /// recovery file, which holds every dab placed and the count of those landed, for the opener to
+    /// restore. Nothing is saved and nobody is notified: [`Finished::Stopped`].
+    ///
     /// # Errors
     ///
-    /// As [`Owner::close`], and any error of the landing's steps or the upkeep between them.
-    pub(crate) fn finish_unseen(mut self, notify: impl FnOnce(&str, &str)) -> Result<()> {
-        let landed = said_too(self.land_unseen(), self.flush_brush());
+    /// As [`Owner::close`], and any error of the landing's steps or the upkeep between them; a
+    /// stop has none of its own ([`Owner::stop_unseen`]).
+    pub(crate) fn finish_unseen_unless(
+        mut self,
+        notify: impl FnOnce(&str, &str),
+        mut asked: impl FnMut() -> bool,
+    ) -> Result<Finished> {
+        let landing = self.land_unseen(&mut asked);
+        if matches!(landing, Ok(LandedUnseen::Stopped)) {
+            return Ok(self.stop_unseen());
+        }
+        let landed = said_too(landing.map(drop), self.flush_brush());
         let left = self.landing();
         let all = if left == 0 {
             Ok(())
@@ -4040,12 +4069,77 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             let (summary, body) = failure.notice(&name);
             notify(&summary, &body);
         }
-        said_too(saved, closed)
+        said_too(saved, closed).map(|()| Finished::Done)
     }
 
-    /// The finisher's landing ([`Owner::finish_unseen`]): the pen's samples no longer taken, then
-    /// batch after batch of what the brush holds until it holds nothing, the project's recovery
-    /// writer tended before each and once after.
+    /// [`Owner::finish_unseen_unless`], never asked to stop.
+    ///
+    /// # Errors
+    ///
+    /// As [`Owner::finish_unseen_unless`].
+    #[cfg(test)]
+    pub(crate) fn finish_unseen(self, notify: impl FnOnce(&str, &str)) -> Result<()> {
+        self.finish_unseen_unless(notify, || false).map(drop)
+    }
+
+    /// The finisher stops for a takeover: flushes every edit and dab journalled so far, waits for
+    /// that save point to be durable ([`Owner::flush_to_stop`]), and closes the project keeping
+    /// its recovery file, which releases both files' locks. The dabs the brush still holds are
+    /// left to the journal: the opener restores them, and lands them.
+    ///
+    /// Nothing here fails the run: a takeover is no failure. A flush that couldn't be made
+    /// durable (crash protection paused, the writer failed), or a close that went wrong, leaves the
+    /// recovery file at its last durable save point, as a crash would: said on stderr, and in
+    /// [`Finished::Stopped`]'s `flushed`.
+    fn stop_unseen(mut self) -> Finished {
+        let mut flushed = self.flush_to_stop();
+        let Self {
+            mut project,
+            cursor,
+            ..
+        } = self;
+        project.store().unsubscribe_stale(cursor);
+        if let Err(error) = project.close(true) {
+            let why = anyhow::Error::new(error);
+            saving::log(&format!(
+                "brushcraft: closing the project to hand it over: {why:#}"
+            ));
+            flushed = false;
+        }
+        Finished::Stopped { flushed }
+    }
+
+    /// Flushes every edit and dab journalled so far, and waits until that is in a durable save
+    /// point ([`Project::flushed`]), for [`STOP_FLUSH_LIMIT`] at most: whether it got there.
+    /// Crash protection paused or failing ends the wait at once: nothing more can be made durable.
+    fn flush_to_stop(&mut self) -> bool {
+        let began = Instant::now();
+        loop {
+            if self.project.flushed() {
+                return true;
+            }
+            let guarded = self.project.protection().is_active() && self.exposed.is_none();
+            if !guarded || began.elapsed() >= STOP_FLUSH_LIMIT {
+                return false;
+            }
+            let asked = self.project.request_flush(Instant::now());
+            let polled = self
+                .heard(asked, "asking for a flush to stop")
+                .and_then(|()| {
+                    let polled = self.project.poll();
+                    self.heard(polled, "polling the project")
+                });
+            if let Err(error) = polled {
+                saving::log(&format!("brushcraft: {error:#}"));
+                return false;
+            }
+            std::thread::sleep(STOP_FLUSH_POLL);
+        }
+    }
+
+    /// The finisher's landing ([`Owner::finish_unseen_unless`]): the pen's samples no longer taken,
+    /// then batch after batch of what the brush holds until it holds nothing, the project's
+    /// recovery writer tended before each and once after.
     ///
     /// A landing error doesn't stop it: what is left lands all the same, ticked as ever, so the
     /// recovery file keeps up with it whatever the save then makes of the error. An error tending
@@ -4057,12 +4151,24 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// The first of [`Owner::request_close`], [`Owner::close_step`] and [`Owner::tend_recovery`]
     /// that failed, those after it as its context.
-    fn land_unseen(&mut self) -> Result<()> {
+    ///
+    /// **Asked to stop:** `asked` is looked at before each batch, the recovery writer just
+    /// tended; once it says so the landing ends there, [`LandedUnseen::Stopped`], and an error met
+    /// before it is said on stderr alone: the recovery file holds the work, for the opener.
+    fn land_unseen(&mut self, asked: &mut impl FnMut() -> bool) -> Result<LandedUnseen> {
         let mut outcome = self.request_close();
         let mut stalls = 0;
         loop {
             if let Err(error) = self.tend_recovery(Instant::now()) {
-                return said_too(outcome, Err(error));
+                return said_too(outcome, Err(error)).map(|()| LandedUnseen::Landed);
+            }
+            if asked() {
+                if let Err(error) = outcome {
+                    saving::log(&format!(
+                        "brushcraft: stopping for a takeover after: {error:#}"
+                    ));
+                }
+                return Ok(LandedUnseen::Stopped);
             }
             let before = self.landing();
             if before == 0 || stalls == FINISH_STALLS {
@@ -4078,7 +4184,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             let moved = landed || self.landing() != before;
             stalls = if moved { 0 } else { stalls + 1 };
         }
-        said_too(outcome, self.tend_recovery(Instant::now()))
+        said_too(outcome, self.tend_recovery(Instant::now())).map(|()| LandedUnseen::Landed)
     }
 
     /// Has the brush apply what it still holds and end its stroke, as the project is about to
@@ -4336,11 +4442,48 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         &self.uploads
     }
 
+    /// The project file saves go to, if there is one: the file a finisher holds, which names its
+    /// takeover socket ([`crate::takeover`]).
+    pub(crate) fn project_path(&self) -> Option<&std::path::Path> {
+        self.project.path()
+    }
+
     /// The project.
     #[cfg(test)]
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// How long a finisher stopping for a takeover waits for its flush ([`Owner::flush_to_stop`]).
+///
+/// A flush's syncs take milliseconds, so this bounds only a disk that stalls, the opener waiting
+/// meanwhile.
+const STOP_FLUSH_LIMIT: Duration = Duration::from_secs(3);
+
+/// How often a finisher stopping looks at its flush.
+const STOP_FLUSH_POLL: Duration = Duration::from_millis(1);
+
+/// How the finisher's landing ended ([`Owner::land_unseen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandedUnseen {
+    /// It landed what the brush held, or as much as it could.
+    Landed,
+    /// It was asked to stop, and stopped before its next batch.
+    Stopped,
+}
+
+/// How a finisher ended ([`Owner::finish_unseen_unless`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finished {
+    /// It landed and saved: the recovery file is gone.
+    Done,
+    /// It was asked to stop and did, its project closed, the recovery file kept for the opener.
+    Stopped {
+        /// Whether everything placed was in a durable save point as it closed; if not, the
+        /// recovery file holds its last durable save point, as after a crash.
+        flushed: bool,
+    },
 }
 
 /// How many of the finisher's batches in a row may change nothing before it stops trying.

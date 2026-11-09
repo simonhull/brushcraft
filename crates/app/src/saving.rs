@@ -70,7 +70,7 @@
 //! cancelled, the window exiting once it has succeeded ([`crate::frame::Owner::ask_close`]). If it
 //! fails the window stays and the failure bar takes the close bar's place. With dabs still landing
 //! the window doesn't wait for them: once the recovery file holds every dab placed, it goes, and
-//! the save is finished unseen ([`crate::frame::Owner::finish_unseen`]), a failure said in a
+//! the save is finished unseen ([`crate::frame::Owner::finish_unseen_unless`]), a failure said in a
 //! desktop notification instead, the recovery file kept.
 //!
 //! **Leaving on a failure:** with any failed save told, Ctrl+S's too, a further close asks nothing

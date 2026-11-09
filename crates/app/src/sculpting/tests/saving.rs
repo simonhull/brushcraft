@@ -10,7 +10,7 @@ use crate::frame::{CloseAnswer, UiKey, WindowRequest};
 use crate::saving::{SaveStep, Stage};
 
 /// Where the tests' projects are saved in `dir`.
-fn path_in(dir: &TestDir) -> PathBuf {
+pub(super) fn path_in(dir: &TestDir) -> PathBuf {
     dir.path().join("p.bcrf")
 }
 
@@ -44,7 +44,7 @@ fn close_out(owner: &mut Owner<Sculpting, NoUploads>) {
 }
 
 /// Runs the save under way as the window's passes do, a step and then a frame, until it ends.
-fn finish_save(owner: &mut Owner<Sculpting, NoUploads>) {
+pub(super) fn finish_save(owner: &mut Owner<Sculpting, NoUploads>) {
     let mut passes = 0;
     while owner.save_stage().is_some() {
         if owner.save_step() == SaveStep::Waiting {
@@ -85,7 +85,7 @@ fn save_points(dir: &TestDir) -> usize {
 }
 
 /// The files in `dir`'s recovery directory.
-fn recovery_files(dir: &TestDir) -> usize {
+pub(super) fn recovery_files(dir: &TestDir) -> usize {
     let found = std::fs::read_dir(dir.path().join("recovery")).expect("the directory");
     found.count()
 }
@@ -1124,9 +1124,20 @@ fn dabs_dropped_under_the_bar_stop_the_exit() {
 /// The project is in a directory of its own, the stroke to and fro `passes` times, its pen lifted,
 /// drawn with a brush that lands a dab at a time from `epoch`.
 fn backlogged(passes: u32, epoch: Instant) -> (TestDir, Owner<Sculpting, NoUploads>) {
-    let dir = TestDir::new();
+    backlogged_in(TestDir::new(), passes, epoch)
+}
+
+/// [`backlogged`], its project in `dir`.
+pub(super) fn backlogged_in(
+    dir: TestDir,
+    passes: u32,
+    epoch: Instant,
+) -> (TestDir, Owner<Sculpting, NoUploads>) {
+    let mut project = saved_project(&dir);
+    // As the app tells every project it opens: a restore reads the journal's rows only so.
+    project.set_dab_format(stroke::DAB_FORMAT);
     let mut owner = owner_of(
-        saved_project(&dir),
+        project,
         |project| {
             Sculpting::new(project)
                 .with_cost(DabCost::one_at_a_time())

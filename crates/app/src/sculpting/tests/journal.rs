@@ -11,6 +11,8 @@ use stroke::{MirrorPlanes, Symmetry};
 use super::*;
 
 mod resume;
+#[cfg(target_os = "linux")]
+mod takeover;
 
 /// Waits until `project`'s recovery writer has no flush under way: every cut taken so far is in
 /// the recovery file, durable. A saved project's [`Project::save_ahead`] says so, and copies

@@ -3374,6 +3374,89 @@ fn the_finisher_ticks_so_its_journal_stays_within_a_second() {
     );
 }
 
+/// The project file `dir`'s finisher tests save to.
+fn first_sculpt(dir: &TestDir) -> PathBuf {
+    dir.path().join("first-sculpt.bcrf")
+}
+
+#[test]
+fn a_finisher_asked_to_stop_flushes_and_releases_its_locks() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 6);
+    let recovery = saved_to_finish(&mut owner);
+    let seen = std::rc::Rc::clone(&owner.brush.finishes.seen);
+    let mut looks = 0;
+    let finished = owner.finish_unseen_unless(no_notice, || {
+        looks += 1;
+        looks > 2
+    });
+    assert_eq!(
+        finished.expect("stopped"),
+        Finished::Stopped { flushed: true },
+        "a takeover is no failure, and nobody is told"
+    );
+    assert_eq!(looks, 3, "it looks between batches");
+    assert_eq!(
+        seen.borrow().steps.len(),
+        2,
+        "and stops at its next look, the rest unlanded"
+    );
+    assert!(!crate::takeover::is_locked(&first_sculpt(&dir)), "released");
+    assert!(recovery.exists(), "the recovery file keeps the work");
+    drop(store::ProjectFile::open(&recovery).expect("and isn't held either"));
+    let file = store::ProjectFile::open(&first_sculpt(&dir)).expect("opened");
+    assert_eq!(file.save_points().expect("save points").len(), 1, "unsaved");
+    drop(file);
+    let found = store::find_recoveries(&dir.path().join("recovery")).expect("listed");
+    let [candidate] = found.as_slice() else {
+        panic!("one recovery file: {found:?}");
+    };
+    assert_eq!(candidate.status, store::CandidateStatus::Restorable);
+    assert!(candidate.last_edit.is_some(), "with the stroke's work");
+}
+
+#[test]
+fn a_finisher_asked_before_its_first_batch_lands_nothing() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    let recovery = saved_to_finish(&mut owner);
+    let seen = std::rc::Rc::clone(&owner.brush.finishes.seen);
+    let finished = owner.finish_unseen_unless(no_notice, || true);
+    assert_eq!(
+        finished.expect("stopped"),
+        Finished::Stopped { flushed: true }
+    );
+    assert!(seen.borrow().steps.is_empty(), "nothing landed");
+    assert!(recovery.exists(), "the work is kept");
+}
+
+/// With crash protection paused under it, a finisher asked to stop still lets go, keeping what is
+/// durable, and says it couldn't flush: the opener restores what there is.
+#[cfg(unix)]
+#[test]
+fn a_finisher_that_cant_flush_still_stops_and_says_so() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    saved_to_finish(&mut owner);
+    pause_protection(&mut owner);
+    let finished = owner.finish_unseen_unless(no_notice, || true);
+    assert_eq!(
+        finished.expect("stopped"),
+        Finished::Stopped { flushed: false }
+    );
+    assert!(!crate::takeover::is_locked(&first_sculpt(&dir)), "released");
+}
+
+#[test]
+fn a_finisher_never_asked_finishes_as_ever() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    let recovery = saved_to_finish(&mut owner);
+    let finished = owner.finish_unseen_unless(no_notice, || false);
+    assert_eq!(finished.expect("finished"), Finished::Done);
+    assert!(!recovery.exists(), "saved");
+}
+
 #[test]
 fn save_finishes_then_exits() {
     let dir = TestDir::new();

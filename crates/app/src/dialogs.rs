@@ -23,7 +23,7 @@
 //! does the bar saying crash protection has stopped ([`Dialogs::protection_stopped`]), which waits
 //! for a bar already asking something, and goes by itself if protection comes back.
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use jiff::Zoned;
 use render::surface::Size;
@@ -205,6 +205,12 @@ enum Prompt {
     /// "Crash protection has stopped: …": why, until the user answers, goes back to work, or
     /// protection comes back.
     Stopped(SaveTrouble),
+    /// "Finishing your last session": the project is held by the session before, still saving it
+    /// unseen, and the window waits to open it ([`crate::takeover`]), saying how long it has.
+    LastSession {
+        /// The whole seconds waited so far.
+        seconds: u64,
+    },
 }
 
 impl Prompt {
@@ -289,6 +295,12 @@ impl Prompt {
                 let title = format!("Crash protection has stopped: {}", trouble.said());
                 let bar = Bar::new(title, controls).with_detail("Save your work when you can.");
                 Some(bar.needing_you())
+            }
+            Self::LastSession { seconds } => {
+                let (minutes, seconds) = (seconds / 60, seconds % 60);
+                let waited =
+                    format!("Your project opens once it's done. {minutes}:{seconds:02} so far.");
+                Some(Bar::new("Finishing your last session", Vec::new()).with_detail(waited))
             }
         }
     }
@@ -591,7 +603,8 @@ impl Dialogs {
             | Prompt::EarlierVersion { .. }
             | Prompt::Copying
             | Prompt::Failed(_)
-            | Prompt::Stopped(_) => None,
+            | Prompt::Stopped(_)
+            | Prompt::LastSession { .. } => None,
         }
     }
 
@@ -626,6 +639,19 @@ impl Dialogs {
         self.prompt = Prompt::Copying;
         self.show_prompt(now);
         Some(candidate)
+    }
+
+    /// Says the window is waiting for the session before to let go of the project, `waited` so
+    /// far, at `now` ([`crate::takeover`]): the window's only bar until the project opens. The
+    /// bar changes once a second, so a call within the same second builds nothing.
+    pub(crate) fn last_session(&mut self, waited: Duration, now: Instant) {
+        let prompt = Prompt::LastSession {
+            seconds: waited.as_secs(),
+        };
+        if self.prompt != prompt {
+            self.prompt = prompt;
+            self.ui.set_bar(self.prompt.bar(), now);
+        }
     }
 
     /// Takes the bar away, and any note behind it.
@@ -1016,7 +1042,6 @@ impl Dialogs {
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use super::*;
     use crate::saving::{DabsDropped, TilesLost, Work};
@@ -1800,6 +1825,55 @@ mod tests {
             let found = [Action::Ignore, Action::OpenCopy];
             assert_controls_found(&dialogs, &found, seen, scale);
         }
+    }
+
+    #[test]
+    fn the_last_session_bar_says_how_long_it_has_waited() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.last_session(Duration::from_millis(5_400), now);
+        let bar = dialogs.bar().expect("a bar");
+        assert_eq!(bar.title(), "Finishing your last session");
+        assert_eq!(
+            bar.details(),
+            ["Your project opens once it's done. 0:05 so far."]
+        );
+        assert!(
+            bar.controls().is_empty(),
+            "nothing to answer: closing the window will do"
+        );
+        assert!(dialogs.needs_frame(now), "it shows");
+        let seen = now + Theme::GLASS.fade * 2;
+        drop(dialogs.frame(seen));
+        dialogs.last_session(Duration::from_millis(5_900), seen);
+        assert!(!dialogs.needs_frame(seen), "the same second builds nothing");
+        dialogs.last_session(Duration::from_secs(75), seen);
+        let later = dialogs.bar().expect("a bar");
+        assert_eq!(
+            later.details(),
+            ["Your project opens once it's done. 1:15 so far."]
+        );
+        assert!(dialogs.needs_frame(seen), "a new second is drawn");
+    }
+
+    #[test]
+    fn the_last_session_bar_fits_the_smallest_window() {
+        let now = Instant::now();
+        let (width, height) = Theme::GLASS.window_min;
+        let mut dialogs = Dialogs::new(Size::new(width, height), 1.0, Blend::Display, now);
+        dialogs.last_session(Duration::from_hours(10), now);
+        let frame = dialogs.frame(now).expect("it draws");
+        let bar = dialogs.bar().expect("a bar");
+        let details = bar.details().iter().map(String::as_str);
+        let said = std::iter::once(bar.title()).chain(details);
+        let letters = said
+            .flat_map(str::chars)
+            .filter(|letter| !letter.is_whitespace());
+        assert_eq!(
+            frame.list.glyphs.len(),
+            letters.count(),
+            "every letter draws"
+        );
     }
 
     /// Checks `actions` can all be hit at `seen`.

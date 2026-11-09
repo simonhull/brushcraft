@@ -21,6 +21,14 @@
 //! bar's Save while dabs still land has the window go at once, and the process finishes unseen,
 //! landing and saving with no window, a failure said in a desktop notification ([`notify`]).
 //!
+//! **Opening a project a finisher holds** takes over from it ([`takeover`]): before any window, the
+//! new instance asks the finisher to stop and waits for its locks ([`takeover::make_way`]), then
+//! opens the project as usual, restoring what the finisher's recovery file holds, the stroke still
+//! landing among it. The finisher listens for that between its batches ([`finish_listening`]),
+//! stops, and exits with success. One that doesn't answer in 5 s, or can't be reached, leaves the
+//! window to open with the "Finishing your last session" bar, which opens the project once its
+//! locks are free ([`ProjectToOpen::open_when_free`]).
+//!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
 //! closes a project on lavapipe with no display. With `--script` the camera follows the
@@ -53,6 +61,7 @@ mod saving;
 mod screenshot;
 mod script;
 mod sculpting;
+mod takeover;
 #[cfg(test)]
 mod test_dir;
 mod uploads;
@@ -76,11 +85,12 @@ use winit::event_loop::EventLoop;
 use crate::cli::Options;
 use crate::dialogs::LastStroke;
 use crate::frame::schedule::Next;
-use crate::frame::{Brush, GpuWait, NoPen, Owner, Reopen, Setup, Uploads as _};
+use crate::frame::{Brush, Finished, GpuWait, NoPen, Owner, Reopen, Setup, Uploads};
 use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
 use crate::sculpting::Sculpting;
+use crate::takeover::{Patience, SocketDir, Way};
 use crate::uploads::GpuResidency;
 use crate::window::WindowApp;
 
@@ -155,6 +165,22 @@ pub(crate) struct Summary {
 }
 
 impl Summary {
+    /// The summary of a window's run that never opened its project: it waited for the session
+    /// before to let go of it ([`takeover`]), and was closed first. On `adapter` presenting as
+    /// `presentation`, its pen stream as `pen` says.
+    pub(crate) fn waited(adapter: String, presentation: Presentation, pen: String) -> Self {
+        Self {
+            frames: 0,
+            adapter,
+            presentation,
+            tiles: "none: the project never opened".to_owned(),
+            scene: "none".to_owned(),
+            pen,
+            phases: Vec::new(),
+            records: Vec::new(),
+        }
+    }
+
     /// The summary of `owner`'s run: `adapter` presenting as `presentation`. Take it before
     /// the owner closes.
     pub(crate) fn of(owner: &AppOwner, adapter: String, presentation: Presentation) -> Self {
@@ -184,9 +210,9 @@ pub(crate) enum End {
     /// It goes: Don't save on the close bar, the one way here.
     Discard,
     /// It lands and is saved with no window, the process finishing unseen
-    /// ([`frame::Owner::finish_unseen`]): Save on the close bar while dabs were still landing,
-    /// once the recovery file held every dab placed. A failure keeps the recovery file and says
-    /// so in a desktop notification ([`notify`]).
+    /// ([`frame::Owner::finish_unseen_unless`]): Save on the close bar while dabs were still
+    /// landing, once the recovery file held every dab placed. A failure keeps the recovery file
+    /// and says so in a desktop notification ([`notify`]).
     Finish,
 }
 
@@ -329,6 +355,32 @@ impl ProjectToOpen {
         let opened = Project::open(&self.path, self.config)
             .with_context(|| format!("opening {}", self.path.display()));
         opened.map(journalling)
+    }
+
+    /// The project file.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Opens it as [`ProjectToOpen::open_as`] does, if nobody holds it: `None` while it is locked
+    /// ([`takeover::is_locked`]), or the open finds it so. The waiting window's look, every
+    /// [`takeover::LOCK_POLL`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectToOpen::open_as`], but for the project being held.
+    pub(crate) fn open_when_free(
+        &self,
+        options: &Options,
+    ) -> Result<Option<(Project, Option<OpenNote>)>> {
+        if takeover::is_locked(&self.path) {
+            return Ok(None);
+        }
+        match self.clone().open_as(options) {
+            Ok(opened) => Ok(Some(opened)),
+            Err(error) if held_elsewhere(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Opens it as the run in `options` should: bringing back what a crash left, or not.
@@ -513,6 +565,24 @@ impl ProjectToOpen {
     }
 }
 
+/// Whether `error`, of opening a project, says another process holds it: its project file or
+/// its recovery file is locked. A finisher does that until it has saved, or stopped
+/// ([`takeover`]).
+pub(crate) fn held_elsewhere(error: &anyhow::Error) -> bool {
+    let mut causes = error.chain();
+    causes.any(|cause| {
+        let file = matches!(cause.downcast_ref(), Some(store::FileError::Locked));
+        let project = matches!(
+            cause.downcast_ref(),
+            Some(
+                ProjectError::Store(store::FileError::Locked)
+                    | ProjectError::NotRestorable(CandidateStatus::ProjectInUse)
+            )
+        );
+        file || project
+    })
+}
+
 /// Swaps `old`'s project for the one `reopen` asks for on the same `gpu`, as `setup` says.
 ///
 /// The old one closes first, for its file lock. The render thread must have settled
@@ -549,14 +619,25 @@ pub(crate) fn swap(
 
 /// Runs the app in a window until it closes (or has drawn a scripted run's frames).
 ///
+/// A run that restores (an interactive one) clears its way first ([`takeover::make_way`]): a
+/// finisher holding the project is asked to stop, and waited for, before any window; one that
+/// doesn't let go has the window wait for it. A scripted or measured run takes nothing over. A
+/// run that ends finishing unseen listens for the next instance's takeover in turn.
+///
 /// # Errors
 ///
 /// If the event loop or the window fails, or the frame loop does.
 fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
+    let sockets = SocketDir::from_env();
+    let way = if options.restores() {
+        takeover::make_way(project.path(), sockets.as_ref(), Patience::DEFAULT)
+    } else {
+        Way::Clear
+    };
     let (done, outcome) = mpsc::channel();
     let ran = EventLoop::new()
         .context("starting the event loop")?
-        .run_app(WindowApp::new(options, project, done))
+        .run_app(WindowApp::new(options, project, way, done))
         .context("running the event loop");
     let Ok(ended) = outcome.try_recv() else {
         ran?;
@@ -566,9 +647,89 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
     let ends = Ends {
         close: AppOwner::close,
         discard: AppOwner::discard,
-        finish: |owner: AppOwner| owner.finish_unseen(desktop_notification),
+        finish: |owner: AppOwner| finish_listening(owner, sockets.as_ref(), desktop_notification),
     };
     settled(ended.run, ran, closing, ends)
+}
+
+/// Finishes `owner` unseen ([`Owner::finish_unseen_unless`]), listening for a takeover.
+///
+/// The socket is in `sockets` ([`takeover`]), listened on from before the landing until the
+/// project has closed; failures are said through `notify`.
+///
+/// With no socket (no directory, or it can't be bound) it finishes all the same: an opener then
+/// waits for the locks.
+///
+/// # Errors
+///
+/// As [`Owner::finish_unseen_unless`]. A takeover is no failure.
+fn finish_listening<B: Brush, U: Uploads>(
+    owner: Owner<B, U>,
+    sockets: Option<&SocketDir>,
+    notify: impl FnOnce(&str, &str),
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let listener = listen(owner.project_path(), sockets);
+        finish_heard(owner, listener, notify)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _no_socket = sockets;
+        owner.finish_unseen_unless(notify, || false).map(drop)
+    }
+}
+
+/// The finisher's ears: a takeover socket for the project file at `path` in `sockets`, if there
+/// is one to listen on. Why there isn't is said on stderr.
+#[cfg(target_os = "linux")]
+fn listen(path: Option<&Path>, sockets: Option<&SocketDir>) -> Option<takeover::Listener> {
+    let (path, sockets) = (path?, sockets?);
+    let bound = takeover::FileIdentity::of(path)
+        .map_err(anyhow::Error::new)
+        .and_then(|file| takeover::Listener::bind(sockets, file).map_err(anyhow::Error::new));
+    match bound {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            let path = path.display();
+            saving::log(&format!("brushcraft: no takeover for {path}: {error:#}"));
+            None
+        }
+    }
+}
+
+/// Finishes `owner` unseen, stopping once `listener` hears it asked to.
+///
+/// Then it answers everyone who asked, the project closed by then, its locks free
+/// ([`takeover::Listener::answer`]). A stop that couldn't make its flush durable is said on
+/// stderr: the recovery file holds its last durable save point, which the opener restores.
+///
+/// # Errors
+///
+/// As [`Owner::finish_unseen_unless`].
+#[cfg(target_os = "linux")]
+fn finish_heard<B: Brush, U: Uploads>(
+    owner: Owner<B, U>,
+    mut listener: Option<takeover::Listener>,
+    notify: impl FnOnce(&str, &str),
+) -> Result<()> {
+    let asked = || {
+        listener
+            .as_mut()
+            .is_some_and(takeover::Listener::stop_asked)
+    };
+    let finished = owner.finish_unseen_unless(notify, asked);
+    if let Some(listener) = listener {
+        listener.answer();
+    }
+    match finished? {
+        Finished::Done | Finished::Stopped { flushed: true } => {}
+        Finished::Stopped { flushed: false } => saving::log(
+            "brushcraft: stopped for another window, but crash protection couldn't keep up: the \
+             most recent work may not have been kept",
+        ),
+    }
+    Ok(())
 }
 
 /// The ways a window's frame loop can close, one for each [`End`].
@@ -1995,5 +2156,82 @@ mod tests {
             failed.expect_err("a finisher that failed fails the run")
         );
         assert!(said.contains("no room"), "{said}");
+    }
+
+    /// A finisher that never answers: the opener waits its patience, then the window waits with
+    /// the bar, saying how long, and opens the project once the locks are free, restoring what the
+    /// finisher left.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unanswered_takeover_waits_with_progress_then_opens() {
+        use std::time::Duration;
+
+        use render::surface::Size;
+        use ui::Blend;
+
+        use crate::dialogs::Dialogs;
+        use crate::takeover::{FileIdentity, Listener, Patience, SocketDir, Way};
+
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let run = options(&opening, &[]);
+        // It holds the project, its work in its recovery file, and listens, never reading.
+        let mut finisher = opening.clone().open().expect("opened");
+        edit(&mut finisher);
+        let sockets = SocketDir::at(dir.path().join("brushcraft"));
+        let file = FileIdentity::of(&opening.path).expect("its identity");
+        let hung = Listener::bind(&sockets, file).expect("bound");
+        let held = opening.clone().open().expect_err("held");
+        assert!(held_elsewhere(&held), "{held:#}");
+
+        let patience = Patience {
+            answer: Duration::from_millis(200),
+            release: Duration::from_millis(200),
+        };
+        let asked = Instant::now();
+        let Way::Busy { since } = takeover::make_way(&opening.path, Some(&sockets), patience)
+        else {
+            panic!("nobody let go");
+        };
+        assert!(
+            asked.elapsed() >= patience.answer,
+            "it waited for an answer"
+        );
+        let now = Instant::now();
+        let mut bar = Dialogs::new(Size::new(640, 400), 1.0, Blend::Display, now);
+        bar.last_session(now.saturating_duration_since(since), now);
+        let said = bar.bar().expect("the bar");
+        assert_eq!(said.title(), "Finishing your last session");
+        assert_eq!(
+            said.details(),
+            ["Your project opens once it's done. 0:00 so far."]
+        );
+        let waiting = opening.open_when_free(&run).expect("nothing wrong");
+        assert!(waiting.is_none(), "still held: the window waits");
+
+        // The finisher goes, keeping its work, as a takeover or a failure leaves it.
+        finisher.close(true).expect("closed, the work kept");
+        drop(hung);
+        let (project, note) = opening
+            .open_when_free(&run)
+            .expect("opened")
+            .expect("free now");
+        assert!(matches!(note, Some(OpenNote::Restored { .. })), "{note:?}");
+        assert!(project.has_unsaved_edits(), "the work is back");
+        close(project);
+    }
+
+    #[test]
+    fn a_project_nobody_holds_opens_when_free_at_once() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let run = options(&opening, &[]);
+        let opened = opening.open_when_free(&run).expect("opened");
+        let (project, note) = opened.expect("free");
+        assert_eq!(note, None);
+        close(project);
+        let missing = to_open(&dir, &dir.path().join("missing.bcrf"));
+        let failed = missing.open_when_free(&run).expect_err("no file");
+        assert!(!held_elsewhere(&failed), "an error, not a wait: {failed:#}");
     }
 }

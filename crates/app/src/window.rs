@@ -19,11 +19,19 @@
 //! **Reopening** ([`WindowApp::reopen`]) swaps the frame loop for one on another project, on the
 //! same window, pen, GPU and render thread.
 //!
+//! **Waiting for the last session** ([`Waiting`]): a project the session before still holds,
+//! finishing unseen, and didn't let go of when asked ([`crate::takeover`]), can't open yet. The
+//! window opens all the same, with its pen and render thread, and draws one thing: the "Finishing
+//! your last session" bar, saying how long it has waited, in frames of the UI alone (no scene, no
+//! frame loop: there is no project). Every [`LOCK_POLL`] it looks at the project's lock, and
+//! once it is free it opens the project and starts the frame loop, the render thread settled
+//! first, as a reopen does. Closing the window meanwhile ends the run with nothing opened.
+//!
 //! **Closing** ends the run with what becomes of the unsaved work ([`End`]): kept, dropped (Don't
 //! save), or finished unseen. The last is the close bar's Save while dabs still land: once the
 //! owner says the journal is durable ([`WindowRequest::Finish`]) the window goes at once, and the
 //! landing and the save go on after the event loop has ended
-//! ([`crate::frame::Owner::finish_unseen`]).
+//! ([`crate::frame::Owner::finish_unseen_unless`]).
 //!
 //! **Order between the two:** within the pen stream, and within the mouse's input, everything
 //! keeps the order it happened in. Across them it doesn't: a frame's input phase applies all the
@@ -40,6 +48,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use render::gpu::Gpu;
 use render::surface::{Size, Target, WindowSurface};
+use store::Project;
 use ui::Theme;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -53,6 +62,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Pixel;
 use crate::cli::Options;
+use crate::dialogs::Dialogs;
 use crate::frame::schedule::Next;
 use crate::frame::{
     BrushChange, CloseAnswer, GPU_POLL, GpuWait, LookChange, RecordSetup, Reopen, Setup, UiKey,
@@ -61,10 +71,12 @@ use crate::frame::{
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
-use crate::render_thread::{Hooks, RenderThread};
+use crate::render_thread::{FrameRequest, Hooks, RenderThread};
 use crate::saving::SaveStep;
+use crate::takeover::{LOCK_POLL, Way};
 use crate::{
-    AppOwner, End, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start, swap,
+    AppOwner, End, Ended, OpenNote, ProjectToOpen, Summary, describe_adapter, held_elsewhere,
+    said_too, start, swap,
 };
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
@@ -102,6 +114,41 @@ struct Running {
     modifiers: ModifiersState,
 }
 
+/// A window, its pen and its render thread, before a project is open in it.
+#[derive(Debug)]
+struct Shell {
+    /// The pen stream, holding the window. Declared first, so on any path that drops the shell
+    /// whole the backend stops before anything else goes.
+    pen: AppPen,
+    /// The render thread. Declared before `window`, so it stops (releasing the surface) before
+    /// the window is dropped.
+    render: RenderThread,
+    /// The window.
+    window: Arc<dyn Window>,
+    /// The GPU.
+    gpu: Arc<Gpu>,
+    /// The GPU's description, for the summary.
+    adapter: String,
+}
+
+/// The window waiting for the session before to let go of the project
+/// ([`WindowApp::wait_step`]).
+#[derive(Debug)]
+struct Waiting {
+    /// The window, the pen and the render thread.
+    shell: Shell,
+    /// The bar, and what draws it.
+    dialogs: Dialogs,
+    /// When the project was first found held.
+    since: Instant,
+    /// When to look at the lock next.
+    next_look: Instant,
+    /// Whether a frame is with the render thread: one at a time.
+    drawing: bool,
+    /// Whether the window asked to be drawn again (exposed, resized, rescaled).
+    stale: bool,
+}
+
 /// winit's application: opens the window when it can, runs the frame loop, and reports how
 /// the run ended through `done`.
 #[derive(Debug)]
@@ -111,8 +158,12 @@ pub(crate) struct WindowApp {
     /// The project to open once the window, its surface and the render thread are up, and to
     /// open again for a reopen.
     project: ProjectToOpen,
-    /// The running app, once the window exists.
+    /// The running app, once the window exists and the project is open.
     running: Option<Running>,
+    /// The window waiting to open a project held elsewhere, until it opens.
+    waiting: Option<Waiting>,
+    /// What clearing the way to the project found, before the window ([`crate::takeover`]).
+    way: Way,
     /// Where the run's outcome goes when the loop exits.
     /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
     /// run finishes once, whatever events follow.
@@ -127,12 +178,20 @@ pub(crate) struct WindowApp {
 }
 
 impl WindowApp {
-    /// An app that opens `project` in a window as `options` say, reporting to `done`.
-    pub(crate) const fn new(options: Options, project: ProjectToOpen, done: Sender<Ended>) -> Self {
+    /// An app that opens `project` in a window as `options` say, reporting to `done`; `way` is
+    /// what clearing the way to it found ([`crate::takeover::make_way`]).
+    pub(crate) const fn new(
+        options: Options,
+        project: ProjectToOpen,
+        way: Way,
+        done: Sender<Ended>,
+    ) -> Self {
         Self {
             options,
             project,
             running: None,
+            waiting: None,
+            way,
             done: Some(done),
             wakeup: 0,
             pen_samples: Vec::new(),
@@ -142,13 +201,45 @@ impl WindowApp {
 
     /// Opens the window, its surface and the render thread, then the project, and starts the
     /// frame loop. The project comes last, so a launch that fails before it leaves no recovery
-    /// file.
+    /// file. A project held elsewhere (the way to it was found busy, or the open finds it held)
+    /// has the window wait for it instead ([`Waiting`]).
+    fn open(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let shell = match self.open_shell(event_loop) {
+            Ok(shell) => shell,
+            Err(error) => {
+                self.finish(event_loop, Err(error));
+                return;
+            }
+        };
+        if let Way::Busy { since } = self.way {
+            self.wait(shell, since, event_loop);
+            return;
+        }
+        let opening = Instant::now();
+        match self.project.clone().open_as(&self.options) {
+            Ok(opened) => self.begin(shell, opened, opening, event_loop),
+            Err(error) if self.options.restores() && held_elsewhere(&error) => {
+                self.wait(shell, Instant::now(), event_loop);
+            }
+            Err(error) => {
+                event_loop.exit();
+                let Shell {
+                    pen,
+                    render,
+                    window,
+                    ..
+                } = shell;
+                self.wind_up_without_owner(pen, render, window, error);
+            }
+        }
+    }
+
+    /// Opens the window, its surface, the GPU and the render thread.
     ///
     /// # Errors
     ///
-    /// If the window, the surface, the GPU or the render thread can't be made, or the project
-    /// doesn't open.
-    fn open(&self, event_loop: &dyn ActiveEventLoop) -> Result<Running> {
+    /// If any of them can't be made.
+    fn open_shell(&self, event_loop: &dyn ActiveEventLoop) -> Result<Shell> {
         let requested = PhysicalSize::new(self.options.size.width(), self.options.size.height());
         let (least_width, least_height) = Theme::GLASS.window_min;
         let attributes = WindowAttributes::default()
@@ -171,8 +262,52 @@ impl WindowApp {
         );
         let timing = self.options.times_gpu();
         let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks, timing)?;
-        let opening = Instant::now();
-        let (project, note) = self.project.clone().open_as(&self.options)?;
+        Ok(Shell {
+            pen,
+            render,
+            window,
+            gpu,
+            adapter,
+        })
+    }
+
+    /// Starts the frame loop on `shell` over the project `opened`, opening since `opening`, and
+    /// runs it: wanting its first frame now. A frame loop that can't start ends the run.
+    fn begin(
+        &mut self,
+        shell: Shell,
+        opened: (Project, Option<OpenNote>),
+        opening: Instant,
+        event_loop: &dyn ActiveEventLoop,
+    ) {
+        match self.start_running(shell, opened, opening) {
+            Ok(running) => {
+                self.running = Some(running);
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            Err(error) => self.finish(event_loop, Err(error)),
+        }
+    }
+
+    /// The frame loop over the project `opened` (with what opening found), in `shell`'s window,
+    /// the project opening since `opening`.
+    ///
+    /// # Errors
+    ///
+    /// If the frame loop can't start ([`start`]): the project is closed then, and the shell goes.
+    fn start_running(
+        &self,
+        shell: Shell,
+        (project, note): (Project, Option<OpenNote>),
+        opening: Instant,
+    ) -> Result<Running> {
+        let Shell {
+            pen,
+            render,
+            window,
+            gpu,
+            adapter,
+        } = shell;
         let record = self.options.record_setup(render.timing(), opening);
         let setup = self.setup(window.as_ref(), &render, &adapter, record);
         let mut owner = start(project, Arc::clone(&gpu), setup)?;
@@ -193,6 +328,174 @@ impl WindowApp {
             closing: false,
             modifiers: ModifiersState::default(),
         })
+    }
+
+    /// The window waits for the project, held since `since` by the session before, with the bar
+    /// saying so ([`Waiting`]).
+    fn wait(&mut self, shell: Shell, since: Instant, event_loop: &dyn ActiveEventLoop) {
+        let now = Instant::now();
+        let size = frame_size(shell.window.surface_size());
+        let mut dialogs =
+            Dialogs::new(size, shell.window.scale_factor(), shell.render.blend(), now);
+        dialogs.last_session(now.saturating_duration_since(since), now);
+        self.waiting = Some(Waiting {
+            shell,
+            dialogs,
+            since,
+            next_look: now + LOCK_POLL,
+            drawing: false,
+            stale: true,
+        });
+        event_loop.set_control_flow(ControlFlow::Poll);
+    }
+
+    /// A pass of the waiting window: the pen's samples dropped, the lock looked at when due and
+    /// the project opened once it is free, the bar's time brought up to date and drawn, and winit
+    /// told when to come back: for the next look, the next second, or the bar's fade.
+    fn wait_step(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(waiting) = &mut self.waiting else {
+            return;
+        };
+        waiting.shell.pen.drain(&mut self.pen_samples);
+        self.pen_samples.clear();
+        let now = Instant::now();
+        if now >= waiting.next_look {
+            waiting.next_look = now + LOCK_POLL;
+            let opening = Instant::now();
+            match self.project.open_when_free(&self.options) {
+                Ok(None) => {}
+                Ok(Some(opened)) => {
+                    let Some(Waiting { mut shell, .. }) = self.waiting.take() else {
+                        return;
+                    };
+                    // None of the bar's frames reach the frame loop.
+                    match shell.render.settle(drop) {
+                        Ok(()) => self.begin(shell, opened, opening, event_loop),
+                        Err(error) => {
+                            let (project, _) = opened;
+                            let keep = project.has_unsaved_edits();
+                            let closed = project.close(keep);
+                            let error = said_too(Err(error), closed.map_err(Into::into));
+                            self.finish_waiting(event_loop, shell, error);
+                        }
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if let Some(Waiting { shell, .. }) = self.waiting.take() {
+                        self.finish_waiting(event_loop, shell, Err(error));
+                    }
+                    return;
+                }
+            }
+        }
+        waiting
+            .dialogs
+            .last_session(now.saturating_duration_since(waiting.since), now);
+        let wants = waiting.stale || waiting.dialogs.needs_frame(now);
+        if wants && !waiting.drawing {
+            let size = frame_size(waiting.shell.window.surface_size());
+            if let Some(size) = size {
+                let sent = waiting
+                    .shell
+                    .render
+                    .send(ui_frame(size, waiting.dialogs.frame(now)));
+                if let Err(error) = sent {
+                    if let Some(Waiting { shell, .. }) = self.waiting.take() {
+                        self.finish_waiting(event_loop, shell, Err(error));
+                    }
+                    return;
+                }
+                waiting.drawing = true;
+            }
+            waiting.stale = false;
+        }
+        let waited = now.saturating_duration_since(waiting.since);
+        let next_second = now + Duration::from_secs(1).saturating_sub(subsec(waited));
+        let wake = if waiting.dialogs.needs_frame(now) {
+            // The bar's fade: its frames as the render thread finishes each.
+            now + GPU_POLL
+        } else {
+            waiting.next_look.min(next_second)
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+    }
+
+    /// Exits the loop and ends a run that never opened its project, its window waiting
+    /// ([`WindowApp::wind_up_waiting`]).
+    fn finish_waiting(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        shell: Shell,
+        result: Result<()>,
+    ) {
+        event_loop.exit();
+        self.wind_up_waiting(shell, result);
+    }
+
+    /// Ends a run that never opened its project, its window waiting: `result` is its error, if
+    /// it ended on one. The pen, then the render thread, then the window, as
+    /// [`WindowApp::wind_up`] has them. Only the first ending sends anything.
+    fn wind_up_waiting(&mut self, shell: Shell, result: Result<()>) {
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        let Shell {
+            pen,
+            render,
+            window,
+            adapter,
+            ..
+        } = shell;
+        let status = pen.status().to_string();
+        let (pen_window, pen_stopped) = pen.stop(&mut Vec::new());
+        drop(pen_window);
+        let presentation = render.presentation();
+        let stopped = render.stop().map(drop);
+        drop(window);
+        let summary = Summary::waited(adapter, presentation, status);
+        // `main` holds the receiver until the loop returns, so the send can't fail.
+        drop(done.send(Ended {
+            run: said_too(said_too(result, stopped), pen_stopped).map(|()| summary),
+            owner: None,
+            end: self.end,
+        }));
+    }
+
+    /// The waiting window's events: it is drawn again when exposed, resized or rescaled, the
+    /// pen's go to its stream (to be dropped), and a close ends the run.
+    fn wait_event(&mut self, event_loop: &dyn ActiveEventLoop, event: &WindowEvent) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            if let Some(Waiting { shell, .. }) = self.waiting.take() {
+                self.finish_waiting(event_loop, shell, Ok(()));
+            }
+            return;
+        }
+        let Some(waiting) = &mut self.waiting else {
+            return;
+        };
+        if let Some((tablet, at, data)) = tablet_event(event) {
+            let stamp = (Instant::now(), self.wakeup);
+            waiting.shell.pen.winit(tablet, at, data, stamp);
+            return;
+        }
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "WindowEvent is non-exhaustive, and the waiting window reads only these"
+        )]
+        match event {
+            WindowEvent::SurfaceResized(size) => {
+                waiting.dialogs.resize(frame_size(*size));
+                waiting.stale = true;
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                waiting.dialogs.set_scale(*scale_factor);
+                waiting.shell.pen.set_scale(*scale_factor);
+                waiting.stale = true;
+            }
+            WindowEvent::RedrawRequested | WindowEvent::Occluded(false) => waiting.stale = true,
+            _ => {}
+        }
     }
 
     /// How a frame loop in `window` is set up, drawing through `render` on the GPU `adapter` says,
@@ -402,6 +705,10 @@ impl WindowApp {
     /// ([`WindowApp`]'s `drop`), so a run that ended in an error still hands its frame loop back,
     /// to land what it holds and close the project.
     fn wind_up(&mut self, result: Result<()>) {
+        if let Some(Waiting { shell, .. }) = self.waiting.take() {
+            self.wind_up_waiting(shell, result);
+            return;
+        }
         let Some(done) = self.done.take() else {
             // Finished already (an error, then the close the exit brings): nothing more to say.
             return;
@@ -717,6 +1024,30 @@ fn tablet_event(event: &WindowEvent) -> Option<TabletEvent> {
     }
 }
 
+/// A frame of the UI alone at `size`, drawing `ui`: the waiting window's ([`Waiting`]).
+///
+/// No scene, no passes and no overlay. It is numbered 0, so the GPU's count of finished frames,
+/// which only grows, is never moved ahead of the frame loop's own numbers, which start at 1.
+fn ui_frame(size: Size, ui: Option<ui::UiFrame>) -> FrameRequest {
+    FrameRequest {
+        number: 0,
+        size,
+        overlay_scale: 1,
+        overlay: Vec::new(),
+        uploads: None,
+        scene: None,
+        reshade: false,
+        look: render::Look::default(),
+        passes: None,
+        ui,
+    }
+}
+
+/// The part of `waited` past its whole seconds.
+fn subsec(waited: Duration) -> Duration {
+    Duration::from_nanos(u64::from(waited.subsec_nanos()))
+}
+
 /// winit's pointer position as a viewport pixel: both physical.
 const fn pixel(position: PhysicalPosition<f64>) -> Pixel {
     Pixel {
@@ -759,16 +1090,20 @@ impl ApplicationHandler for WindowApp {
     }
 
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self.running.is_some() || self.done.is_none() {
+        if self.running.is_some() || self.waiting.is_some() || self.done.is_none() {
             return;
         }
-        match self.open(event_loop) {
-            Ok(running) => self.running = Some(running),
-            Err(e) => self.finish(event_loop, Err(e)),
-        }
+        self.open(event_loop);
     }
 
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if let Some(waiting) = &mut self.waiting {
+            match waiting.shell.render.finished() {
+                Ok(presented) => waiting.drawing &= presented.is_empty(),
+                Err(error) => self.finish(event_loop, Err(error)),
+            }
+            return;
+        }
         let Some(running) = &mut self.running else {
             return;
         };
@@ -781,10 +1116,18 @@ impl ApplicationHandler for WindowApp {
     }
 
     fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        if self.waiting.is_some() {
+            self.wait_event(event_loop, &event);
+            return;
+        }
         self.handle(event_loop, event);
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.waiting.is_some() {
+            self.wait_step(event_loop);
+            return;
+        }
         let Some(running) = &mut self.running else {
             return;
         };

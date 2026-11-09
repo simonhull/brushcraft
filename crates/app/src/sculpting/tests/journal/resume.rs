@@ -349,10 +349,10 @@ fn kill_child(dir: &TestDir, (cut, more): (usize, usize)) {
 }
 
 /// A finest tile's interior quantization steps, and every vertex's correction.
-type Corrections = ([f32; 3], Vec<geom::Vec3>);
+pub(super) type Corrections = ([f32; 3], Vec<geom::Vec3>);
 
 /// Every finest tile's corrections in `project`.
-fn corrections(project: &mut Project) -> BTreeMap<TileKey, Corrections> {
+pub(super) fn corrections(project: &mut Project) -> BTreeMap<TileKey, Corrections> {
     let keys = tile_keys(project);
     let store = project.store();
     let tiles = keys.into_iter().map(|key| {
@@ -368,7 +368,7 @@ fn corrections(project: &mut Project) -> BTreeMap<TileKey, Corrections> {
 
 /// How far `got`'s corrections are from `expected`'s at most, in quantization steps of the
 /// coarser of each tile's two: over every component of every vertex.
-fn steps_apart(
+pub(super) fn steps_apart(
     got: &BTreeMap<TileKey, Corrections>,
     expected: &BTreeMap<TileKey, Corrections>,
 ) -> f32 {
