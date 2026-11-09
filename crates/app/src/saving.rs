@@ -416,9 +416,7 @@ impl SaveFailure {
             (Work::LessAStroke, Cover::Protected) => {
                 "Your other work is safe and comes back when you open it."
             }
-            (Work::Whole | Work::Found | Work::SavedLessEdits, Cover::Protected) => {
-                "Your work is safe and comes back when you open it."
-            }
+            _ => "Your work is safe and comes back when you open it.",
         };
         (summary, format!("{reason}. {rest}"))
     }
@@ -445,6 +443,9 @@ pub(crate) fn says_uncovered(error: &Error) -> bool {
 }
 
 /// Whether `cause`, a link of an error's chain, says the recovery file may not hold the edits.
+///
+/// Protection paused, the writer failed, tiles not yet in it, or tiles whose edits are gone (a
+/// save never fails with those, but a close does).
 fn says_edits_arent_covered(cause: &(dyn StdError + 'static)) -> bool {
     matches!(
         cause.downcast_ref(),
@@ -452,6 +453,7 @@ fn says_edits_arent_covered(cause: &(dyn StdError + 'static)) -> bool {
             ProjectError::ProtectionPaused(_)
                 | ProjectError::Recovery(_)
                 | ProjectError::Unprotected(_)
+                | ProjectError::Lost(_)
         )
     )
 }
@@ -866,6 +868,17 @@ mod tests {
             notice(failure(&full).exposed()),
             (couldnt, exposed),
             "a flush failed meanwhile"
+        );
+        let lost = Error::new(ProjectError::Lost(Vec::new())).context("closing the project");
+        assert!(
+            says_uncovered(&lost),
+            "a close that lost tiles keeps none safe"
+        );
+        let unprotected = Error::new(ProjectError::Unprotected(Vec::new()));
+        assert!(says_uncovered(&unprotected), "nor one that left tiles out");
+        assert!(
+            !says_uncovered(&full),
+            "a full disk alone says nothing of it"
         );
         let gone = Error::new(TilesLost(2));
         assert_eq!(

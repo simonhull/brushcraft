@@ -3265,6 +3265,29 @@ fn a_finisher_that_saved_less_part_of_a_stroke_says_so() {
     );
 }
 
+/// Dabs dropped before Save that nobody was told of: the save goes through, and the notification
+/// says it is less part of a stroke, as the window's bar would.
+#[test]
+fn a_finisher_owns_up_to_dabs_dropped_untold_before_the_save() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 2);
+    owner.brush.drops = 1;
+    let recovery = saved_to_finish(&mut owner);
+    let (told, error) = finished_with_notices(owner);
+    assert!(
+        format!("{error:#}").contains("dabs were dropped"),
+        "{error:#}"
+    );
+    assert_eq!(
+        told,
+        vec![(
+            "BrushCraft saved first-sculpt, less part of a stroke".to_owned(),
+            "Part of a stroke is gone. The rest of your work was saved.".to_owned()
+        )]
+    );
+    assert!(!recovery.exists(), "the save holds the rest");
+}
+
 /// A landing error stops neither the landing nor the ticks: what is left lands, batch by batch,
 /// and the error is the run's, the save not made.
 #[test]

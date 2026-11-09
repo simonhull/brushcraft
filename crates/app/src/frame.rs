@@ -4002,11 +4002,31 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// As [`Owner::close`], and any error of the landing's steps or the upkeep between them.
     pub(crate) fn finish_unseen(mut self, notify: impl FnOnce(&str, &str)) -> Result<()> {
-        let landed = self.land_unseen();
-        let flushed = self.flush_brush();
-        let whole = landed.is_ok() && flushed.is_ok();
-        let saved = said_too(said_too(landed, flushed), self.last_save(whole));
-        let failure = saved.as_ref().err().map(|error| self.failure_of(error));
+        let landed = said_too(self.land_unseen(), self.flush_brush());
+        let left = self.landing();
+        let all = if left == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!("not saved: {left} dabs the brush held didn't land"))
+        };
+        let landed = said_too(landed, all);
+        let whole = landed.is_ok();
+        let saved = said_too(landed, self.last_save(whole));
+        let (saved, failure) = match saved {
+            Err(error) => {
+                let failure = self.failure_of(&error);
+                (Err(error), Some(failure))
+            }
+            // Saved, but with dabs dropped that nobody was told of: said as the window's save says
+            // it, and the run's error.
+            Ok(()) => match self.brush.dropped_since(self.told_drops) {
+                Ok(()) => (Ok(()), None),
+                Err(dropped) => {
+                    let failure = SaveFailure::stroke_lost_but_saved();
+                    (Err(dabs_dropped(dropped)), Some(failure))
+                }
+            },
+        };
         let name = self.saving.name().to_owned();
         let closed = self.close_project();
         if let Some(failure) = failure {
@@ -4027,10 +4047,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// batch after batch of what the brush holds until it holds nothing, the project's recovery
     /// writer tended before each and once after.
     ///
-    /// An error doesn't stop it: what is left lands all the same, ticked as ever, so the recovery
-    /// file keeps up with it whatever the save then makes of the error. It stops early only once
-    /// [`FINISH_STALLS`] batches in a row have changed nothing, which leaves what is left to
-    /// [`Owner::flush_brush`].
+    /// A landing error doesn't stop it: what is left lands all the same, ticked as ever, so the
+    /// recovery file keeps up with it whatever the save then makes of the error. An error tending
+    /// the recovery writer does (the store is broken): the recovery file stays at its last durable
+    /// save point, as after a crash. It also stops once [`FINISH_STALLS`] batches in a row have
+    /// changed nothing, which leaves what is left to [`Owner::flush_brush`].
     ///
     /// # Errors
     ///
@@ -4040,7 +4061,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let mut outcome = self.request_close();
         let mut stalls = 0;
         loop {
-            outcome = said_too(outcome, self.tend_recovery(Instant::now()));
+            if let Err(error) = self.tend_recovery(Instant::now()) {
+                return said_too(outcome, Err(error));
+            }
             let before = self.landing();
             if before == 0 || stalls == FINISH_STALLS {
                 break;
@@ -4322,8 +4345,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
 /// How many of the finisher's batches in a row may change nothing before it stops trying.
 ///
-/// A batch of [`Owner::land_unseen`] can find nothing it may land yet (a stroke beginning, its cut
-/// still to be taken), which a tick between batches moves on.
+/// A batch of [`Owner::land_unseen`] that can land nothing shouldn't happen (close steps wait for a
+/// stroke's cut): this guards against it, so the finisher never spins.
 const FINISH_STALLS: u32 = 3;
 
 /// Whether `error`, of a tick or a poll, is the recovery file's alone, so a run can go on after it.
