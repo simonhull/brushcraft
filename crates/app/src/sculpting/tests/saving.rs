@@ -324,9 +324,10 @@ fn a_stroke_begun_as_a_save_writes_waits_for_it() {
     owner.close().expect("closed");
 }
 
-/// A stroke waiting for the one before it when Ctrl+S comes was drawn before it: it's in the save.
+/// A stroke begun over the one before it, still landing, when Ctrl+S comes was drawn before it:
+/// it's in the save.
 #[test]
-fn a_stroke_waiting_behind_another_at_ctrl_s_is_in_the_save() {
+fn a_stroke_begun_over_another_at_ctrl_s_is_in_the_save() {
     let dir = TestDir::new();
     let mut owner = slow_owner(&dir);
     run(&mut owner, 10_000);
@@ -334,7 +335,11 @@ fn a_stroke_waiting_behind_another_at_ctrl_s_is_in_the_save() {
     run(&mut owner, 1);
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
     run(&mut owner, 1);
-    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    assert_eq!(
+        owner.brush().strokes.len(),
+        2,
+        "the second began over the first"
+    );
     owner.request_save(Instant::now());
     finish_save(&mut owner);
     assert!(!owner.project().has_unsaved_edits());
@@ -881,8 +886,8 @@ fn a_stroke_while_finishing_stays_out_of_the_save_and_the_window_stays() {
     owner.close().expect("closed");
 }
 
-/// The frame loop over a saved project in `dir`, with a stroke half landed, the pen still on it, a
-/// second waiting and a sample held over: all that a brush can hold at once.
+/// The frame loop over a saved project in `dir`, with a stroke half landed, a second begun over
+/// it, the pen still on that, and a sample held over: all that a brush can hold at once.
 fn holding_everything(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
     let mut owner = slow_owner(dir);
     run(&mut owner, 10_000);
@@ -893,7 +898,7 @@ fn holding_everything(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
     let second = stroke(((150.0, 80.0), (170.0, 120.0)), 6);
     queue(&mut owner, second.clone());
     run(&mut owner, 1);
-    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    assert_eq!(owner.brush().strokes.len(), 2, "the second began over it");
     let held = second.first().copied();
     owner.brush_mut().held.push(held);
     assert!(owner.brush().under_way(), "the first is under way");
@@ -1213,10 +1218,10 @@ fn save_on_a_large_backlog_lets_the_window_go_before_any_dab_lands() {
     );
 }
 
-/// A stroke waiting behind the landing is pen samples, not journalled dabs, so no journal holds it:
-/// Save waits in the window until both strokes are saved, and never lets the window go first.
+/// A stroke begun over the landing is journalled behind it, which no restore takes yet: Save waits
+/// in the window until both strokes are saved, and never lets the window go first.
 #[test]
-fn a_stroke_waiting_behind_the_landing_keeps_the_window_until_it_is_saved() {
+fn a_stroke_begun_over_the_landing_keeps_the_window_until_it_is_saved() {
     let dir = TestDir::new();
     let mut owner = slow_owner(&dir);
     run(&mut owner, 10_000);
@@ -1224,10 +1229,7 @@ fn a_stroke_waiting_behind_the_landing_keeps_the_window_until_it_is_saved() {
     run(&mut owner, 1);
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
     run(&mut owner, 1);
-    assert!(
-        !owner.brush().deferred.is_empty(),
-        "the second waits, whole"
-    );
+    assert_eq!(owner.brush().strokes.len(), 2, "the second began over it");
     assert!(!owner.brush().pen_down(), "its pen has lifted");
     let now = Instant::now();
     assert_eq!(owner.ask_close(now), CloseAnswer::Asked);

@@ -20,6 +20,7 @@ use crate::render_thread::Presented;
 use crate::script::{Script, Speed};
 use crate::test_dir::TestDir;
 
+mod chain;
 mod journal;
 mod lifecycle;
 mod navigation;

@@ -26,15 +26,15 @@
 //!   ("The first landing waits for its cut", below). A stroke whose op can't begin doesn't begin
 //!   either, its samples dropped.
 //! - **A stroke begins on what the last one left:** it reads its pen-down surface (the brush-engine
-//!   spec), which is the surface once every stroke before it has landed. So a pen `Down` while an
-//!   earlier stroke still has dabs to apply (its pen lifted) waits, with every event after it, and
-//!   is taken once that stroke's op has ended ([`Sculpting::admit`]): its first dab is shown no
-//!   sooner, but every dab it places is the same however fast the finest work went. So one stroke
-//!   at most is under way. Whether such a `Down` brushes or navigates is decided as it comes, from
-//!   the surface as it is then too (the earlier stroke's dabs landed so far), as a `Down` on that
-//!   stroke's fresh ridge means to brush ([`Brush::route`]); the stroke begins, or finds nothing
-//!   under it and doesn't, on the surface the earlier one left. A `Down` after Ctrl+S waits the
-//!   same way, for the save ([`crate::saving`]).
+//!   spec), which is the surface once every stroke before it has landed. A pen `Down` while earlier
+//!   strokes still have dabs to apply (their pens lifted) begins at once over them, reading the
+//!   surface they will leave ("Strokes over strokes still landing" below), so every dab it places
+//!   is the same however fast the finest work went. Past the open strokes' memory share, or if that
+//!   surface can't be had, it waits instead, with every event after it, and is taken once they have
+//!   all ended ([`Sculpting::admit`]). Whether such a `Down` brushes or navigates is decided as it
+//!   comes, from the surface as it is then (the earlier strokes' dabs landed so far), as a `Down`
+//!   on a fresh ridge means to brush ([`Brush::route`]). A `Down` after Ctrl+S waits for the save
+//!   ([`crate::saving`]).
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -138,6 +138,51 @@
 //!   may roll the recovery file over then, if its writer failed since the last call: the `Down`
 //!   takes that roll-over's time.
 //!
+//! # Strokes over strokes still landing
+//!
+//! A `Down` while earlier strokes still land doesn't wait for them (the stroke-while-landing
+//! spec): it begins at once, on exactly the surface they will leave, and shows its dabs in its
+//! first frame. The strokes under way are a list, oldest first; only the newest's pen is ever down
+//! (a `Down` lifts the stroke before it), and they land one at a time, in op order.
+//!
+//! - **Its op is reserved** ([`Project::begin_stroke_after`], [`StrokeOp::Reserved`]): ordered
+//!   after theirs, its journal open at once, its dabs journalled as placed
+//!   ([`Project::journal_placed_after`], their batches naming the stroke before as their pen-down
+//!   until the stroke's own cut is durable). Past the open strokes' share of the store's budget
+//!   ([`store::CacheError::OpenStrokesFull`]) nothing is reserved and the `Down` waits, as before
+//!   ([`Begin::Waits`]).
+//! - **What it reads of them:** as a stroke begins over others, each of them not yet read gets its
+//!   [`Remaining`]: its dabs not landed, brushed over its pen-down tiles without writing
+//!   ([`StrokeEdits`], sealed: its pen is up), and the tiles they reach with how far they can move
+//!   each. Its landing keeps both up ([`Remaining::land`]).
+//! - **Its surface is their futures:** each tile as stored with every earlier stroke's remaining
+//!   dabs applied ([`Futures::future_of`], bit for bit what their landing leaves), installed as the
+//!   stroke's pen-down shapes ([`store::TileStore::install_pen_down_of`]) and refitted in the
+//!   spatial index, read through [`StoreSurface::of_reserved`]. A tile they don't change is read as
+//!   stored, which it stays.
+//! - **Which futures:** each call into the stroke engine runs on a copy of its engine stroke over a
+//!   surface that notes what it reads ([`Recorded`]): rays up to their hits, and balls (a walk's
+//!   reach, an area normal's radius, a hit's normals). Every tile the earlier strokes change whose
+//!   box, grown by how far their dabs can move it, one of those reaches, and every such tile in the
+//!   ring of a tile a ball reaches, must have its future installed ([`needed`]); if one hadn't,
+//!   they are made (in one [`Futures`] a batch) and the call runs again, until a run read only
+//!   installed futures ([`on_futures`]). The engine is deterministic, so that run is the one the
+//!   finished surface gives. Each future is made once: the stroke keeps which are installed until
+//!   its op begins (a future stays valid while its stroke lands).
+//! - **Shown at once:** its dabs are shown over its own pen-down shapes, in a reading of its op
+//!   ([`store::TileStore::read_pen_down_of`]), after the earlier strokes' in the one [`Preview`],
+//!   whose dabs land in that same order. The previews end with the last stroke.
+//! - **Landing in order:** the catch-up lands the oldest stroke only. As it ends, the next's op
+//!   begins ([`Project::begin_reserved_stroke`]), its futures its own pen-down shapes now, and its
+//!   first landing waits for its pen-down cut as any stroke's ([`Project::may_land`]). A close, a
+//!   flush or a save lands them one after another the same way.
+//! - **Futures that can't be had** at the `Down` make it wait, nothing reserved kept; later in the
+//!   stroke, every stroke before it lands then and there, blocking, and it goes on over the surface
+//!   they left, its op begun ([`Sculpting::land_before_newest`]).
+//! - **A store error** while the oldest lands drops its dabs left, and every later stroke with
+//!   them, their reserved ops given back ([`Project::drop_stroke_after`]): they read the surface
+//!   those dabs were to leave.
+//!
 //! # A stroke a restore found
 //!
 //! A crash during a landing leaves the stroke's journal in the recovery file. A restore finds it
@@ -155,7 +200,7 @@
 //!   renderer draws from the start: its floor), so the whole stroke is on screen in the first
 //!   frame, which reports them shown.
 //! - **Landed as a lifted stroke:** the catch-up lands it as any stroke whose pen has lifted, and a
-//!   `Down` meanwhile waits behind it, as behind any landing. Once every dab has landed its op ends
+//!   `Down` meanwhile begins over it, as over any landing. Once every dab has landed its op ends
 //!   unrecorded ([`Project::end_unrecorded_stroke`]): the journal holds no pen samples, and a
 //!   stroke record is history, never needed to open.
 //! - **Not taken on** with rows of another layout ([`OtherDabFormat`](resume::OtherDabFormat)), a
@@ -204,7 +249,7 @@
 //!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
 //!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::f64::consts::FRAC_PI_2;
 use std::time::{Duration, Instant};
 
@@ -212,10 +257,10 @@ use anyhow::{Result, anyhow};
 use geom::TileKey;
 use input::Phase;
 use render::camera::View;
-use sculpt::{Preview, StoreSurface, apply_dabs};
+use sculpt::{Futures, PenDownTiles, Preview, SculptError, StoreSurface, StrokeEdits, apply_dabs};
 use store::{
     Evaluation, OpId, OpenStroke, PenSample as RecordSample, PenTilt, Project, ProjectError,
-    SpatialIndex, StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
+    ReservedOp, SpatialIndex, StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
 };
 use stroke::{
     DVec3, Dab, Hit, Projector, REACH_RADII, Radius, Ray, Sample, ScreenPoint, Strength,
@@ -642,6 +687,446 @@ struct Recording {
     samples: Vec<RecordSample>,
 }
 
+/// A stroke's op: begun, the store's current op, or reserved behind the strokes before it while
+/// they still land (see "Strokes over strokes still landing" in the module notes).
+#[derive(Debug)]
+enum StrokeOp {
+    /// Begun ([`Project::begin_stroke`], [`Project::begin_reserved_stroke`], or resumed): the
+    /// store's current op, every edit made as it, and its dabs land once it may.
+    Begun(OpId),
+    /// Reserved behind the strokes before it ([`Project::begin_stroke_after`]): it reads their
+    /// futures, installed as its pen-down shapes, and lands nothing until it begins, once they
+    /// have all ended.
+    Reserved {
+        /// The op's token, given back to the project as it begins or is let go.
+        token: ReservedOp,
+        /// The tiles whose futures are installed for it: each computed once, and read as its
+        /// pen-down shapes until it begins, when they become its own.
+        installed: BTreeSet<TileKey>,
+    },
+}
+
+impl StrokeOp {
+    /// The op.
+    const fn id(&self) -> OpId {
+        match self {
+            Self::Begun(op) => *op,
+            Self::Reserved { token, .. } => token.op(),
+        }
+    }
+}
+
+/// How far an earlier stroke's dabs still to land reach a tile: the tiles a later stroke must read
+/// at their futures, and how far those futures can lie from the tile as the index holds it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Reach {
+    /// The dabs not landed whose spheres touch the tile in the index, as each was queued.
+    dabs: usize,
+    /// Their strengths' magnitudes summed, over every dab that ever counted here (landing
+    /// lowers only the count): how far they can move one of its vertices together, as draw moves
+    /// a vertex at most its strength a dab.
+    strength: f64,
+}
+
+/// What a later stroke reads of an earlier one still landing (the stroke-while-landing spec,
+/// "What a new stroke reads").
+///
+/// Made once a stroke begins over it, its pen up by then so its dabs are final: the futures of
+/// the tiles its remaining dabs touch are made from `edits` ([`Futures`]), and which tiles those
+/// are, with how far they can move, from `reach`. Both follow its landing.
+#[derive(Debug)]
+struct Remaining {
+    /// Its dabs not landed, with the tiles each touches and edits at its pen-down, sealed.
+    edits: StrokeEdits,
+    /// Every tile its dabs not landed reach in the index, as they were queued.
+    reach: BTreeMap<TileKey, Reach>,
+}
+
+impl Remaining {
+    /// What a later stroke reads of `stroke`, which follows `earlier` (each with its own made
+    /// already), every one of them still landing, oldest first. Its pen-down tiles are the store's
+    /// for the oldest, the futures of those before it for any other, so `state` is the session's
+    /// stroke state the futures are made from.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError`] as [`PenDownTiles::of_oldest`], [`PenDownTiles::of_futures`],
+    /// [`Futures::new`] and [`StrokeEdits::place`]; [`sculpt::FutureError::Chain`] if one of
+    /// `earlier` has none made.
+    fn of(
+        store: &mut TileStore,
+        state: &sculpt::Stroke,
+        earlier: &[Pending],
+        stroke: &mut Pending,
+    ) -> Result<Self, SculptError> {
+        let touched = stroke.sources.iter().flat_map(|source| &source.tiles);
+        let keys: BTreeSet<TileKey> = touched.copied().collect();
+        let op = stroke.op.id();
+        let pen_down = if earlier.is_empty() {
+            PenDownTiles::of_oldest(store, op, &keys)?
+        } else {
+            let chain = chain_of(earlier).ok_or(sculpt::FutureError::Chain)?;
+            let futures = Futures::new(store, state, &chain)?;
+            PenDownTiles::of_futures(store, &futures, &keys)?
+        };
+        let after = earlier.last().map(|before| before.op.id());
+        let mut edits = StrokeEdits::new(op, after);
+        let dabs: &[Dab] = stroke.dabs.make_contiguous();
+        edits.place(store, dabs, &pen_down)?;
+        edits.seal();
+        let mut reach: BTreeMap<TileKey, Reach> = BTreeMap::new();
+        let queued = stroke.dabs.iter().zip(&stroke.sources);
+        for (dab, source) in queued {
+            for key in &source.tiles {
+                let tile = reach.entry(*key).or_default();
+                tile.dabs += 1;
+                tile.strength += f64::from(dab.strength.abs());
+            }
+        }
+        Ok(Self { edits, reach })
+    }
+
+    /// The oldest of its dabs, from `sources` (theirs, oldest first), have landed: they leave its
+    /// edits and its reach.
+    fn land<'a>(&mut self, sources: impl ExactSizeIterator<Item = &'a Source>) {
+        self.edits.land(sources.len());
+        for source in sources {
+            for key in &source.tiles {
+                if let Some(tile) = self.reach.get_mut(key) {
+                    tile.dabs = tile.dabs.saturating_sub(1);
+                    if tile.dabs == 0 {
+                        self.reach.remove(key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The edits of `strokes`, oldest first, if each has its [`Remaining`] made: the chain of futures
+/// a stroke after them reads.
+fn chain_of(strokes: &[Pending]) -> Option<Vec<&StrokeEdits>> {
+    let edits = strokes
+        .iter()
+        .map(|stroke| stroke.remaining.as_ref().map(|remaining| &remaining.edits));
+    edits.collect()
+}
+
+/// How many rounds of reading a later stroke's surface and installing the futures it found
+/// missing ([`on_futures`]) may go before it gives up.
+///
+/// Each installs at least one tile, and the tiles that can be missing are those the earlier
+/// strokes still change, so a few always do.
+const FUTURE_ROUNDS: usize = 32;
+
+/// Why a call into the stroke engine on a reserved stroke's surface ([`on_futures`]) gave nothing.
+#[derive(Debug)]
+enum OnFutures {
+    /// The surface met a store error: the call's dabs are dropped, and its stroke ends, as any
+    /// stroke's after a store error.
+    Surface(SculptError),
+    /// The futures it read couldn't be had (past the open strokes' share, a tile that can't be
+    /// evaluated): it must wait for the strokes before it to land.
+    Futures(anyhow::Error),
+}
+
+/// What a call into the stroke engine read of a surface, as far as which tiles it can have read
+/// goes ([`Recorded`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Read {
+    /// A raycast: the tiles along `ray` up to `until`, its hit's parameter (infinite for a miss).
+    Ray {
+        /// The ray.
+        ray: Ray,
+        /// The parameter its hit lies at; infinite if it hit nothing.
+        until: f64,
+    },
+    /// The surface within `radius` of `center`, normals included: a walk, a region's closest
+    /// point, an area normal, a hit's normal.
+    Ball {
+        /// The centre.
+        center: DVec3,
+        /// The radius.
+        radius: f64,
+    },
+}
+
+/// A surface that notes what each call reads ([`Read`]): what a reserved stroke's call is checked
+/// against ([`on_futures`]).
+struct Recorded<'s, S> {
+    /// The surface.
+    surface: &'s mut S,
+    /// What was read, in order.
+    reads: Vec<Read>,
+}
+
+impl<S: Surface> Surface for Recorded<'_, S> {
+    fn raycast(&mut self, ray: &Ray) -> Option<Hit> {
+        let hit = self.surface.raycast(ray);
+        let until = hit.map_or(f64::INFINITY, |hit| ray.depth_of(hit.position));
+        self.reads.push(Read::Ray { ray: *ray, until });
+        if let Some(hit) = hit {
+            // Its normal reads the tile it hit and that tile's ring.
+            self.reads.push(Read::Ball {
+                center: hit.position,
+                radius: 0.0,
+            });
+        }
+        hit
+    }
+
+    fn closest_on_region(&mut self, ray: &Ray, near: &Hit, reach: f64) -> Option<Hit> {
+        self.reads.push(Read::Ball {
+            center: near.position,
+            radius: reach,
+        });
+        self.surface.closest_on_region(ray, near, reach)
+    }
+
+    fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
+        self.reads.push(Read::Ball {
+            center: a.position,
+            radius: reach,
+        });
+        self.surface.continuous(a, b, reach)
+    }
+
+    fn area_normal(
+        &mut self,
+        center: DVec3,
+        facing: DVec3,
+        radius: f64,
+        hardness: f32,
+    ) -> Option<DVec3> {
+        self.reads.push(Read::Ball { center, radius });
+        self.surface.area_normal(center, facing, radius, hardness)
+    }
+}
+
+/// The share of a tile's box diagonal its box is grown by besides the dabs' reach, for the
+/// rounding of the positions a future holds against the moves that make it.
+const BOX_SLACK: f64 = 1e-3;
+
+/// The tiles `reads` may have read whose futures differ from the store's tiles.
+///
+/// Of those the strokes `earlier` still change: each whose box in `index`, grown by how far
+/// their dabs can move it, a read reaches, and those in the ring of any tile a read reaches by
+/// its normals.
+///
+/// What a later stroke's surface must have installed before that read for it to read the
+/// surface those strokes leave (the store's "Ops reserved ahead"): a tile they don't change is
+/// read as it is, which it stays.
+///
+/// # Errors
+///
+/// As [`TileStore::normal_inputs`].
+fn needed(
+    store: &TileStore,
+    index: &SpatialIndex,
+    earlier: &[Pending],
+    reads: &[Read],
+) -> Result<BTreeSet<TileKey>, store::CacheError> {
+    let reaches = earlier
+        .iter()
+        .filter_map(|stroke| stroke.remaining.as_ref());
+    let maps: Vec<&BTreeMap<TileKey, Reach>> = reaches.map(|remaining| &remaining.reach).collect();
+    // How far the earlier strokes' dabs can move tile `key`; `None` for one they don't reach.
+    let growth = |key: &TileKey| -> Option<f64> {
+        let reaching = maps.iter().filter_map(|map| map.get(key));
+        reaching.map(|reach| reach.strength).reduce(|a, b| a + b)
+    };
+    let changed: BTreeSet<TileKey> = maps.iter().flat_map(|map| map.keys()).copied().collect();
+    let most = changed.iter().filter_map(growth).fold(0.0_f64, f64::max);
+    // The box of tile `key` grown by how far it can move, and by its slack.
+    let grown = |key: &TileKey| -> Option<(DVec3, DVec3)> {
+        let aabb = index.bvh().bounds(key)?.aabb;
+        let (low, high) = (aabb.min(), aabb.max());
+        let (low, high) = (
+            DVec3::new(f64::from(low.x), f64::from(low.y), f64::from(low.z)),
+            DVec3::new(f64::from(high.x), f64::from(high.y), f64::from(high.z)),
+        );
+        let slack = (high - low).length() * BOX_SLACK + growth(key).unwrap_or(0.0);
+        let by = DVec3::new(slack, slack, slack);
+        Some((low - by, high + by))
+    };
+    let mut needed: BTreeSet<TileKey> = BTreeSet::new();
+    for read in reads {
+        match *read {
+            Read::Ray { ray, until } => {
+                let crossed = changed.iter().filter(|key| {
+                    grown(key).is_none_or(|(low, high)| ray_meets_box(&ray, until, low, high))
+                });
+                needed.extend(crossed);
+            }
+            Read::Ball { center, radius } => {
+                let slack = radius + most + center.length().max(1.0) * BOX_SLACK;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the index's query is f32; the boxes are grown past its rounding"
+                )]
+                let (at, within) = (center.to_f32(), (slack * 1.01) as f32);
+                let near = index.query_sphere(at, within);
+                for key in near {
+                    let touched = grown(&key).is_none_or(|(low, high)| {
+                        box_distance_squared(center, low, high) <= radius * radius
+                    });
+                    if !touched {
+                        continue;
+                    }
+                    if changed.contains(&key) {
+                        needed.insert(key);
+                    }
+                    let ring = store.normal_inputs(&key)?;
+                    needed.extend(ring.iter().filter(|input| changed.contains(input)));
+                }
+            }
+        }
+    }
+    Ok(needed)
+}
+
+/// Whether `ray`, from its origin up to parameter `until`, meets the box from `low` to `high`
+/// (the slab test, its boundary included).
+fn ray_meets_box(ray: &Ray, until: f64, low: DVec3, high: DVec3) -> bool {
+    let (origin, direction) = (ray.origin(), ray.direction());
+    let axes = [
+        (origin.x, direction.x, low.x, high.x),
+        (origin.y, direction.y, low.y, high.y),
+        (origin.z, direction.z, low.z, high.z),
+    ];
+    let mut span = (0.0_f64, until);
+    for (from, along, least, most) in axes {
+        if along == 0.0 {
+            if from < least || from > most {
+                return false;
+            }
+            continue;
+        }
+        let (a, b) = ((least - from) / along, (most - from) / along);
+        span = (span.0.max(a.min(b)), span.1.min(a.max(b)));
+        if span.0 > span.1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The squared distance from `point` to the box from `low` to `high`: 0 inside it.
+fn box_distance_squared(point: DVec3, low: DVec3, high: DVec3) -> f64 {
+    let outside = |at: f64, least: f64, most: f64| (least - at).max(at - most).max(0.0);
+    let d = DVec3::new(
+        outside(point.x, low.x, high.x),
+        outside(point.y, low.y, high.y),
+        outside(point.z, low.z, high.z),
+    );
+    d.dot(d)
+}
+
+/// Installs the futures of `keys` not `installed` yet for the stroke reserved as `token`.
+///
+/// They are the futures after the strokes `earlier` (each with its [`Remaining`]), made from the
+/// session's stroke state `state` in one [`Futures`]; each is labelled with the newest of them
+/// whose dabs reach the tile, and refitted in the scene's index so the stroke's raycasts find it
+/// there.
+///
+/// # Errors
+///
+/// [`OnFutures::Futures`] if a future can't be made or installed (past the open strokes' share)
+/// or a tile refitted: those installed before it stay.
+fn install(
+    scene: &mut Scene<'_>,
+    state: &sculpt::Stroke,
+    earlier: &[Pending],
+    token: &ReservedOp,
+    installed: &mut BTreeSet<TileKey>,
+    keys: &BTreeSet<TileKey>,
+) -> Result<(), OnFutures> {
+    let fresh: Vec<TileKey> = keys.difference(installed).copied().collect();
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let chain = chain_of(earlier)
+        .ok_or_else(|| OnFutures::Futures(anyhow!("an earlier stroke's dabs aren't known")))?;
+    let store = scene.project.store();
+    let futures = Futures::new(store, state, &chain).map_err(futures_error)?;
+    let mut added: Vec<TileKey> = Vec::with_capacity(fresh.len());
+    let mut outcome = Ok(());
+    for key in fresh {
+        let tile = match futures.future_of(store, key) {
+            Ok(tile) => tile,
+            Err(error) => {
+                outcome = Err(futures_error(error));
+                break;
+            }
+        };
+        let reaching = earlier.iter().rev().find(|stroke| {
+            let remaining = stroke.remaining.as_ref();
+            remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))
+        });
+        let written_by = reaching.map(|stroke| stroke.op.id());
+        if let Err(error) = store.install_pen_down_of(token, key, tile, written_by) {
+            outcome = Err(futures_error(error));
+            break;
+        }
+        installed.insert(key);
+        added.push(key);
+    }
+    drop(futures);
+    let refitted = scene.index.refit(scene.project.store(), &added);
+    outcome?;
+    refitted.map_err(futures_error)
+}
+
+/// `error`, met making or installing a future, as the reason a stroke waits.
+fn futures_error(error: impl std::error::Error + Send + Sync + 'static) -> OnFutures {
+    OnFutures::Futures(error.into())
+}
+
+/// Runs `call`, a call into the stroke engine, on the surface of the stroke reserved as `token`,
+/// after the strokes `earlier` still landing, until it has every future it reads.
+///
+/// It runs again after installing every future its reads found missing ([`needed`]), until one
+/// run reads only tiles whose futures it had, and returns that run's result. The stroke engine is
+/// deterministic, so that run is what the call gives on the surface those strokes leave; `call`
+/// must start each run afresh (from a copy of the engine's stroke, say).
+///
+/// # Errors
+///
+/// [`OnFutures::Surface`] for a store error the surface met; [`OnFutures::Futures`] if the
+/// futures can't be had, or a run still finds some missing after [`FUTURE_ROUNDS`].
+fn on_futures<T>(
+    scene: &mut Scene<'_>,
+    state: &sculpt::Stroke,
+    earlier: &[Pending],
+    token: &ReservedOp,
+    installed: &mut BTreeSet<TileKey>,
+    mut call: impl FnMut(&mut Recorded<'_, StoreSurface<'_>>) -> T,
+) -> Result<T, OnFutures> {
+    for _ in 0..FUTURE_ROUNDS {
+        let (made, reads) = {
+            let mut surface = StoreSurface::of_reserved(scene.project.store(), scene.index, token)
+                .map_err(OnFutures::Surface)?;
+            let mut recorded = Recorded {
+                surface: &mut surface,
+                reads: Vec::new(),
+            };
+            let made = call(&mut recorded);
+            let reads = recorded.reads;
+            surface.finish().map_err(OnFutures::Surface)?;
+            (made, reads)
+        };
+        let wanted =
+            needed(scene.project.store(), scene.index, earlier, &reads).map_err(futures_error)?;
+        if wanted.is_subset(installed) {
+            return Ok(made);
+        }
+        install(scene, state, earlier, token, installed, &wanted)?;
+    }
+    Err(OnFutures::Futures(anyhow!(
+        "the surface under the pen kept reaching tiles still to land"
+    )))
+}
+
 /// A stroke, from its `Down` (or its resuming, for one a restore found) until its op ends: its
 /// engine stroke while the pen is down, what its record keeps, and its dabs not yet applied.
 #[derive(Debug)]
@@ -653,8 +1138,13 @@ struct Pending {
     /// journal holds no pen samples, so it ends unrecorded
     /// ([`Project::end_unrecorded_stroke`]).
     record: Option<Recording>,
-    /// Its op, begun with it: every edit of its dabs is part of it, and its journal is the op's.
-    op: OpId,
+    /// Its op: begun with it, or reserved behind the strokes before it until they have ended
+    /// (see "Strokes over strokes still landing" in the module notes). Every edit of its dabs is
+    /// part of it, and its journal is the op's.
+    op: StrokeOp,
+    /// What a later stroke reads of it while it lands: its remaining dabs' edits and reach, made
+    /// once a stroke begins over it (its pen up by then), and kept as it lands.
+    remaining: Option<Remaining>,
     /// Its dabs not yet applied, oldest first.
     dabs: VecDeque<Dab>,
     /// How many of its dabs [`apply_dabs`] has applied, in placement order: the last landed count
@@ -701,6 +1191,28 @@ impl Pending {
         }
     }
 
+    /// Its op.
+    #[cfg(test)]
+    const fn op_id(&self) -> OpId {
+        self.op.id()
+    }
+
+    /// Notes `sample`, taken at `times`, the open stroke's next: its record keeps it, and its
+    /// sample interval and last sample follow it.
+    fn note_sample(&mut self, sample: &Sample, times: SampleTimes) {
+        if let Some(record) = &mut self.record {
+            record.samples.push(record_sample(sample));
+        }
+        let gap = times.received.saturating_duration_since(self.last.received);
+        self.interval = smoothed_interval(self.interval, gap);
+        self.last = times;
+    }
+
+    /// How many of its dabs not yet applied are shown ahead of their finest work.
+    fn shown(&self) -> usize {
+        self.sources.iter().filter(|source| source.shown).count()
+    }
+
     /// Whether the pen still draws it.
     const fn open(&self) -> bool {
         self.engine.is_some()
@@ -712,7 +1224,8 @@ impl Pending {
     }
 
     /// Queues `placed`, the dabs the sample at `times` placed, each with the tiles of `index` its
-    /// sphere touches, and journals them in `project` ([`Project::journal_placed`]), in order, as
+    /// sphere touches, and journals them in `project` ([`Project::journal_placed`], or
+    /// [`Project::journal_placed_after`] while its op is reserved), in order, as
     /// their bytes in the queue itself: the journal is given the queue's memory, cast to rows,
     /// so it costs no copy and no allocation here. Returns how many joined the queue.
     ///
@@ -721,7 +1234,8 @@ impl Pending {
     ///
     /// # Errors
     ///
-    /// As [`Project::journal_placed`]: none of them joins the queue then, and it is as it was.
+    /// As [`Project::journal_placed`] (or [`Project::journal_placed_after`]): none of them joins
+    /// the queue then, and it is as it was.
     fn place(
         &mut self,
         placed: impl Iterator<Item = Dab>,
@@ -742,7 +1256,11 @@ impl Pending {
         }
         let rows: &[DabRow] = bytemuck::cast_slice(new);
         let count = rows.len();
-        if let Err(error) = project.journal_placed(rows) {
+        let journalled = match &self.op {
+            StrokeOp::Begun(_) => project.journal_placed(rows),
+            StrokeOp::Reserved { token, .. } => project.journal_placed_after(token, rows),
+        };
+        if let Err(error) = journalled {
             self.dabs.truncate(before);
             self.sources.truncate(before);
             self.heading = heading;
@@ -750,6 +1268,15 @@ impl Pending {
         }
         Ok(count)
     }
+}
+
+/// What became of a pen `Down` ([`Sculpting::begin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Begin {
+    /// Taken: a stroke began, or none could (nothing under it, an error kept).
+    Done,
+    /// It can't begin over the strokes still landing: it waits for them, deferred.
+    Waits,
 }
 
 /// What the warming under a hovering pen is doing.
@@ -795,9 +1322,10 @@ pub(crate) struct Sculpting {
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
-    /// The stroke not over yet, if one is: its pen down, or its dabs still to apply. A stroke
-    /// started meanwhile waits in `deferred`.
-    stroke: Option<Pending>,
+    /// The strokes not over yet, oldest first: the oldest's op begun, every later one's reserved
+    /// behind it, and only the newest's pen ever down (see "Strokes over strokes still landing" in
+    /// the module notes). A stroke that can't begin over them waits in `deferred`.
+    strokes: Vec<Pending>,
     /// What the stroke keeps of the surface it began on, as the last step left it.
     kept: Kept,
     /// What applying dabs costs: how a step's time becomes dabs.
@@ -882,7 +1410,7 @@ impl Sculpting {
             settings,
             strength_factor: 1.0,
             state,
-            stroke: None,
+            strokes: Vec::new(),
             kept: Kept::default(),
             cost: DabCost::CALIBRATED,
             preview: Some(Preview::new()),
@@ -976,23 +1504,29 @@ impl Sculpting {
     /// begin.
     #[cfg(test)]
     pub(crate) fn stroking(&self) -> bool {
-        self.stroke.is_some() || !self.deferred.is_empty()
+        !self.strokes.is_empty() || !self.deferred.is_empty()
     }
 
     /// Whether a stroke is under way (not one that waits to begin).
     #[cfg(test)]
     pub(crate) const fn under_way(&self) -> bool {
-        self.stroke.is_some()
+        !self.strokes.is_empty()
+    }
+
+    /// The strokes under way, oldest first: each from its `Down` until its op ends.
+    #[cfg(test)]
+    fn pending(&self) -> impl Iterator<Item = &Pending> {
+        self.strokes.iter()
     }
 
     /// Dabs placed and not yet applied.
     fn queued(&self) -> usize {
-        self.stroke.as_ref().map_or(0, |stroke| stroke.dabs.len())
+        self.strokes.iter().map(|stroke| stroke.dabs.len()).sum()
     }
 
     /// Dabs placed and neither applied nor shown: the stroke's lag.
     fn unshown(&self) -> usize {
-        let sources = self.stroke.iter().flat_map(|stroke| &stroke.sources);
+        let sources = self.strokes.iter().flat_map(|stroke| &stroke.sources);
         sources.filter(|source| !source.shown).count()
     }
 
@@ -1001,15 +1535,20 @@ impl Sculpting {
     /// only dabs that fit their step's time: a dab forced past it would hold up the samples
     /// arriving meanwhile, and the frame showing a lifted stroke's tail.
     fn pen_moving(&self) -> bool {
-        let last = self.stroke.as_ref();
+        let last = self.strokes.last();
         last.is_some_and(|stroke| stroke.last.received.elapsed() < STROKE_QUIET)
     }
 
+    /// Whether the pen is down on a stroke: the newest, the only one whose pen can be.
+    fn pen_on_stroke(&self) -> bool {
+        self.strokes.last().is_some_and(Pending::open)
+    }
+
     /// When a catch-up batch must be done by while the pen draws, so as not to hold up its next
-    /// sample: [`SAMPLE_MARGIN`] before that is due, by its stroke's smoothed interval. `None`
-    /// with no stroke.
+    /// sample: [`SAMPLE_MARGIN`] before that is due, by the newest stroke's smoothed interval.
+    /// `None` with no stroke.
     fn before_next_sample(&self) -> Option<Instant> {
-        let stroke = self.stroke.as_ref()?;
+        let stroke = self.strokes.last()?;
         let due = stroke.last.received + stroke.interval;
         Some(due.checked_sub(SAMPLE_MARGIN).unwrap_or(due))
     }
@@ -1025,7 +1564,7 @@ impl Sculpting {
         report.dabs_carried = self.unshown();
         report.dabs_catching_up = self.catching_up();
         report.busy = self.queued() > 0 || !self.deferred.is_empty();
-        report.open = self.stroke.as_ref().is_some_and(Pending::open) || !self.deferred.is_empty();
+        report.open = self.pen_on_stroke() || !self.deferred.is_empty();
         report.kept = self.kept;
     }
 
@@ -1066,18 +1605,17 @@ impl Sculpting {
         Some(engine.with_buttons(stroke::Buttons::from_bits(button_bits(sample.buttons))))
     }
 
-    /// Takes one pen event as [`Sculpting::handle`] does, unless it must wait: a `Down` (ending
-    /// an open stroke whose `Up` was lost) while an earlier stroke still has dabs to apply, and
-    /// every event after one that waits, are deferred until the stroke before them has ended
-    /// ([`Sculpting::release_deferred`]).
+    /// Takes one pen event as [`Sculpting::handle`] does, unless it must wait: every event after
+    /// one that waits, and a stroke's `Down` begun after a save was asked for, are deferred until
+    /// the strokes before them have ended ([`Sculpting::release_deferred`]). A `Down` (ending an
+    /// open stroke whose `Up` was lost) while earlier strokes still have dabs to apply begins at
+    /// once over them, unless it can't ([`Begin::Waits`]): it is deferred then too.
     fn admit(&mut self, scene: &mut Scene<'_>, event: Option<&PenSample>) {
         let down = event.is_some_and(|sample| sample.phase == Phase::Down);
         if down && self.deferred.is_empty() {
             self.lift(scene, None);
         }
-        let waits = !self.deferred.is_empty()
-            || (down && self.stroke.is_some())
-            || self.waits_for_save(event);
+        let waits = !self.deferred.is_empty() || self.waits_for_save(event);
         if !waits {
             self.handle(scene, event);
             return;
@@ -1110,11 +1648,11 @@ impl Sculpting {
         events.take_while(|event| !self.waits_for_save(event.as_ref()))
     }
 
-    /// Takes the events deferred, once the stroke before them has ended: through
-    /// [`Sculpting::admit`] again, so a later stroke among them waits for the first in turn, and
-    /// one begun after a save was asked for waits for it.
+    /// Takes the events deferred, once the strokes before them have ended: through
+    /// [`Sculpting::admit`] again, so a later stroke among them begins over the first in turn (or
+    /// waits for it), and one begun after a save was asked for waits for it.
     fn release_deferred(&mut self, scene: &mut Scene<'_>) {
-        if self.stroke.is_some() || self.deferred_for_save() {
+        if !self.strokes.is_empty() || self.deferred_for_save() {
             return;
         }
         let deferred = std::mem::take(&mut self.deferred);
@@ -1133,7 +1671,11 @@ impl Sculpting {
         match sample.phase {
             Phase::Down => {
                 self.lift(scene, None);
-                self.begin(scene, sample);
+                if self.begin(scene, sample) == Begin::Waits {
+                    // It begins once the strokes before it have ended, raycasting again then.
+                    self.routed = None;
+                    self.deferred.push(Some(*sample));
+                }
             }
             Phase::Drag => self.push(scene, sample),
             Phase::Up => self.lift(scene, Some(sample)),
@@ -1143,18 +1685,27 @@ impl Sculpting {
     }
 
     /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it,
-    /// and begins its op ahead ([`Project::begin_stroke`]): with none under way
-    /// ([`Sculpting::admit`] holds a `Down` back until then). It lands once it may (see "The
-    /// journal" in the module notes).
-    fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
+    /// and begins its op ahead ([`Project::begin_stroke`]); with strokes still landing, over them
+    /// ([`Sculpting::begin_after`]). It lands once it may (see "The journal" in the module notes).
+    ///
+    /// Returns [`Begin::Waits`] for a stroke that can't begin over those landing: nothing of it is
+    /// done, its number not taken, and the caller defers it.
+    fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) -> Begin {
         self.warm = Warm::default();
         let routed = self.routed.take();
         let Some(first) = self.engine_sample(down) else {
-            return;
+            return Begin::Done;
         };
-        let projector = scene.projector;
         let id = StrokeId::new(self.next_stroke);
+        if !self.strokes.is_empty() {
+            let begun = self.begin_after(scene, down, first, id);
+            if begun == Begin::Done {
+                self.next_stroke = self.next_stroke.wrapping_add(1);
+            }
+            return begun;
+        }
         self.next_stroke = self.next_stroke.wrapping_add(1);
+        let projector = scene.projector;
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let mut primed = Primed {
             surface: &mut surface,
@@ -1163,10 +1714,10 @@ impl Sculpting {
         let engine = Stroke::begin(&self.settings, id, &projector, &mut primed, first);
         if let Err(error) = surface.finish() {
             self.dropped("starting a stroke", &error);
-            return;
+            return Begin::Done;
         }
         let Some(engine) = engine else {
-            return;
+            return Begin::Done;
         };
         // Before its first dab: the op's journal takes every dab it places.
         let op = match scene.project.begin_stroke() {
@@ -1174,20 +1725,109 @@ impl Sculpting {
             Err(error) => {
                 // No op, so nothing of it can be applied: it is dropped.
                 self.dropped("starting a stroke's op", &error);
-                return;
+                return Begin::Done;
             }
         };
+        self.started(scene, down, first, engine, StrokeOp::Begun(op));
+        Begin::Done
+    }
+
+    /// Starts a stroke at `down`, numbered `id`, its first sample `first`, over the strokes still
+    /// landing (see "Strokes over strokes still landing" in the module notes): its op reserved
+    /// behind theirs ([`Project::begin_stroke_after`]), it begins on their futures. `routed` is
+    /// left unused: it was cast on the pen-down surface of the oldest of them.
+    ///
+    /// [`Begin::Waits`], with nothing reserved, past the open strokes' share, or if the futures
+    /// can't be had.
+    fn begin_after(
+        &mut self,
+        scene: &mut Scene<'_>,
+        down: &PenSample,
+        first: Sample,
+        id: StrokeId,
+    ) -> Begin {
+        let Ok(token) = scene.project.begin_stroke_after() else {
+            // Past the share, typically: it begins once those before it have landed.
+            return Begin::Waits;
+        };
+        if self.make_remaining(scene).is_err() {
+            drop(scene.project.drop_stroke_after(token));
+            return Begin::Waits;
+        }
+        let mut installed: BTreeSet<TileKey> = BTreeSet::new();
+        let (settings, projector) = (&self.settings, scene.projector);
+        let begun = on_futures(
+            scene,
+            &self.state,
+            &self.strokes,
+            &token,
+            &mut installed,
+            |surface| Stroke::begin(settings, id, &projector, surface, first),
+        );
+        let engine = match begun {
+            Ok(Some(engine)) => engine,
+            Ok(None) => {
+                // Nothing under it: no stroke, as with none landing.
+                drop(scene.project.drop_stroke_after(token));
+                return Begin::Done;
+            }
+            Err(OnFutures::Surface(error)) => {
+                drop(scene.project.drop_stroke_after(token));
+                self.dropped("starting a stroke", &error);
+                return Begin::Done;
+            }
+            Err(OnFutures::Futures(_)) => {
+                drop(scene.project.drop_stroke_after(token));
+                return Begin::Waits;
+            }
+        };
+        let op = StrokeOp::Reserved { token, installed };
+        self.started(scene, down, first, engine, op);
+        Begin::Done
+    }
+
+    /// Makes what a later stroke reads ([`Remaining`]) of every stroke still landing that has none,
+    /// oldest first: a stroke begins over them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Remaining::of`]: those made before it stay.
+    fn make_remaining(&mut self, scene: &mut Scene<'_>) -> Result<(), SculptError> {
+        for at in 0..self.strokes.len() {
+            let Some((earlier, rest)) = self.strokes.split_at_mut_checked(at) else {
+                break;
+            };
+            let Some(stroke) = rest.first_mut().filter(|stroke| stroke.remaining.is_none()) else {
+                continue;
+            };
+            let made = Remaining::of(scene.project.store(), &self.state, earlier, stroke)?;
+            stroke.remaining = Some(made);
+        }
+        Ok(())
+    }
+
+    /// The stroke begun at `down`, its first sample `first`, its engine stroke `engine` and its op
+    /// `op`, joins the strokes under way, the newest: its pen is down.
+    fn started(
+        &mut self,
+        scene: &Scene<'_>,
+        down: &PenSample,
+        first: Sample,
+        engine: Stroke,
+        op: StrokeOp,
+    ) {
         if self.error.take().is_some() {
             self.errors += 1;
         }
-        self.stroke = Some(Pending {
+        self.strokes.push(Pending {
             engine: Some(engine),
             record: Some(Recording {
                 settings: self.settings.clone(),
-                camera: stroke_camera(scene.camera, &projector.view),
+                camera: stroke_camera(scene.camera, &scene.projector.view),
                 samples: vec![record_sample(&first)],
             }),
             op,
+            remaining: None,
             dabs: VecDeque::new(),
             landed: 0,
             sources: VecDeque::new(),
@@ -1202,32 +1842,39 @@ impl Sculpting {
 
     /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing and journalling the
     /// dabs it places; a store error (the journal's included) ends the stroke there, its dabs
-    /// dropped.
+    /// dropped. A stroke over strokes still landing reads their futures ([`Sculpting::on_newest`]).
     fn push(&mut self, scene: &mut Scene<'_>, sample: &PenSample) {
         let Some(engine_sample) = self.engine_sample(sample) else {
             return;
         };
-        let Some(pending) = self.stroke.as_mut().filter(|stroke| stroke.open()) else {
+        let times = times_of(sample);
+        let Some(pending) = self.strokes.last_mut().filter(|stroke| stroke.open()) else {
             return;
         };
+        pending.note_sample(&engine_sample, times);
+        let projector = scene.projector;
+        if matches!(pending.op, StrokeOp::Reserved { .. }) {
+            let pushed = self.on_newest(scene, |engine, surface| {
+                let placed: Vec<Dab> = engine.push(&projector, surface, engine_sample).collect();
+                placed
+            });
+            if let Some(placed) = pushed {
+                self.queue_newest(
+                    scene,
+                    placed.into_iter(),
+                    times,
+                    "journalling the dabs placed",
+                );
+            }
+            return;
+        }
         // Out while its dabs are queued, which borrow it; back only if they all were.
         let Some(mut engine) = pending.engine.take() else {
             return;
         };
-        let projector = scene.projector;
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let placed = engine.push(&projector, &mut surface, engine_sample);
-        let finished = surface.finish();
-        let times = times_of(sample);
-        if let Some(record) = &mut pending.record {
-            record.samples.push(record_sample(&engine_sample));
-        }
-        let gap = times
-            .received
-            .saturating_duration_since(pending.last.received);
-        pending.interval = smoothed_interval(pending.interval, gap);
-        pending.last = times;
-        if let Err(error) = finished {
+        if let Err(error) = surface.finish() {
             drop(placed);
             self.dropped("placing dabs", &error);
             return;
@@ -1249,14 +1896,33 @@ impl Sculpting {
     /// the pen lifted at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last
     /// sample.
     fn lift(&mut self, scene: &mut Scene<'_>, up: Option<&PenSample>) {
-        let Some(pending) = self.stroke.as_mut() else {
-            return;
-        };
-        let Some(engine) = pending.engine.take() else {
+        let Some(pending) = self.strokes.last_mut().filter(|stroke| stroke.open()) else {
             return;
         };
         let times = up.map_or(pending.last, times_of);
         let projector = scene.projector;
+        if matches!(pending.op, StrokeOp::Reserved { .. }) {
+            let ended = self.on_newest(scene, |engine, surface| {
+                let tail: Vec<Dab> = engine.clone().end(&projector, surface).collect();
+                tail
+            });
+            if let Some(newest) = self.strokes.last_mut() {
+                // Lifted, whatever its tail met.
+                newest.engine = None;
+            }
+            if let Some(tail) = ended {
+                self.queue_newest(
+                    scene,
+                    tail.into_iter(),
+                    times,
+                    "journalling the stroke's last dabs",
+                );
+            }
+            return;
+        }
+        let Some(engine) = pending.engine.take() else {
+            return;
+        };
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let tail = engine.end(&projector, &mut surface);
         if let Err(error) = surface.finish() {
@@ -1269,6 +1935,107 @@ impl Sculpting {
             Ok(_) => pending.note_start(&mut self.stroke_start),
             Err(error) => self.dropped("journalling the stroke's last dabs", &error),
         }
+    }
+
+    /// Runs `call` on the newest stroke's engine stroke, its pen down and its op reserved over the
+    /// strokes still landing, on their futures ([`on_futures`]), each run on a copy of the engine
+    /// stroke: the engine stroke becomes the run's that stands, and its dabs are returned.
+    ///
+    /// A store error ends the stroke (its pen lifted, these dabs dropped) and returns `None`.
+    /// Futures that can't be had land every stroke before it now, as if it had waited for them
+    /// ([`Sculpting::land_before_newest`]); then its op has begun, and `call` runs on its own
+    /// pen-down surface, the surface they left. If they can't land, its pen is lifted, and it ends
+    /// once they have.
+    fn on_newest(
+        &mut self,
+        scene: &mut Scene<'_>,
+        mut call: impl FnMut(&mut Stroke, &mut Recorded<'_, StoreSurface<'_>>) -> Vec<Dab>,
+    ) -> Option<Vec<Dab>> {
+        let (pending, earlier) = self.strokes.split_last_mut()?;
+        let engine = pending.engine.as_ref()?;
+        let StrokeOp::Reserved { token, installed } = &mut pending.op else {
+            return None;
+        };
+        let run = on_futures(scene, &self.state, earlier, token, installed, |surface| {
+            let mut moved = engine.clone();
+            let placed = call(&mut moved, surface);
+            (moved, placed)
+        });
+        let why = match run {
+            Ok((moved, placed)) => {
+                pending.engine = Some(moved);
+                return Some(placed);
+            }
+            Err(OnFutures::Surface(error)) => {
+                pending.engine = None;
+                self.dropped("placing dabs", &error);
+                return None;
+            }
+            Err(OnFutures::Futures(why)) => why,
+        };
+        self.land_before_newest(scene);
+        let newest = self.strokes.last_mut()?;
+        if !matches!(newest.op, StrokeOp::Begun(_)) {
+            newest.engine = None;
+            let why = why.context("the strokes before it couldn't land");
+            self.fail("placing dabs over strokes still landing", &*why);
+            return None;
+        }
+        let own = newest.engine.as_mut()?;
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
+        let mut recorded = Recorded {
+            surface: &mut surface,
+            reads: Vec::new(),
+        };
+        let placed = call(own, &mut recorded);
+        if let Err(error) = surface.finish() {
+            newest.engine = None;
+            self.dropped("placing dabs", &error);
+            return None;
+        }
+        Some(placed)
+    }
+
+    /// Queues and journals `placed`, the newest stroke's dabs placed from the sample at `times`;
+    /// a journal that refuses them ends its engine stroke, the error kept from `doing`.
+    fn queue_newest(
+        &mut self,
+        scene: &mut Scene<'_>,
+        placed: impl Iterator<Item = Dab>,
+        times: SampleTimes,
+        doing: &str,
+    ) {
+        let Some(pending) = self.strokes.last_mut() else {
+            return;
+        };
+        match pending.place(placed, times, scene.index, scene.project) {
+            Ok(count) => {
+                if count > 0 {
+                    pending.placed_at = Instant::now();
+                }
+                pending.note_start(&mut self.stroke_start);
+            }
+            Err(error) => {
+                pending.engine = None;
+                self.dropped(doing, &error);
+            }
+        }
+    }
+
+    /// Lands every stroke before the newest now, blocking, oldest first, each beginning the next
+    /// as it ends: for a newest stroke whose futures can't be had, which then reads the surface
+    /// they left, as if it had waited for them. Stops if a landing makes no progress.
+    fn land_before_newest(&mut self, scene: &mut Scene<'_>) {
+        let landing = std::mem::replace(&mut self.landing, Landing::InFrames);
+        while self.strokes.len() > 1 {
+            let before = (self.strokes.len(), self.queued());
+            self.unframed = false;
+            self.apply(scene, &mut BrushReport::default(), None);
+            if (self.strokes.len(), self.queued()) == before {
+                break;
+            }
+        }
+        self.landing = landing;
     }
 
     /// One step's dabs: applied as `budget` leaves time for (all of them with none), and, for a
@@ -1295,15 +2062,16 @@ impl Sculpting {
     }
 
     /// Whether every queued dab fits `budget` as finest work, with nothing shown waiting: then a
-    /// step needs no preview.
+    /// step needs no preview. Never with strokes over the oldest: their dabs can't land before
+    /// its op ends, so they are shown.
     fn fits(&self, budget: Option<&BrushBudget>) -> bool {
         let Some(budget) = budget else {
             return true;
         };
-        if self.catching_up() > 0 {
+        if self.catching_up() > 0 || self.strokes.len() > 1 {
             return false;
         }
-        let Some(front) = self.stroke.as_ref() else {
+        let Some(front) = self.strokes.first() else {
             return true;
         };
         let Some(oldest) = front.sources.front() else {
@@ -1327,6 +2095,10 @@ impl Sculpting {
     /// [`Sculpting::show`] on `project`'s tiles, found by `index`, previews made of those `drawn`:
     /// what showing needs of a scene, for a stroke taken on before any view
     /// ([`Sculpting::resume`]).
+    ///
+    /// Stroke by stroke, oldest first, as they land: a stroke whose op is reserved over strokes
+    /// still landing shows its dabs over its own pen-down shapes, their futures
+    /// ([`TileStore::read_pen_down_of`]), as its dabs were placed.
     fn show_on(
         &mut self,
         project: &mut Project,
@@ -1337,43 +2109,51 @@ impl Sculpting {
         let Some(preview) = &mut self.preview else {
             return;
         };
-        let unshown = self.stroke.iter().flat_map(|stroke| {
+        let wanted = |key: &TileKey| drawn.draws(key);
+        let mut failed = None;
+        for stroke in &mut self.strokes {
             let pairs = stroke.dabs.iter().zip(&stroke.sources);
-            pairs.filter(|(_, source)| !source.shown)
-        });
-        let dabs: Vec<Dab> = unshown.map(|(dab, _)| *dab).collect();
-        if dabs.is_empty() {
-            return;
+            let unshown = pairs.filter(|(_, source)| !source.shown);
+            let dabs: Vec<Dab> = unshown.map(|(dab, _)| *dab).collect();
+            if dabs.is_empty() {
+                continue;
+            }
+            let before = preview.shown();
+            let shown = match &stroke.op {
+                StrokeOp::Begun(_) => preview.show(project.store(), index, &dabs, &wanted),
+                StrokeOp::Reserved { token, .. } => match project.store().read_pen_down_of(token) {
+                    Ok(mut reading) => preview.show(&mut reading, index, &dabs, &wanted),
+                    Err(error) => Err(error.into()),
+                },
+            };
+            let count = preview.shown() - before;
+            let sources = stroke.sources.iter_mut();
+            let newly = sources.filter(|source| !source.shown).take(count);
+            for source in newly {
+                source.shown = true;
+                report.dabs_shown += 1;
+                report.oldest = Some(
+                    report
+                        .oldest
+                        .map_or(source.times, |oldest| oldest.earliest(source.times)),
+                );
+                report.above_limit |= source.tiles.len() > LIMIT_TILES;
+            }
+            if let Err(error) = shown {
+                failed = Some(error);
+                break;
+            }
         }
-        let before = preview.shown();
-        let shown = preview.show(project.store(), index, &dabs, &|key: &TileKey| {
-            drawn.draws(key)
-        });
-        let count = preview.shown() - before;
-        let sources = self
-            .stroke
-            .iter_mut()
-            .flat_map(|stroke| &mut stroke.sources);
-        let newly = sources.filter(|source| !source.shown).take(count);
-        for source in newly {
-            source.shown = true;
-            report.dabs_shown += 1;
-            report.oldest = Some(
-                report
-                    .oldest
-                    .map_or(source.times, |oldest| oldest.earliest(source.times)),
-            );
-            report.above_limit |= source.tiles.len() > LIMIT_TILES;
-        }
-        if let Err(error) = shown {
+        if let Some(error) = failed {
             self.fail("showing dabs ahead of their finest work", &error);
         }
     }
 
     /// Applies queued dabs while `budget` leaves time for them (all of them with none), oldest
-    /// first, ending the stroke's op once the stroke is over (in the same call as the batch that
-    /// leaves it over, a failed one's included); at least one dab if any is queued and the step
-    /// must make progress (always for a brush that shows nothing ahead, else as the budget says).
+    /// first, of the oldest stroke, ending its op once it is over (in the same call as the batch
+    /// that leaves it over, a failed one's included), and beginning the next's; at least one dab if
+    /// any is queued and the step must make progress (always for a brush that shows nothing
+    /// ahead, else as the budget says).
     ///
     /// The time left is read from the clock before the batch. Dabs shown ahead keep the aim's time:
     /// a step catching up never takes the "behind" time, which is for a brush whose stroke lags
@@ -1396,7 +2176,7 @@ impl Sculpting {
         let moving = self.landing == Landing::InFrames && self.pen_moving();
         // While the pen is down, resting or not, the catch-up never holds up its next sample:
         // a dab is forced, and long batches taken, only once it has lifted.
-        let down = self.stroke.as_ref().is_some_and(Pending::open);
+        let down = self.pen_on_stroke();
         let forced = match (&self.preview, budget) {
             (None, _) | (_, None) => true,
             (Some(_), Some(budget)) => budget.forces_progress() && !moving && !down,
@@ -1408,8 +2188,8 @@ impl Sculpting {
         // sample's interval at a time, so one arriving waits at most that.
         let resting = down && !moving;
         let interval = self
-            .stroke
-            .as_ref()
+            .strokes
+            .last()
             .map_or(FIRST_INTERVAL, |stroke| stroke.interval);
         // While the pen draws, the catch-up waits for the frame of what this step (or one before
         // it, between frames) showed, then has until the next sample is due.
@@ -1419,15 +2199,16 @@ impl Sculpting {
         let backlog = self.catching_up();
         let limit = self.backlog_limit;
         let drawing = self
-            .stroke
-            .as_ref()
+            .strokes
+            .last()
             .is_some_and(|stroke| stroke.placed_at.elapsed() < RESTING_QUIET);
         let behind = if drawing {
             backlog >= self.backlog_limit && waited >= CATCH_UP_STARVED / 4
         } else {
             waited >= CATCH_UP_STARVED
         };
-        let Some(front) = self.stroke.as_mut() else {
+        // The oldest stroke lands first: one stroke writes at a time, in op order.
+        let Some(front) = self.strokes.first_mut() else {
             return;
         };
         let first = report.dabs_applied == 0;
@@ -1485,11 +2266,12 @@ impl Sculpting {
         if count > 0 || !catching_up {
             self.landed_at = Instant::now();
         }
-        if !self.stroke.as_ref().is_some_and(Pending::done) {
+        if !self.strokes.first().is_some_and(Pending::done) {
             return;
         }
-        if let Some(over) = self.stroke.take() {
-            self.end(scene.project, &over);
+        if !self.strokes.is_empty() {
+            let over = self.strokes.remove(0);
+            self.end(scene, &over);
         }
     }
 
@@ -1516,11 +2298,12 @@ impl Sculpting {
         scene.project.may_land()
     }
 
-    /// Applies the stroke's first `count` queued dabs in one [`apply_dabs`], adding to
-    /// `report`, passes the stroke's landed count to its journal ([`Project::journal_landed`])
-    /// right after, and lands those of them shown. A store error drops the stroke's dabs left,
-    /// ends its engine stroke, and has the spatial index rebuilt; a count the journal refuses
-    /// drops the dabs left too.
+    /// Applies the oldest stroke's first `count` queued dabs in one [`apply_dabs`], adding to
+    /// `report`, passes its landed count to its journal ([`Project::journal_landed`]) right
+    /// after, and lands those of them shown; what a later stroke reads of it follows
+    /// ([`Remaining::land`]). A store error drops the stroke's dabs left (and every later
+    /// stroke, [`Sculpting::drop_left`]), ends its engine stroke, and has the spatial index
+    /// rebuilt; a count the journal refuses drops the dabs left too.
     ///
     /// Returns how long [`apply_dabs`] took, what the cost model learns from ([`DabCost`] models
     /// the finest work alone, not the landing's previews made again); `None` if there was no
@@ -1531,7 +2314,7 @@ impl Sculpting {
         report: &mut BrushReport,
         count: usize,
     ) -> Option<Duration> {
-        let front = self.stroke.as_mut()?;
+        let front = self.strokes.first_mut()?;
         // Dabs shown already count for the frame that showed them.
         let sources = front
             .sources
@@ -1557,6 +2340,9 @@ impl Sculpting {
                 let direct: Vec<Dab> = batch.get(landing..).unwrap_or_default().to_vec();
                 // The dabs `apply_dabs` was given: what landed.
                 let taken = batch.len();
+                if let Some(remaining) = &mut front.remaining {
+                    remaining.land(front.sources.iter().take(taken));
+                }
                 front.dabs.drain(..taken);
                 front.sources.drain(..taken);
                 // The count goes with the edits, in this call: nothing ticks the project between
@@ -1582,13 +2368,14 @@ impl Sculpting {
                 if let Err(error) = counted {
                     // No cut may pair the batch's edits with the count before it: the stroke
                     // ends in this call, and its journal closes counting every dab landed.
-                    let dropped = self.drop_left("journalling the dabs landed", &error);
+                    let dropped =
+                        self.drop_left(scene.project, "journalling the dabs landed", &error);
                     self.land(scene, dropped, false);
                 }
             }
             Err(error) => {
                 // No count: how far the batch got is unknown, and the stroke ends in this call.
-                let dropped = self.drop_left("applying dabs", &error);
+                let dropped = self.drop_left(scene.project, "applying dabs", &error);
                 self.index_stale = true;
                 self.rebuild_index(scene);
                 self.land(scene, dropped, true);
@@ -1597,19 +2384,42 @@ impl Sculpting {
         Some(took)
     }
 
-    /// Drops every dab the stroke has left to apply, those shown with them, and ends its engine
-    /// stroke, keeping `error` from `doing` as one that dropped dabs: the stroke is then over, and
-    /// [`Sculpting::apply`] ends its op in the same call. Returns how many of the dabs dropped were
-    /// shown: theirs are the previews to land ([`Sculpting::land`]).
-    fn drop_left(&mut self, doing: &str, error: &dyn std::error::Error) -> usize {
-        let shown = self.stroke.as_mut().map_or(0, |front| {
-            let shown = front.sources.iter().filter(|s| s.shown).count();
+    /// Drops every dab the oldest stroke has left to apply, those shown with them, and ends its
+    /// engine stroke, keeping `error` from `doing` as one that dropped dabs: the stroke is then
+    /// over, and [`Sculpting::apply`] ends its op in the same call. Every later stroke goes too
+    /// ([`Sculpting::drop_later`]): it read the surface those dabs were to leave. Returns how many
+    /// of the dabs dropped were shown: theirs are the previews to land ([`Sculpting::land`]).
+    fn drop_left(
+        &mut self,
+        project: &mut Project,
+        doing: &str,
+        error: &dyn std::error::Error,
+    ) -> usize {
+        let shown = self.strokes.first_mut().map_or(0, |front| {
+            let shown = front.shown();
             front.dabs.clear();
             front.sources.clear();
             front.engine = None;
             shown
         });
+        let later = self.drop_later(project);
         self.dropped(doing, error);
+        shown + later
+    }
+
+    /// Lets every stroke after the oldest go, none of its dabs landed: each reserved op is given
+    /// back to `project` ([`Project::drop_stroke_after`], which closes its journal counting every
+    /// dab landed, so a restore never lands them). Returns how many of their dabs were shown,
+    /// which come right after the oldest's among those the previews hold.
+    fn drop_later(&mut self, project: &mut Project) -> usize {
+        let later = self.strokes.split_off(self.strokes.len().min(1));
+        let mut shown = 0;
+        for stroke in later {
+            shown += stroke.shown();
+            if let StrokeOp::Reserved { token, .. } = stroke.op {
+                drop(project.drop_stroke_after(token));
+            }
+        }
         shown
     }
 
@@ -1647,19 +2457,42 @@ impl Sculpting {
         }
     }
 
-    /// Ends `over`'s op with its record; unrecorded if it has none (a stroke a restore found), if
-    /// the record can't be made or the project refuses it, so its edits are flushed all the same.
-    fn end(&mut self, project: &mut Project, over: &Pending) {
+    /// Ends `over`'s op, the oldest stroke's, taken out of the strokes under way, and begins the
+    /// next's ([`Sculpting::begin_next`]).
+    ///
+    /// The previews end with the last stroke: a later stroke's dabs shown stay. The op ends with
+    /// its record; unrecorded if it has none (a stroke a restore found), if the record can't be
+    /// made or the project refuses it, so its edits are flushed all the same.
+    fn end(&mut self, scene: &mut Scene<'_>, over: &Pending) {
+        if self.strokes.is_empty() {
+            self.end_previews(scene.project);
+        }
+        self.end_op(scene.project, over);
+        if !self.strokes.is_empty() {
+            self.begin_next(scene);
+            if self.strokes.is_empty() {
+                // The next couldn't begin, and went with every one after it.
+                self.end_previews(scene.project);
+            }
+        }
+    }
+
+    /// Ends the previews' stroke: every dab shown has landed, or was dropped.
+    fn end_previews(&mut self, project: &mut Project) {
         if let Some(preview) = &mut self.preview
             && let Err(error) = preview.end_stroke(project.store())
         {
             self.fail("ending the stroke's previews", &error);
         }
+    }
+
+    /// Ends `over`'s op (see [`Sculpting::end`]).
+    fn end_op(&mut self, project: &mut Project, over: &Pending) {
         let Some(recording) = &over.record else {
             self.end_unrecorded(project);
             return;
         };
-        let record = match self.record_of(over.op, recording) {
+        let record = match self.record_of(over.op.id(), recording) {
             Ok(record) => record,
             Err(error) => {
                 self.fail("recording the stroke", &error);
@@ -1674,6 +2507,39 @@ impl Sculpting {
                 self.end_unrecorded(project);
             }
             Err(error) => self.ended_with(error),
+        }
+    }
+
+    /// Begins the op of the oldest stroke left, reserved behind the one that just ended
+    /// ([`Project::begin_reserved_stroke`]): its futures become its own pen-down shapes, the
+    /// strokes after it read it as the oldest ([`StrokeEdits::earlier_landed`]), and it lands
+    /// once its pen-down cut is taken ([`Project::may_land`]), as any stroke. One that can't
+    /// begin goes, with every stroke after it, their dabs dropped.
+    fn begin_next(&mut self, scene: &mut Scene<'_>) {
+        let Some(next) = self.strokes.first_mut() else {
+            return;
+        };
+        let id = next.op.id();
+        let StrokeOp::Reserved { token, .. } = std::mem::replace(&mut next.op, StrokeOp::Begun(id))
+        else {
+            return;
+        };
+        match scene.project.begin_reserved_stroke(token) {
+            Ok(op) => {
+                next.op = StrokeOp::Begun(op);
+                if let Some(remaining) = &mut next.remaining {
+                    remaining.edits.earlier_landed();
+                }
+            }
+            Err(refused) => {
+                let (given_back, error) = refused.into_parts();
+                let shown = next.shown();
+                drop(scene.project.drop_stroke_after(given_back));
+                let later = self.drop_later(scene.project);
+                self.strokes.clear();
+                self.dropped("beginning a stroke's op", &error);
+                self.land(scene, shown + later, false);
+            }
         }
     }
 
@@ -1745,7 +2611,7 @@ impl Sculpting {
             self.lift(&mut scene, None);
         }
         self.work(&mut scene, &mut report, Some(&budget));
-        if !self.deferred.is_empty() && self.stroke.is_none() {
+        if !self.deferred.is_empty() && self.strokes.is_empty() {
             self.release_deferred(&mut scene);
             if lifting {
                 self.lift(&mut scene, None);
@@ -1832,7 +2698,7 @@ impl Sculpting {
             radius: self.settings.radius().get(),
             strength: self.settings.strength().get(),
             factor: self.strength_factor,
-            drawing: self.stroke.is_some(),
+            drawing: !self.strokes.is_empty(),
             last: self.last,
             kept: self.kept,
             errors: self.errors,
@@ -1876,7 +2742,7 @@ impl Sculpting {
 
     /// Notes where the pen hovers in this frame's view, for [`Brush::prepare`] to warm.
     fn note_hover(&mut self, pen: &PenFrame, view: Option<&View>) {
-        let open = self.stroke.as_ref().is_some_and(Pending::open);
+        let open = self.pen_on_stroke();
         self.warm.wanted = match (pen.hover(), view, open) {
             (Some(hover), Some(view), false) => Some((hover.at, *view)),
             _ => None,
@@ -1917,7 +2783,7 @@ impl Sculpting {
     /// last, not evaluated yet. A heading met before (within a radius of the last one warmed) is
     /// not listed again.
     fn warm_ahead(&mut self, scene: &mut Scene<'_>) {
-        let Some([Some(previous), Some(last)]) = self.stroke.as_ref().map(|stroke| stroke.heading)
+        let Some([Some(previous), Some(last)]) = self.strokes.last().map(|stroke| stroke.heading)
         else {
             return;
         };
@@ -2058,7 +2924,7 @@ impl Brush for Sculpting {
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let Some(mut scene) = Scene::of(context) else {
-            if self.stroke.is_some() || !self.deferred.is_empty() {
+            if !self.strokes.is_empty() || !self.deferred.is_empty() {
                 // Kept for a frame that can place them: the strokes they belong to go on, and so
                 // does a stroke that waits to begin.
                 let events = pen.brush_events().map(|event| match event {
@@ -2091,7 +2957,7 @@ impl Brush for Sculpting {
             self.admit(&mut scene, sample);
         }
         self.work(&mut scene, &mut report, Some(budget));
-        if !self.deferred.is_empty() && self.stroke.is_none() {
+        if !self.deferred.is_empty() && self.strokes.is_empty() {
             // The stroke before them has ended: the deferred stroke begins on what it left.
             self.release_deferred(&mut scene);
             self.work(&mut scene, &mut report, Some(budget));
@@ -2136,7 +3002,7 @@ impl Brush for Sculpting {
             }
             // A `Down` that waits for a stroke still landing begins on what that stroke leaves:
             // one on its fresh ridge, off the surface it began on, brushes too.
-            None if self.stroke.is_some() || !self.deferred.is_empty() => {
+            None if !self.strokes.is_empty() || !self.deferred.is_empty() => {
                 let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32());
                 let landed = narrow
                     .map(|narrow| scene.index.raycast_triangle(scene.project.store(), &narrow));
@@ -2174,7 +3040,7 @@ impl Brush for Sculpting {
         }
         // Ahead of a drawing pen, the ground its next dabs will reach is warmed first, a batch a
         // call: placement's reads there (the area normal, the raycasts) find it evaluated.
-        if self.stroke.as_ref().is_some_and(Pending::open) {
+        if self.pen_on_stroke() {
             self.warm_ahead(&mut scene);
         }
         if self.catching_up() > 0 {
@@ -2237,16 +3103,19 @@ impl Brush for Sculpting {
     }
 
     fn landing(&self) -> usize {
-        let under_way = usize::from(self.stroke.is_some());
-        self.queued().max(under_way) + self.deferred.len() + self.held.len()
+        self.queued().max(self.strokes.len()) + self.deferred.len() + self.held.len()
     }
 
     fn journals(&self) -> bool {
         true
     }
 
+    /// The events held or deferred, and every stroke reserved over one still landing: its dabs
+    /// are journalled, but no restore takes a stroke behind another yet, so the window stays for
+    /// the save as it does for a stroke not placed.
     fn unplaced_for_save(&self) -> usize {
-        self.deferred_in_save().count() + self.held.len()
+        let reserved = self.strokes.iter().skip(1).count();
+        self.deferred_in_save().count() + self.held.len() + reserved
     }
 
     fn begin_saving(&mut self, asked: Instant) {
@@ -2261,7 +3130,7 @@ impl Brush for Sculpting {
         }
         match events.last() {
             Some(event) => matches!(event.phase, Phase::Down | Phase::Drag),
-            None => self.stroke.as_ref().is_some_and(Pending::open),
+            None => self.pen_on_stroke(),
         }
     }
 
@@ -2270,8 +3139,7 @@ impl Brush for Sculpting {
     }
 
     fn landing_for_save(&self) -> usize {
-        let under_way = usize::from(self.stroke.is_some());
-        self.queued().max(under_way) + self.deferred_in_save().count() + self.held.len()
+        self.queued().max(self.strokes.len()) + self.deferred_in_save().count() + self.held.len()
     }
 
     fn save_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
@@ -2284,7 +3152,13 @@ impl Brush for Sculpting {
     }
 
     fn abandon(&mut self) {
-        self.stroke = None;
+        // The project is discarded next, its store with it: a reserved op has nothing to go
+        // back to.
+        for stroke in std::mem::take(&mut self.strokes) {
+            if let StrokeOp::Reserved { token, .. } = stroke.op {
+                token.abandon_with_store_gone();
+            }
+        }
         self.held.clear();
         self.deferred.clear();
         self.landing = Landing::InFrames;
@@ -2322,17 +3196,26 @@ impl Brush for Sculpting {
             loop {
                 self.unframed = false;
                 let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
-                let mut report = BrushReport::default();
-                self.work(&mut scene, &mut report, Some(&budget));
-                if report.dabs_applied == 0 {
+                let before = (self.strokes.len(), self.queued());
+                self.work(&mut scene, &mut BrushReport::default(), Some(&budget));
+                // A stroke ending, and the next beginning, is progress too.
+                if (self.strokes.len(), self.queued()) == before {
                     break;
                 }
             }
             self.landing = Landing::InFrames;
             loop {
                 self.lift(&mut scene, None);
+                let before = (self.strokes.len(), self.queued());
                 self.work(&mut scene, &mut BrushReport::default(), None);
-                if self.deferred.is_empty() || self.stroke.is_some() {
+                if !self.strokes.is_empty() {
+                    // Each work lands the oldest stroke whole, and begins the next's op.
+                    if (self.strokes.len(), self.queued()) == before {
+                        break;
+                    }
+                    continue;
+                }
+                if self.deferred.is_empty() {
                     break;
                 }
                 self.release_deferred(&mut scene);

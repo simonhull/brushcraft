@@ -73,7 +73,7 @@ fn crash_mid_landing(format: u32, landed: usize) -> Crashed {
     let shown = run.frame(&stroke(ACROSS, 12));
     assert!(shown.dabs_shown > landed + 2, "{shown:?}");
     assert!(!run.stroke().open(), "the pen lifted");
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     let placed = run.queued_rows();
     run.cut();
     for _ in 0..landed {
@@ -100,7 +100,7 @@ fn crash_mid_landing(format: u32, landed: usize) -> Crashed {
 
 /// The rows of the dabs `owner`'s brush still has to land, in order.
 fn rows_left(owner: &Owner<Sculpting, NoUploads>) -> Vec<DabRow> {
-    let stroke = owner.brush().stroke.as_ref().expect("a stroke under way");
+    let stroke = owner.brush().strokes.first().expect("a stroke under way");
     let rows = stroke.dabs.iter().copied().map(row_of);
     rows.collect()
 }
@@ -111,8 +111,8 @@ fn a_resumed_stroke_is_shown_at_once_and_lands_as_a_lifted_stroke() {
     let mut owner = crashed.resumed(Sculpting::new);
     {
         let brush = owner.brush();
-        let resumed = brush.stroke.as_ref().expect("the stroke is taken on");
-        assert_eq!(resumed.op, crashed.op, "as its own op");
+        let resumed = brush.strokes.first().expect("the stroke is taken on");
+        assert_eq!(resumed.op.id(), crashed.op, "as its own op");
         assert_eq!(resumed.landed, 3, "its landed count goes on");
         assert!(!resumed.open(), "its pen has lifted");
         assert_eq!(
@@ -160,7 +160,7 @@ fn a_resumed_stroke_ends_its_op_unrecorded_once_landed() {
 }
 
 #[test]
-fn a_down_during_a_resumed_landing_waits_as_behind_any_landing() {
+fn a_down_during_a_resumed_landing_begins_over_it_as_over_any_landing() {
     let crashed = crash_mid_landing(stroke::DAB_FORMAT, 1);
     // A dab a step: the restored stroke is still landing when the next stroke comes.
     let mut owner =
@@ -168,9 +168,10 @@ fn a_down_during_a_resumed_landing_waits_as_behind_any_landing() {
     queue(&mut owner, below());
     assert_eq!(run(&mut owner, 1), 1);
     let brush = owner.brush();
-    assert!(!brush.deferred.is_empty(), "the new stroke waits to begin");
-    let landing = brush.stroke.as_ref().expect("still landing");
-    assert_eq!(landing.op, crashed.op, "behind the restored stroke");
+    assert!(brush.deferred.is_empty(), "the new stroke begins at once");
+    let ops: Vec<OpId> = brush.strokes.iter().map(|stroke| stroke.op.id()).collect();
+    assert_eq!(ops.len(), 2, "both under way");
+    assert_eq!(ops.first(), Some(&crashed.op), "over the restored stroke");
     run(&mut owner, 10_000);
     assert!(!owner.brush().stroking(), "both over");
     assert_eq!(owner.brush().error(), None);
@@ -410,8 +411,8 @@ fn a_stroke_killed_mid_landing_comes_back_whole() {
         let dir = TestDir::new();
         kill_child(&dir, (cut, more));
         let mut owner = resumed_in(&dir, Sculpting::new);
-        let resumed = owner.brush().stroke.as_ref().expect("taken on");
-        let op = resumed.op;
+        let resumed = owner.brush().strokes.first().expect("taken on");
+        let op = resumed.op.id();
         assert_eq!(
             usize::try_from(resumed.landed).expect("a few"),
             cut,

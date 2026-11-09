@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use store::{OpenStroke, Project, ProjectError};
 use stroke::Dab;
 
-use super::{DabRow, FIRST_INTERVAL, Pending, Sculpting, Source, ViewProjector};
+use super::{DabRow, FIRST_INTERVAL, Pending, Sculpting, Source, StrokeOp, ViewProjector};
 use crate::camera::Camera;
 use crate::dialogs::LastStroke;
 use crate::frame::{Brush, BrushContext, BrushReport, Drawing, SampleTimes};
@@ -122,7 +122,7 @@ impl Sculpting {
             drawn,
             ..
         } = context;
-        if self.stroke.is_some() || !self.deferred.is_empty() || !self.held.is_empty() {
+        if !self.strokes.is_empty() || !self.deferred.is_empty() || !self.held.is_empty() {
             return Err(anyhow!("a stroke is under way"));
         }
         let index = index.ok_or_else(|| anyhow!("there is no spatial index to brush"))?;
@@ -163,10 +163,11 @@ impl Sculpting {
         };
         let sources = dabs.iter().map(|dab| Source::of(dab, times, index));
         let sources: VecDeque<Source> = sources.collect();
-        self.stroke = Some(Pending {
+        self.strokes.push(Pending {
             engine: None,
             record: None,
-            op,
+            op: StrokeOp::Begun(op),
+            remaining: None,
             dabs,
             landed,
             sources,

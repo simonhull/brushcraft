@@ -119,8 +119,8 @@ fn left_to_land(owner: &Owner<Sculpting, NoUploads>) -> usize {
     let error = owner.brush().error();
     let stroke = owner
         .brush()
-        .stroke
-        .as_ref()
+        .strokes
+        .first()
         .unwrap_or_else(|| panic!("the stroke resumed: {error:?}"));
     stroke.dabs.len()
 }

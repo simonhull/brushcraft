@@ -134,7 +134,7 @@ impl Journalling {
             .expect("after the epoch");
         self.brush.landed_at = long_ago;
         self.brush.unframed = false;
-        if let Some(stroke) = &mut self.brush.stroke {
+        if let Some(stroke) = self.brush.strokes.first_mut() {
             stroke.placed_at = long_ago;
             stroke.last.received = long_ago;
         }
@@ -147,7 +147,7 @@ impl Journalling {
 
     /// The stroke under way.
     fn stroke(&self) -> &Pending {
-        self.brush.stroke.as_ref().expect("a stroke under way")
+        self.brush.strokes.first().expect("a stroke under way")
     }
 
     /// The rows of the stroke's dabs not yet landed, in order.
@@ -176,8 +176,9 @@ impl Journalling {
     /// shown and none of it lands; a tick cuts the journal, its flush held in its tile sync until
     /// a stroke waits for its cut ([`Project::hold_recovery_syncs_until_waited`]), so it is in
     /// flight whatever polls and however the threads are scheduled; the second's `Down` to `Up`
-    /// waits for the first to land. Whatever lands the first lands it after that cut, so the
-    /// second begins waiting for the next flush's, and its wait lets the held flush go.
+    /// begins over the first, its op reserved until the first has landed. Whatever lands the
+    /// first lands it after that cut, so the second's op begins waiting for the next flush's, and
+    /// its wait lets the held flush go.
     fn second_waits(&mut self) {
         let first = self.frame(&stroke(ACROSS, 12));
         assert!(first.dabs_shown > 0, "{first:?}");
@@ -185,7 +186,11 @@ impl Journalling {
         self.ticked = self.ticked.max(Instant::now()) + FLUSH_INTERVAL * 2;
         self.project.tick(self.ticked).expect("ticked");
         self.frame(&below());
-        assert!(!self.brush.deferred.is_empty(), "the second waits to begin");
+        assert_eq!(
+            self.brush.strokes.len(),
+            2,
+            "the second began over the first"
+        );
     }
 
     /// Asserts that the second stroke began waiting for its cut and the step waited for it, that
@@ -196,7 +201,7 @@ impl Journalling {
             "the second stroke began waiting for its cut, and the step waited"
         );
         assert_eq!(self.brush.landing(), 0, "nothing left to land");
-        assert!(self.brush.stroke.is_none(), "no stroke under way");
+        assert!(self.brush.strokes.is_empty(), "no stroke under way");
         assert!(self.project.may_land(), "and none waits");
     }
 }
@@ -217,7 +222,7 @@ fn every_dab_placed_is_journalled_in_order() {
     // Three pushes' worth, each cut apart: the Down and six drags, six more, then the pen's lift.
     let first = run.frame(&samples);
     assert!(first.dabs_shown > 0, "{first:?}");
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     run.cut();
     run.frame(drags);
     run.cut();
@@ -247,7 +252,7 @@ fn the_landed_count_follows_the_finest_work() {
     let shown = run.frame(&pen_left_down());
     assert!(shown.dabs_shown > 3, "{shown:?}");
     assert_eq!(shown.dabs_applied, 0, "a frame lands none of them");
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     run.cut();
     let mut applied = 0;
     for landing in [1, 2] {
@@ -283,7 +288,7 @@ fn a_stroke_shown_ahead_is_journalled_before_any_dab_lands() {
     let (down, drags) = samples.split_at(1);
     // The op begins at the `Down`, before its first dab: the journal is open for it.
     run.frame(down);
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     // Frame after frame of a big brush: every dab shown at once, none landed.
     let mut shown = 0;
     let frames = drags.chunks(3);
@@ -309,8 +314,8 @@ fn a_stroke_shown_ahead_is_journalled_before_any_dab_lands() {
 #[test]
 fn dabs_dropped_after_an_error_are_never_replayed() {
     let (dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
-    let light = owner.brush().stroke.as_ref().expect("its pen down");
-    let op = light.op;
+    let light = owner.brush().strokes.first().expect("its pen down");
+    let op = light.op.id();
     assert!(light.dabs.is_empty(), "the light half has landed");
     // Held from landing while they are placed, shown and cut: the journal holds them unlanded.
     owner.brush_mut().landing = Landing::InSteps;
@@ -318,8 +323,8 @@ fn dabs_dropped_after_an_error_are_never_replayed() {
     run(&mut owner, 1);
     let waiting = owner
         .brush()
-        .stroke
-        .as_ref()
+        .strokes
+        .first()
         .expect("its dabs wait")
         .dabs
         .len();
@@ -407,7 +412,7 @@ fn landed_at_once_is_counted_as_applied(symmetry: Symmetry) {
     let one = run.frame(first).dabs_applied;
     assert_eq!(one, 1, "a dab at a time");
     assert!(!run.stroke().dabs.is_empty(), "some wait");
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     run.cut();
     run.brush.cost = DabCost::any_number();
     let more = run.frame(drags).dabs_applied;
@@ -490,7 +495,7 @@ fn a_stroke_shows_its_dabs_and_lands_none_until_its_cut_is_taken() {
     );
 
     let shown = run.frame(&pen_left_down());
-    let op = run.stroke().op;
+    let op = run.stroke().op.id();
     assert_ne!(op, before, "the brush's own stroke");
     assert!(
         !run.project.may_land(),

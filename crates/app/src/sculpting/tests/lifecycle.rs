@@ -59,7 +59,7 @@ fn a_lost_up_ends_the_stroke_as_a_navigation_stroke_starts() {
 }
 
 #[test]
-fn a_stroke_started_while_dabs_are_carried_begins_once_they_have_landed() {
+fn a_stroke_started_while_dabs_are_carried_begins_at_once_and_lands_after_them() {
     let dir = TestDir::new();
     // F = ∞: nothing shown ahead, every dab carried until its finest work.
     let mut owner = owner_of(
@@ -79,8 +79,8 @@ fn a_stroke_started_while_dabs_are_carried_begins_once_they_have_landed() {
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
     assert_eq!(run(&mut owner, 1), 1);
     assert!(
-        owner.brush().under_way() && !owner.brush().deferred.is_empty(),
-        "the second waits, unplaced, for the first to land: it begins on what the first left"
+        owner.brush().deferred.is_empty() && owner.brush().strokes.len() == 2,
+        "the second begins at once, on what the first will leave"
     );
     assert_eq!(
         owner.brush().last().dabs_applied,
@@ -335,7 +335,8 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting, op: OpId) -> Pending {
             camera: stroke_camera(camera, &view),
             samples: Vec::new(),
         }),
-        op,
+        op: StrokeOp::Begun(op),
+        remaining: None,
         landed: 0,
         dabs: VecDeque::from([Dab::default()]),
         sources: VecDeque::new(),
@@ -436,7 +437,7 @@ fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
         ..Dab::default()
     };
     apply_dabs(project.store(), picker.index_mut(), &mut state, &[bump]).expect("applied");
-    brush.stroke = Some(landing_stroke(&camera, &brush, op));
+    brush.strokes = vec![landing_stroke(&camera, &brush, op)];
     // A pixel past the silhouette the stroke began on, on the bump.
     let on_bump = (1..40).map(|d| edge + f64::from(d)).find(|&x| {
         let missed = pen_down_hit(&mut project, picker.index_mut(), x).is_none();
@@ -453,7 +454,7 @@ fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
     let down = sample(Phase::Down, (x, 100.0), 0.5);
     let waiting = brush.route(context(&mut project, picker.index_mut(), &camera), &down);
     assert_eq!(waiting, Route::Brush, "a Down on the fresh ridge brushes");
-    brush.stroke = None;
+    brush.strokes.clear();
     let alone = brush.route(context(&mut project, picker.index_mut(), &camera), &down);
     assert_eq!(
         alone,
