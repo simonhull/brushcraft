@@ -4298,7 +4298,6 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// As [`Project::close`]: the recovery file is kept then.
     pub(crate) fn close_for_reopen(self) -> Result<Carried<B>> {
         let pen_down = self.dialogs.pen_is_down();
-        let landing = self.landing() > 0;
         let Self {
             mut project,
             cursor,
@@ -4322,7 +4321,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ..
         } = self;
         project.store().unsubscribe_stale(cursor);
-        let keep = landing || project.has_unsaved_edits();
+        // Dabs journalled and not landed count among them.
+        let keep = project.has_unsaved_edits();
         project.close(keep).context("closing the project")?;
         Ok(Carried {
             brush,
