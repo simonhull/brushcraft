@@ -218,7 +218,54 @@ fn something_else_at_the_socket_s_name_is_never_used_or_removed() {
         Answer::NoFinisher
     );
     assert!(socket.exists(), "left alone");
-    assert!(Listener::bind(&sockets, file).is_err(), "not bound over");
+    let bound = Listener::bind(&sockets, file);
+    assert!(
+        matches!(bound, Err(socket::SocketError::Occupied(_))),
+        "{bound:?}"
+    );
+    assert_eq!(
+        std::fs::read(&socket).expect("still there"),
+        b"not a socket",
+        "not renamed over"
+    );
+    assert_eq!(staged_files(&dir), 0, "nothing left of the try");
+}
+
+/// The files the sockets' directory in `dir` holds at a staging name (`.tmp`).
+fn staged_files(dir: &TestDir) -> usize {
+    let entries = std::fs::read_dir(dir.path().join("brushcraft")).expect("listed");
+    let names = entries.map(|entry| entry.expect("an entry").file_name());
+    let staged = names.filter(|name| name.to_string_lossy().ends_with(".tmp"));
+    staged.count()
+}
+
+#[test]
+fn a_socket_has_its_name_only_once_it_listens_and_is_ours_alone() {
+    let dir = TestDir::new();
+    let (_path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let sockets = sockets_in(&dir);
+    let listener = Listener::bind(&sockets, file).expect("bound");
+    let made = std::fs::symlink_metadata(listener.path()).expect("in place");
+    assert_eq!(made.mode() & 0o777, 0o600, "{:o}", made.mode());
+    assert_eq!(staged_files(&dir), 0, "renamed into place");
+    // Connecting to it the moment it has its name works: it listened before.
+    drop(UnixStream::connect(listener.path()).expect("it listens"));
+}
+
+#[test]
+fn a_runtime_directory_too_deep_for_an_address_has_no_finisher() {
+    let dir = TestDir::new();
+    let (_path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let deep = dir.path().join("d".repeat(120));
+    let sockets = SocketDir::at(deep.join("brushcraft"));
+    assert!(Listener::bind(&sockets, file).is_err(), "no socket there");
+    let began = Instant::now();
+    assert_eq!(
+        ask_to_stop(&sockets, file, Duration::from_secs(5)),
+        Answer::NoFinisher,
+        "not a finisher that doesn't answer"
+    );
+    assert!(began.elapsed() < Duration::from_secs(1), "at once");
 }
 
 #[test]
@@ -322,14 +369,151 @@ fn a_held_project_with_no_finisher_is_busy() {
     assert!(is_locked(&path));
     let began = Instant::now();
     let way = make_way(&path, Some(&sockets_in(&dir)), Patience::DEFAULT);
-    assert!(matches!(way, Way::Busy { .. }), "{way:?}");
+    assert!(
+        matches!(
+            way,
+            Way::Busy {
+                holder: Holder::Elsewhere,
+                ..
+            }
+        ),
+        "a working channel, nobody on it: another window: {way:?}"
+    );
     assert!(
         began.elapsed() < Duration::from_secs(1),
         "nobody to wait for"
     );
-    assert!(matches!(make_way(&path, None, QUICK), Way::Busy { .. }));
+    let unreachable = make_way(&path, None, QUICK);
+    assert!(
+        matches!(
+            unreachable,
+            Way::Busy {
+                holder: Holder::Finisher,
+                ..
+            }
+        ),
+        "no channel at all: a finisher that can't be reached: {unreachable:?}"
+    );
     drop(held);
     assert!(!is_locked(&path), "the lock goes with the file");
+}
+
+#[test]
+fn a_finisher_that_doesnt_answer_holds_it_as_a_finisher() {
+    let dir = TestDir::new();
+    let (path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let sockets = sockets_in(&dir);
+    let held = File::open(&path).expect("opened");
+    held.lock().expect("locked");
+    // Bound, and never read: a finisher stuck in a long batch.
+    let stuck = Listener::bind(&sockets, file).expect("bound");
+    let way = make_way(&path, Some(&sockets), QUICK);
+    assert!(
+        matches!(
+            way,
+            Way::Busy {
+                holder: Holder::Finisher,
+                ..
+            }
+        ),
+        "{way:?}"
+    );
+    drop((stuck, held));
+}
+
+/// A finisher on a thread of its own holding `held`, listening on `listener`: once asked, it
+/// lets the lock go and says it has stopped.
+fn finisher_on_a_thread(held: File, mut listener: Listener) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let began = Instant::now();
+        while !listener.stop_asked() {
+            assert!(began.elapsed() < Duration::from_secs(30), "asked");
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(held);
+        listener.answer();
+    })
+}
+
+/// Steps `waiter` as the waiting window does until the lock, looked at when due, is free: how
+/// long that took. Bounded by `most`.
+fn waited_out(waiter: &mut Waiter, path: &Path, most: Duration) -> Duration {
+    let began = Instant::now();
+    loop {
+        let now = Instant::now();
+        if waiter.step(now) {
+            if !is_locked(path) {
+                return began.elapsed();
+            }
+            waiter.looked(now);
+        }
+        assert!(began.elapsed() < most, "it opened within {most:?}");
+        thread::sleep(
+            waiter
+                .wake(now)
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+    }
+}
+
+#[test]
+fn a_finisher_that_binds_after_the_first_ask_is_taken_over() {
+    let dir = TestDir::new();
+    let (path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let sockets = sockets_in(&dir);
+    let held = File::open(&path).expect("opened");
+    held.lock().expect("locked");
+    let Way::Busy { since, holder } = make_way(&path, Some(&sockets), QUICK) else {
+        panic!("held");
+    };
+    assert_eq!(holder, Holder::Elsewhere, "nobody listened yet");
+    let now = Instant::now();
+    let mut waiter = Waiter::new(
+        path.clone(),
+        Some(sockets.clone()),
+        QUICK,
+        (since, holder),
+        now,
+    );
+    // It binds now: the waiting window's next ask finds it.
+    let finisher = finisher_on_a_thread(held, Listener::bind(&sockets, file).expect("bound"));
+    let took = waited_out(&mut waiter, &path, Duration::from_secs(10));
+    finisher.join().expect("the finisher");
+    assert_eq!(waiter.holder(), Holder::Finisher, "found as one");
+    assert!(
+        took < ASK_AGAIN * 3,
+        "taken over at its next ask, not at the end of the landing: {took:?}"
+    );
+}
+
+#[test]
+fn a_window_that_becomes_a_finisher_while_another_waits_is_said_so() {
+    let dir = TestDir::new();
+    let (path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let sockets = sockets_in(&dir);
+    let held = File::open(&path).expect("opened");
+    held.lock().expect("locked, by a window");
+    let now = Instant::now();
+    let held_by = (now, Holder::Elsewhere);
+    let mut waiter = Waiter::new(path.clone(), Some(sockets.clone()), QUICK, held_by, now);
+    // The window's close bar Save: it binds as its window goes, and is busy landing a batch.
+    let stuck = Listener::bind(&sockets, file).expect("bound");
+    let began = Instant::now();
+    while waiter.holder() == Holder::Elsewhere {
+        let at = Instant::now();
+        if waiter.step(at) {
+            waiter.looked(at);
+        }
+        assert!(
+            began.elapsed() < ASK_AGAIN * 3 + QUICK.answer,
+            "the bar changes"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Its landing ends, and it lets go: the waiting window opens.
+    drop((stuck, held));
+    waited_out(&mut waiter, &path, Duration::from_secs(5));
 }
 
 #[test]

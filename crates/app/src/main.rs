@@ -24,7 +24,8 @@
 //! **Opening a project a finisher holds** takes over from it ([`takeover`]): before any window, the
 //! new instance asks the finisher to stop and waits for its locks ([`takeover::make_way`]), then
 //! opens the project as usual, restoring what the finisher's recovery file holds, the stroke still
-//! landing among it. The finisher listens for that between its batches ([`finish_listening`]),
+//! landing among it. The finisher listens for that between its batches ([`finish_heard`]), on a
+//! socket bound before its window goes ([`listen`]),
 //! stops, and exits with success. One that doesn't answer in 5 s, or can't be reached, leaves the
 //! window to open with the "Finishing your last session" bar, which opens the project once its
 //! locks are free ([`ProjectToOpen::open_when_free`]).
@@ -226,6 +227,9 @@ pub(crate) struct Ended {
     pub(crate) owner: Option<AppOwner>,
     /// What becomes of what isn't saved.
     pub(crate) end: End,
+    /// The takeover socket of a run that ends finishing unseen ([`End::Finish`]), bound before
+    /// the window went ([`listen`]); `None` for any other end, or if none could be bound.
+    pub(crate) listener: Option<takeover::Listener>,
 }
 
 /// A GPU's name and backend, as the overlay and the summary show it.
@@ -635,55 +639,45 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
         Way::Clear
     };
     let (done, outcome) = mpsc::channel();
+    let app = WindowApp::new(options, project, (way, sockets), done);
     let ran = EventLoop::new()
         .context("starting the event loop")?
-        .run_app(WindowApp::new(options, project, way, done))
+        .run_app(app)
         .context("running the event loop");
     let Ok(ended) = outcome.try_recv() else {
         ran?;
         bail!("the event loop ended without closing the project");
     };
     let closing = (ended.owner, ended.end);
+    // Bound as the window went: openers can ask from then on.
+    let listener = ended.listener;
     let ends = Ends {
         close: AppOwner::close,
         discard: AppOwner::discard,
-        finish: |owner: AppOwner| finish_listening(owner, sockets.as_ref(), desktop_notification),
+        finish: move |owner: AppOwner| finish_heard(owner, listener, desktop_notification),
     };
     settled(ended.run, ran, closing, ends)
 }
 
-/// Finishes `owner` unseen ([`Owner::finish_unseen_unless`]), listening for a takeover.
-///
-/// The socket is in `sockets` ([`takeover`]), listened on from before the landing until the
-/// project has closed; failures are said through `notify`.
-///
-/// With no socket (no directory, or it can't be bound) it finishes all the same: an opener then
-/// waits for the locks.
-///
-/// # Errors
-///
-/// As [`Owner::finish_unseen_unless`]. A takeover is no failure.
-fn finish_listening<B: Brush, U: Uploads>(
-    owner: Owner<B, U>,
+/// The finisher's ears: none here, as there is no takeover socket yet.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn listen(
+    path: Option<&Path>,
     sockets: Option<&SocketDir>,
-    notify: impl FnOnce(&str, &str),
-) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let listener = listen(owner.project_path(), sockets);
-        finish_heard(owner, listener, notify)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _no_socket = sockets;
-        owner.finish_unseen_unless(notify, || false).map(drop)
-    }
+) -> Option<takeover::Listener> {
+    let _no_socket = (path, sockets);
+    None
 }
 
-/// The finisher's ears: a takeover socket for the project file at `path` in `sockets`, if there
-/// is one to listen on. Why there isn't is said on stderr.
+/// The finisher's ears: a takeover socket for the project file at `path` in `sockets`.
+///
+/// `None` if there is none to listen on, said on stderr. Bound as the window goes, before the
+/// landing ([`crate::window`]), so an opener never finds a finisher that can't hear it.
 #[cfg(target_os = "linux")]
-fn listen(path: Option<&Path>, sockets: Option<&SocketDir>) -> Option<takeover::Listener> {
+pub(crate) fn listen(
+    path: Option<&Path>,
+    sockets: Option<&SocketDir>,
+) -> Option<takeover::Listener> {
     let (path, sockets) = (path?, sockets?);
     let bound = takeover::FileIdentity::of(path)
         .map_err(anyhow::Error::new)
@@ -698,16 +692,17 @@ fn listen(path: Option<&Path>, sockets: Option<&SocketDir>) -> Option<takeover::
     }
 }
 
-/// Finishes `owner` unseen, stopping once `listener` hears it asked to.
+/// Finishes `owner` unseen ([`Owner::finish_unseen_unless`]), stopping once `listener` hears it
+/// asked to; failures are said through `notify`.
 ///
 /// Then it answers everyone who asked, the project closed by then, its locks free
 /// ([`takeover::Listener::answer`]). A stop that couldn't make its flush durable is said on
-/// stderr: the recovery file holds its last durable save point, which the opener restores.
+/// stderr: the recovery file holds its last durable save point, which the opener restores. With
+/// no listener (no socket could be bound) it finishes all the same: an opener then waits.
 ///
 /// # Errors
 ///
-/// As [`Owner::finish_unseen_unless`].
-#[cfg(target_os = "linux")]
+/// As [`Owner::finish_unseen_unless`]. A takeover is no failure.
 fn finish_heard<B: Brush, U: Uploads>(
     owner: Owner<B, U>,
     mut listener: Option<takeover::Listener>,
@@ -2170,7 +2165,7 @@ mod tests {
         use ui::Blend;
 
         use crate::dialogs::Dialogs;
-        use crate::takeover::{FileIdentity, Listener, Patience, SocketDir, Way};
+        use crate::takeover::{FileIdentity, Holder, Listener, Patience, SocketDir, Way};
 
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
@@ -2189,7 +2184,10 @@ mod tests {
             release: Duration::from_millis(200),
         };
         let asked = Instant::now();
-        let Way::Busy { since } = takeover::make_way(&opening.path, Some(&sockets), patience)
+        let Way::Busy {
+            since,
+            holder: Holder::Finisher,
+        } = takeover::make_way(&opening.path, Some(&sockets), patience)
         else {
             panic!("nobody let go");
         };

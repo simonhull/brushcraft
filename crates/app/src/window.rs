@@ -23,9 +23,9 @@
 //! finishing unseen, and didn't let go of when asked ([`crate::takeover`]), can't open yet. The
 //! window opens all the same, with its pen and render thread, and draws one thing: the "Finishing
 //! your last session" bar, saying how long it has waited, in frames of the UI alone (no scene, no
-//! frame loop: there is no project). Every [`LOCK_POLL`] it looks at the project's lock, and
-//! once it is free it opens the project and starts the frame loop, the render thread settled
-//! first, as a reopen does. Closing the window meanwhile ends the run with nothing opened.
+//! frame loop: there is no project). Every [`crate::takeover::LOCK_POLL`] it looks at the project's
+//! lock, and once it is free it opens the project and starts the frame loop, the render thread
+//! settled first, as a reopen does. Closing the window meanwhile ends the run with nothing opened.
 //!
 //! **Closing** ends the run with what becomes of the unsaved work ([`End`]): kept, dropped (Don't
 //! save), or finished unseen. The last is the close bar's Save while dabs still land: once the
@@ -73,10 +73,10 @@ use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{FrameRequest, Hooks, RenderThread};
 use crate::saving::SaveStep;
-use crate::takeover::{LOCK_POLL, Way};
+use crate::takeover::{Holder, Listener, Patience, SocketDir, Waiter, Way};
 use crate::{
     AppOwner, End, Ended, OpenNote, ProjectToOpen, Summary, describe_adapter, held_elsewhere,
-    said_too, start, swap,
+    listen, said_too, start, swap,
 };
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
@@ -139,14 +139,28 @@ struct Waiting {
     shell: Shell,
     /// The bar, and what draws it.
     dialogs: Dialogs,
-    /// When the project was first found held.
-    since: Instant,
-    /// When to look at the lock next.
-    next_look: Instant,
+    /// When to look at the lock and ask the holder again, and who holds it.
+    waiter: Waiter,
+    /// The project's name, as the bar says it.
+    name: String,
     /// Whether a frame is with the render thread: one at a time.
     drawing: bool,
     /// Whether the window asked to be drawn again (exposed, resized, rescaled).
     stale: bool,
+}
+
+impl Waiting {
+    /// Brings the bar up to date at `now`, as who holds the project says: a finisher's with the
+    /// time waited, another window's with the project's name.
+    fn say(&mut self, now: Instant) {
+        match self.waiter.holder() {
+            Holder::Finisher => {
+                let waited = now.saturating_duration_since(self.waiter.since());
+                self.dialogs.last_session(waited, now);
+            }
+            Holder::Elsewhere => self.dialogs.open_elsewhere(&self.name, now),
+        }
+    }
 }
 
 /// winit's application: opens the window when it can, runs the frame loop, and reports how
@@ -164,6 +178,12 @@ pub(crate) struct WindowApp {
     waiting: Option<Waiting>,
     /// What clearing the way to the project found, before the window ([`crate::takeover`]).
     way: Way,
+    /// Where finishers listen: the waiting window asks there, and a run that ends finishing
+    /// listens there.
+    sockets: Option<SocketDir>,
+    /// The takeover socket, bound as the close bar's Save lets the window go, for the finisher
+    /// after it ([`Ended::listener`]).
+    listener: Option<Listener>,
     /// Where the run's outcome goes when the loop exits.
     /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
     /// run finishes once, whatever events follow.
@@ -179,11 +199,12 @@ pub(crate) struct WindowApp {
 
 impl WindowApp {
     /// An app that opens `project` in a window as `options` say, reporting to `done`; `way` is
-    /// what clearing the way to it found ([`crate::takeover::make_way`]).
-    pub(crate) const fn new(
+    /// what clearing the way to it found ([`crate::takeover::make_way`]), and `sockets` where
+    /// finishers listen.
+    pub(crate) fn new(
         options: Options,
         project: ProjectToOpen,
-        way: Way,
+        (way, sockets): (Way, Option<SocketDir>),
         done: Sender<Ended>,
     ) -> Self {
         Self {
@@ -192,6 +213,8 @@ impl WindowApp {
             running: None,
             waiting: None,
             way,
+            sockets,
+            listener: None,
             done: Some(done),
             wakeup: 0,
             pen_samples: Vec::new(),
@@ -211,15 +234,21 @@ impl WindowApp {
                 return;
             }
         };
-        if let Way::Busy { since } = self.way {
-            self.wait(shell, since, event_loop);
+        if let Way::Busy { since, holder } = self.way {
+            self.wait(shell, (since, holder), event_loop);
             return;
         }
         let opening = Instant::now();
         match self.project.clone().open_as(&self.options) {
             Ok(opened) => self.begin(shell, opened, opening, event_loop),
             Err(error) if self.options.restores() && held_elsewhere(&error) => {
-                self.wait(shell, Instant::now(), event_loop);
+                // Held again since the way was cleared: by a finisher only if one let it go.
+                let holder = if self.way == Way::TookOver {
+                    Holder::Finisher
+                } else {
+                    Holder::Elsewhere
+                };
+                self.wait(shell, (Instant::now(), holder), event_loop);
             }
             Err(error) => {
                 event_loop.exit();
@@ -330,22 +359,26 @@ impl WindowApp {
         })
     }
 
-    /// The window waits for the project, held since `since` by the session before, with the bar
-    /// saying so ([`Waiting`]).
-    fn wait(&mut self, shell: Shell, since: Instant, event_loop: &dyn ActiveEventLoop) {
+    /// The window waits for the project, held by `holder` since `since`, with the bar saying so
+    /// ([`Waiting`]).
+    fn wait(&mut self, shell: Shell, held: (Instant, Holder), event_loop: &dyn ActiveEventLoop) {
         let now = Instant::now();
         let size = frame_size(shell.window.surface_size());
-        let mut dialogs =
-            Dialogs::new(size, shell.window.scale_factor(), shell.render.blend(), now);
-        dialogs.last_session(now.saturating_duration_since(since), now);
-        self.waiting = Some(Waiting {
+        let dialogs = Dialogs::new(size, shell.window.scale_factor(), shell.render.blend(), now);
+        let path = self.project.path().to_owned();
+        let name = path.file_stem().unwrap_or_default();
+        let name = name.to_string_lossy().into_owned();
+        let waiter = Waiter::new(path, self.sockets.clone(), Patience::DEFAULT, held, now);
+        let mut waiting = Waiting {
             shell,
             dialogs,
-            since,
-            next_look: now + LOCK_POLL,
+            waiter,
+            name,
             drawing: false,
             stale: true,
-        });
+        };
+        waiting.say(now);
+        self.waiting = Some(waiting);
         event_loop.set_control_flow(ControlFlow::Poll);
     }
 
@@ -359,11 +392,10 @@ impl WindowApp {
         waiting.shell.pen.drain(&mut self.pen_samples);
         self.pen_samples.clear();
         let now = Instant::now();
-        if now >= waiting.next_look {
-            waiting.next_look = now + LOCK_POLL;
+        if waiting.waiter.step(now) {
             let opening = Instant::now();
             match self.project.open_when_free(&self.options) {
-                Ok(None) => {}
+                Ok(None) => waiting.waiter.looked(Instant::now()),
                 Ok(Some(opened)) => {
                     let Some(Waiting { mut shell, .. }) = self.waiting.take() else {
                         return;
@@ -389,9 +421,7 @@ impl WindowApp {
                 }
             }
         }
-        waiting
-            .dialogs
-            .last_session(now.saturating_duration_since(waiting.since), now);
+        waiting.say(now);
         let wants = waiting.stale || waiting.dialogs.needs_frame(now);
         if wants && !waiting.drawing {
             let size = frame_size(waiting.shell.window.surface_size());
@@ -410,13 +440,13 @@ impl WindowApp {
             }
             waiting.stale = false;
         }
-        let waited = now.saturating_duration_since(waiting.since);
-        let next_second = now + Duration::from_secs(1).saturating_sub(subsec(waited));
         let wake = if waiting.dialogs.needs_frame(now) {
             // The bar's fade: its frames as the render thread finishes each.
             now + GPU_POLL
         } else {
-            waiting.next_look.min(next_second)
+            let waited = now.saturating_duration_since(waiting.waiter.since());
+            let next_second = now + Duration::from_secs(1).saturating_sub(subsec(waited));
+            waiting.waiter.wake(now).min(next_second)
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
@@ -459,6 +489,7 @@ impl WindowApp {
             run: said_too(said_too(result, stopped), pen_stopped).map(|()| summary),
             owner: None,
             end: self.end,
+            listener: None,
         }));
     }
 
@@ -739,12 +770,14 @@ impl WindowApp {
                     run: said_too(said_too(result, stopped), pen_stopped).map(|()| summary),
                     owner: Some(owner),
                     end: self.end,
+                    listener: self.listener.take(),
                 }
             }
             None => Ended {
                 run: result.and_then(|()| Err(anyhow!("the window never opened"))),
                 owner: None,
                 end: self.end,
+                listener: None,
             },
         };
         // `main` holds the receiver until the loop returns, so the send can't fail.
@@ -773,6 +806,7 @@ impl WindowApp {
             run: said_too(said_too(failed, stopped), pen_stopped),
             owner: None,
             end: self.end,
+            listener: None,
         }));
     }
 
@@ -1167,9 +1201,11 @@ impl ApplicationHandler for WindowApp {
                 self.end = End::Discard;
                 self.finish(event_loop, Ok(()));
             }
-            // The journal is durable: the window goes now, and the rest finishes unseen.
+            // The journal is durable: the window goes now, and the rest finishes unseen, its
+            // takeover socket bound first, so an opener from now on is heard.
             Some(WindowRequest::Finish) => {
                 self.end = End::Finish;
+                self.listener = listen(running.owner.project_path(), self.sockets.as_ref());
                 self.finish(event_loop, Ok(()));
             }
             Some(WindowRequest::Reopen(reopen)) => self.reopen(event_loop, reopen),

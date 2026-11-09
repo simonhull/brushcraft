@@ -12,7 +12,7 @@ use super::*;
 use crate::frame::{CloseAnswer, Finished, UiKey, WindowRequest};
 use crate::saving::SaveStep;
 use crate::sculpting::tests::saving::{backlogged_in, finish_save, path_in, recovery_files};
-use crate::takeover::{Patience, SocketDir, Way};
+use crate::takeover::{Listener, Patience, SocketDir, Way};
 use crate::{ProjectToOpen, held_elsewhere};
 
 /// Passes of the stroke to and fro: a backlog of more than 4,000 dabs.
@@ -33,8 +33,15 @@ const SOCKETS: &str = "BRUSHCRAFT_TAKEOVER_SOCKETS";
 /// The child test's full path, as libtest names it.
 const CHILD_TEST: &str = "sculpting::tests::journal::takeover::finishing_child";
 
-/// The line the child prints once it listens, as its landing begins.
-const LISTENING: &str = "brushcraft takeover child: listening";
+/// The line the child prints once it listens, as its landing begins, its backlog after it.
+const LISTENING: &str = "brushcraft takeover child: listening, backlog";
+
+/// The line the child prints as it lands, the batches it has landed after it: a dab each.
+const LANDED: &str = "brushcraft takeover child: landed";
+
+/// How many batches the child lands before the parent asks it to stop: well into the landing,
+/// and far from its end.
+const LANDED_BEFORE_ASKING: usize = 40;
 
 /// How long the parent waits for the child to get there, or to end.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -155,9 +162,10 @@ fn the_new_window_restores_what_the_finisher_left() {
 
 /// The child: a finisher of its own, until it is asked to stop.
 ///
-/// It builds the backlog in the parent's directory, Saves on the close bar, listens in
-/// [`SOCKETS`], prints [`LISTENING`], and finishes unseen as the app does
-/// ([`crate::finish_heard`]). Without its variables it does nothing.
+/// It builds the backlog in the parent's directory, Saves on the close bar, binds its socket in
+/// [`SOCKETS`] as the app does when its window goes ([`crate::listen`]), prints [`LISTENING`],
+/// and finishes unseen as [`crate::finish_heard`] does, saying how many batches it has landed
+/// ([`LANDED`]) as it goes. Without its variables it does nothing.
 #[test]
 #[ignore = "reopening_while_finishing_takes_over_and_loses_nothing runs it as its child"]
 fn finishing_child() {
@@ -168,18 +176,55 @@ fn finishing_child() {
     let (dir, mut owner) = backlogged_in(TestDir::adopt(dir.into()), PASSES, Instant::now());
     // The parent's directory: it stays when the child is done.
     let _parents = ManuallyDrop::new(dir);
+    let backlog = owner.landing();
     saved_to_finish(&mut owner);
     let sockets = SocketDir::at(sockets.into());
-    let listener = crate::listen(owner.project_path(), Some(&sockets));
+    let mut listener = crate::listen(owner.project_path(), Some(&sockets));
     assert!(listener.is_some(), "it listens");
-    println!("{LISTENING}");
-    crate::finish_heard(owner, listener, |summary, body| panic!("{summary}: {body}"))
-        .expect("stopped, which is no failure");
+    println!("{LISTENING} {backlog}");
+    let mut looks = 0_usize;
+    let finished = owner.finish_unseen_unless(
+        |summary, body| panic!("{summary}: {body}"),
+        || {
+            // A look before each batch: those before it have landed.
+            println!("{LANDED} {looks}");
+            looks += 1;
+            listener.as_mut().is_some_and(Listener::stop_asked)
+        },
+    );
+    if let Some(listener) = listener {
+        listener.answer();
+    }
+    assert_eq!(
+        finished.expect("stopped, which is no failure"),
+        Finished::Stopped { flushed: true }
+    );
+}
+
+/// What the child says, as the parent hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    /// It listens, with this many dabs to land.
+    Listening(usize),
+    /// It has landed this many batches.
+    Landed(usize),
+}
+
+/// What `line` of the child's output says, if anything: a [`LISTENING`] or [`LANDED`] line,
+/// perhaps after libtest's `test <name> ... ` on the same line.
+fn heard(line: &str) -> Option<Said> {
+    let number = |marker: &str| {
+        let (_, after) = line.split_once(marker)?;
+        after.trim().parse().ok()
+    };
+    number(LISTENING)
+        .map(Said::Listening)
+        .or_else(|| number(LANDED).map(Said::Landed))
 }
 
 /// The finishing child, running in `dir` with its socket in `sockets`, its output read on
-/// threads of its own; returns it once it is [`LISTENING`].
-fn finishing(dir: &TestDir, sockets: &std::path::Path) -> Child {
+/// threads of its own; returns it once it is [`LISTENING`], with its backlog.
+fn finishing(dir: &TestDir, sockets: &std::path::Path) -> (Child, usize) {
     use std::io::{BufRead as _, BufReader};
     use std::process::{Command, Stdio};
     let mut child = Command::new(std::env::current_exe().expect("the test binary"))
@@ -199,19 +244,19 @@ fn finishing(dir: &TestDir, sockets: &std::path::Path) -> Child {
         drop(std::io::Read::read_to_string(&mut stderr, &mut text));
         text
     });
-    let (ready, listening) = std::sync::mpsc::channel();
+    let (says, said) = std::sync::mpsc::channel();
     let output = std::thread::spawn(move || {
         let lines = BufReader::new(stdout).lines();
         let mut text = String::new();
         let read = lines.map_while(Result::ok);
         for line in read {
-            // After libtest's `test <name> ... `, on the same line.
-            if line.ends_with(LISTENING) {
-                // The parent may have stopped waiting: then nothing listens.
-                ready.send(()).unwrap_or_default();
+            if let Some(heard) = heard(&line) {
+                // The parent may have stopped listening: then nobody hears.
+                says.send(heard).unwrap_or_default();
+            } else {
+                text.push_str(&line);
+                text.push('\n');
             }
-            text.push_str(&line);
-            text.push('\n');
         }
         text
     });
@@ -219,12 +264,13 @@ fn finishing(dir: &TestDir, sockets: &std::path::Path) -> Child {
         process: child,
         output: Some(output),
         errors: Some(errors),
+        said,
     };
-    if listening.recv_timeout(CHILD_TIMEOUT).is_err() {
-        let said = child.end();
-        panic!("the child never listened:\n{said}");
-    }
-    child
+    let Some(Said::Listening(backlog)) = child.next(|_| true) else {
+        let words = child.end();
+        panic!("the child never listened:\n{words}");
+    };
+    (child, backlog)
 }
 
 /// A finishing child, and what it says.
@@ -235,9 +281,24 @@ struct Child {
     output: Option<std::thread::JoinHandle<String>>,
     /// The thread reading its errors, which returns them.
     errors: Option<std::thread::JoinHandle<String>>,
+    /// What it says, as heard.
+    said: std::sync::mpsc::Receiver<Said>,
 }
 
 impl Child {
+    /// The next thing the child says that `wanted` takes, within [`CHILD_TIMEOUT`]; `None` if it
+    /// says nothing of the sort in time.
+    fn next(&self, wanted: impl Fn(Said) -> bool) -> Option<Said> {
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let said = self.said.recv_timeout(left).ok()?;
+            if wanted(said) {
+                return Some(said);
+            }
+        }
+    }
+
     /// Waits for the child to end, killing it after [`CHILD_TIMEOUT`]: what it said, and whether
     /// it succeeded.
     fn wait(&mut self) -> (bool, String) {
@@ -283,9 +344,13 @@ fn reopening_while_finishing_takes_over_and_loses_nothing() {
     let dir = TestDir::new();
     let sockets = TestDir::new();
     let socket_dir = sockets.path().join("brushcraft");
-    let mut child = finishing(&dir, &socket_dir);
-    // Well into the landing.
-    std::thread::sleep(Duration::from_millis(300));
+    let (mut child, backlog) = finishing(&dir, &socket_dir);
+    assert!(backlog >= 4_000, "{backlog} dabs to land");
+    let into = |said| matches!(said, Said::Landed(batches) if batches >= LANDED_BEFORE_ASKING);
+    if child.next(into).is_none() {
+        let said = child.end();
+        panic!("the child never got into its landing:\n{said}");
+    }
     let project = path_in(&dir);
     let held = to_open(&dir).open().expect_err("the finisher holds it");
     assert!(held_elsewhere(&held), "{held:#}");
@@ -305,7 +370,10 @@ fn reopening_while_finishing_takes_over_and_loses_nothing() {
         "takeover: the finisher stopped {stopped:?} after the ask; sculpting {sculpting:?} after \
          it, {left} dabs left to land"
     );
-    assert!(left > 0, "it took over mid-landing");
+    assert!(
+        0 < left && left < backlog,
+        "it took over mid-landing: {left} of {backlog} left"
+    );
     assert!(
         sculpting < Duration::from_secs(5),
         "sculpting soon after asking: {sculpting:?}"

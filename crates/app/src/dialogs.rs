@@ -211,6 +211,12 @@ enum Prompt {
         /// The whole seconds waited so far.
         seconds: u64,
     },
+    /// "`name` is open elsewhere": another window holds the project, and the window waits for
+    /// it to close ([`crate::takeover`]).
+    OpenElsewhere {
+        /// The project's name.
+        name: String,
+    },
 }
 
 impl Prompt {
@@ -301,6 +307,10 @@ impl Prompt {
                 let waited =
                     format!("Your project opens once it's done. {minutes}:{seconds:02} so far.");
                 Some(Bar::new("Finishing your last session", Vec::new()).with_detail(waited))
+            }
+            Self::OpenElsewhere { name } => {
+                let bar = Bar::new(format!("{name} is open elsewhere"), Vec::new());
+                Some(bar.with_detail("It opens here once that closes."))
             }
         }
     }
@@ -604,7 +614,8 @@ impl Dialogs {
             | Prompt::Copying
             | Prompt::Failed(_)
             | Prompt::Stopped(_)
-            | Prompt::LastSession { .. } => None,
+            | Prompt::LastSession { .. }
+            | Prompt::OpenElsewhere { .. } => None,
         }
     }
 
@@ -647,6 +658,18 @@ impl Dialogs {
     pub(crate) fn last_session(&mut self, waited: Duration, now: Instant) {
         let prompt = Prompt::LastSession {
             seconds: waited.as_secs(),
+        };
+        if self.prompt != prompt {
+            self.prompt = prompt;
+            self.ui.set_bar(self.prompt.bar(), now);
+        }
+    }
+
+    /// Says the window is waiting for another window to close the project `name`, at `now`
+    /// ([`crate::takeover`]): the window's only bar until the project opens.
+    pub(crate) fn open_elsewhere(&mut self, name: &str, now: Instant) {
+        let prompt = Prompt::OpenElsewhere {
+            name: name.to_owned(),
         };
         if self.prompt != prompt {
             self.prompt = prompt;
@@ -1854,6 +1877,45 @@ mod tests {
             ["Your project opens once it's done. 1:15 so far."]
         );
         assert!(dialogs.needs_frame(seen), "a new second is drawn");
+    }
+
+    #[test]
+    fn a_project_open_elsewhere_says_so_and_counts_nothing() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.open_elsewhere("first-sculpt", now);
+        let bar = dialogs.bar().expect("a bar");
+        assert_eq!(bar.title(), "first-sculpt is open elsewhere");
+        assert_eq!(bar.details(), ["It opens here once that closes."]);
+        assert!(bar.controls().is_empty(), "nothing to answer");
+        let seen = now + Theme::GLASS.fade * 2;
+        drop(dialogs.frame(seen));
+        dialogs.open_elsewhere("first-sculpt", seen + Duration::from_secs(5));
+        assert!(!dialogs.needs_frame(seen), "no counter: nothing changes");
+        // A finisher found meanwhile: the bar says so instead.
+        dialogs.last_session(Duration::from_secs(3), seen);
+        let finishing = dialogs.bar().expect("a bar");
+        assert_eq!(finishing.title(), "Finishing your last session");
+        assert!(dialogs.needs_frame(seen), "drawn");
+    }
+
+    #[test]
+    fn the_open_elsewhere_bar_fits_the_smallest_window() {
+        let now = Instant::now();
+        let (width, height) = Theme::GLASS.window_min;
+        let mut dialogs = Dialogs::new(Size::new(width, height), 1.0, Blend::Display, now);
+        dialogs.open_elsewhere("a project with a name as long as anyone", now);
+        let frame = dialogs.frame(now).expect("it draws");
+        let bar = dialogs.bar().expect("a bar");
+        let details = bar.details().iter().map(String::as_str);
+        let said = std::iter::once(bar.title()).chain(details);
+        let letters = said.flat_map(str::chars);
+        let letters = letters.filter(|letter| !letter.is_whitespace());
+        assert_eq!(
+            frame.list.glyphs.len(),
+            letters.count(),
+            "every letter draws"
+        );
     }
 
     #[test]
