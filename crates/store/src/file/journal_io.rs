@@ -11,7 +11,7 @@ use std::os::unix::fs::FileExt;
 use super::error::FileError;
 use super::lock::Access;
 use super::{Loc, ProjectFile};
-use crate::journal::{DabBatch, MAX_JOURNAL_PAYLOAD};
+use crate::journal::{BatchHead, DabBatch, MAX_JOURNAL_PAYLOAD};
 use crate::record::{HEAD, Head, KIND_JOURNAL, TAIL, frame, verify};
 
 /// The longest framed batch: framing around the longest payload a writer makes.
@@ -126,6 +126,24 @@ impl ProjectFile {
         let raw = self.reader().read_record(loc)?;
         match verify(&raw) {
             Some((KIND_JOURNAL, payload)) => DabBatch::decode(payload).ok(),
+            _ => None,
+        }
+        .ok_or(FileError::Damaged { offset: loc.offset })
+    }
+
+    /// The fixed fields of the batch at `loc` (one of [`ProjectFile::batch_locations`]): its
+    /// whole record read and its checksum checked, as [`ProjectFile::read_batch`] does, but its
+    /// dabs never decompressed ([`DabBatch::decode_head`]). For a restore, which looks over every
+    /// batch to find the strokes left open.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::read_batch`].
+    pub(crate) fn read_batch_head(&self, loc: Loc) -> Result<BatchHead, FileError> {
+        count_batch_read();
+        let raw = self.reader().read_record(loc)?;
+        match verify(&raw) {
+            Some((KIND_JOURNAL, payload)) => DabBatch::decode_head(payload).ok(),
             _ => None,
         }
         .ok_or(FileError::Damaged { offset: loc.offset })

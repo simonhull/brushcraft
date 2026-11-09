@@ -11,7 +11,7 @@ use crate::tiles::PenDownPoint;
 
 /// Fails the writer's next sync and drives the flushes until the project has rolled over onto a
 /// fresh recovery file. Returns the fresh file's save points.
-fn fail_and_roll_over(project: &mut Project) -> Vec<u64> {
+pub(super) fn fail_and_roll_over(project: &mut Project) -> Vec<u64> {
     let old = project.recovery_path().unwrap().to_path_buf();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     project.finish_flushes().unwrap();
@@ -21,7 +21,7 @@ fn fail_and_roll_over(project: &mut Project) -> Vec<u64> {
 
 /// Crashes `project` where it is: its writer is let go with nothing more flushed, and the
 /// project dropped with its recovery file as the last durable save point left it.
-fn crash_now(mut project: Project) {
+pub(super) fn crash_now(mut project: Project) {
     project.writer.take().unwrap().abandon(&mut project.store);
     drop(project);
 }
@@ -74,7 +74,7 @@ fn assert_resumes_as_live(
 /// A stroke of 300 dabs is flushed first, so the next stroke's tiles have records at its
 /// pen-down; the stroke of 30, begun with `seed`, is placed whole, 6 landed and flushed, then 3
 /// more landed.
-fn landing_with_shapes(
+pub(super) fn landing_with_shapes(
     dir: &TestDir,
     map: &mut CorrectionMap,
     seed: u64,

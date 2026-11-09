@@ -41,6 +41,7 @@
 //! without evaluating a tile. Then it saves the restored project and checks the project file
 //! holds them too.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
@@ -951,4 +952,227 @@ fn assert_restores_and_lands_the_rest(variant: &str, runs: u32, after: &str) {
         );
         project.close(false).unwrap();
     }
+}
+
+/// The variable that makes the test binary the chain crash test's child.
+const CHAIN: &str = "BRUSHCRAFT_CRASH_CHAIN";
+
+/// The chain crash test's child, by its full path.
+const CHAIN_CHILD_TEST: &str = "project::tests::crash::chain_child";
+
+/// The dabs each stroke of the chain child places.
+const CHAIN_DABS: u32 = 48;
+
+/// The dabs the chain child's writing stroke lands a step: slower than its strokes place, so
+/// strokes begin behind it while it lands.
+const CHAIN_LAND_EACH: u32 = 3;
+
+/// The most strokes the chain child keeps open at once: past it, the next waits.
+const CHAIN_OPEN: usize = 3;
+
+/// The most steps the chain child takes: once there, it waits for the kill.
+const CHAIN_STEPS: u32 = 100_000;
+
+/// The seed of the chain child's first stroke's edits; each stroke's is the next.
+const CHAIN_SEED: u64 = 6_000;
+
+/// The edits standing for the work of stroke `stroke` of the chain child, one a dab.
+fn chain_edits(mesh: &BaseMesh, stroke: u64) -> Vec<crate::fixture::Edit> {
+    random_edits(mesh, TOP, CHAIN_DABS, CHAIN_SEED + stroke)
+}
+
+/// A stroke of the chain child: the writing one (no token), or one begun behind it.
+struct ChainStroke {
+    /// Its op's token while the op is reserved; `None` once it has begun.
+    reserved: Option<crate::tiles::ReservedOp>,
+    /// The edit of each dab, by index.
+    edits: Vec<crate::fixture::Edit>,
+    /// The dabs placed.
+    placed: u32,
+    /// The dabs landed.
+    landed: u32,
+}
+
+/// The chain crash test's child: strokes one after another, each begun as soon as the last has
+/// placed its dabs, behind those still landing, until it is killed.
+///
+/// Each step, the newest stroke places [`PLACE_EACH`] dabs (or, once it has placed
+/// [`CHAIN_DABS`], a stroke begins behind it, up to [`CHAIN_OPEN`] open), the writing stroke
+/// lands [`CHAIN_LAND_EACH`] once it may, each tile's pen-down shape kept before its first edit,
+/// and a stroke whose every dab has landed ends, the next one's op beginning. A clock running a
+/// flush interval a step makes every tick due. It prints [`READY`] once a flush is durable with
+/// two strokes open, and goes on until [`CHAIN_STEPS`]; then it waits for the kill. Does nothing
+/// unless [`CHAIN`] is set.
+#[test]
+#[ignore = "the chain crash test's child: the test runs it in a process of its own"]
+fn chain_child() {
+    let Some(dir) = std::env::var_os(DIR).filter(|_| std::env::var_os(CHAIN).is_some()) else {
+        return;
+    };
+    let config = ProjectConfig {
+        store: roomy(),
+        recovery_dir: PathBuf::from(dir).join("recovery"),
+    };
+    let mut project = Project::new((*mesh()).clone(), config).unwrap();
+    project.set_dab_format(JOURNAL_FORMAT);
+    let mesh = project.store().working().mesh();
+    let start = Instant::now();
+    let mut open: VecDeque<ChainStroke> = VecDeque::new();
+    let mut strokes = 0;
+    let mut ready = false;
+    for step in 0..CHAIN_STEPS {
+        let placing = open.back_mut().filter(|newest| newest.placed < CHAIN_DABS);
+        if let Some(newest) = placing {
+            let next = newest.placed + PLACE_EACH;
+            let dabs: Vec<[u8; DAB_BYTES]> = (newest.placed..next).map(dab_at).collect();
+            match &newest.reserved {
+                Some(reserved) => project.journal_placed_after(reserved, &dabs).unwrap(),
+                None => project.journal_placed(&dabs).unwrap(),
+            }
+            newest.placed = next;
+        } else if open.len() < CHAIN_OPEN {
+            let reserved = if open.is_empty() {
+                project.begin_stroke().unwrap();
+                None
+            } else {
+                Some(project.begin_stroke_after().unwrap())
+            };
+            open.push_back(ChainStroke {
+                reserved,
+                edits: chain_edits(&mesh, strokes),
+                placed: 0,
+                landed: 0,
+            });
+            strokes += 1;
+        }
+        let may_land = project.may_land();
+        let writing = open
+            .front_mut()
+            .filter(|front| front.reserved.is_none() && may_land);
+        if let Some(front) = writing {
+            let target = (front.landed + CHAIN_LAND_EACH).min(front.placed);
+            let landing = &front.edits[front.landed as usize..target as usize];
+            let changed: Vec<TileKey> = landing.iter().flat_map(|edit| edit.keys(&mesh)).collect();
+            project.store().keep_pen_down(&changed).unwrap();
+            apply_dabs(project.store(), &mut CorrectionMap::new(), landing);
+            project.journal_landed(target).unwrap();
+            front.landed = target;
+            if target == CHAIN_DABS {
+                project.end_unrecorded_stroke().unwrap();
+                open.pop_front();
+                if let Some(next) = open.front_mut().and_then(|next| next.reserved.take()) {
+                    let begun = project.begin_reserved_stroke(next);
+                    begun.map_err(|refused| refused.into_parts().1).unwrap();
+                }
+            }
+        }
+        project.tick(start + FLUSH_INTERVAL * (step + 1)).unwrap();
+        let flushed = project.writer.as_ref().unwrap().flushes() > 0;
+        if !ready && flushed && open.len() >= 2 {
+            ready = true;
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{READY}").unwrap();
+            stdout.flush().unwrap();
+        }
+    }
+    wait_for_the_kill();
+}
+
+/// The chain crash test's runs: kills at as many moments.
+const CHAIN_RUNS: u32 = 12;
+
+/// The longest the chain crash test waits, once the child has had a durable save point with two
+/// strokes open, to kill it.
+const CHAIN_KILL_WITHIN: Duration = Duration::from_millis(300);
+
+/// A restore after a kill with strokes open in a chain lands each in op order, exactly.
+///
+/// Killed at random moments while strokes begin behind the one landing, a restore offers every
+/// stroke open, in op order, each usable; resuming and landing each in turn, the next once the one
+/// before has ended, gives the tiles of every dab placed by the last save point, of every stroke,
+/// in op order. The fixture's dabs set a vertex's correction outright, so the store's part is
+/// proven exact; the app's landing of each resumed stroke is within the dab journal's half
+/// quantization step (see `crate::project::resume`).
+#[test]
+fn a_kill_with_strokes_open_in_a_chain_restores_and_lands_every_dab_placed() {
+    let mesh = mesh();
+    let mut chains = 0;
+    for run in 0..CHAIN_RUNS {
+        let dir = TestDir::new();
+        let delay = random_delay(CHAIN_KILL_WITHIN);
+        let what = format!("run {run}, killed {delay:?} after two strokes were open");
+        run_and_kill(CHAIN_CHILD_TEST, (CHAIN, "1"), &dir, delay, &what);
+        let candidate = find_recoveries(&dir.path("recovery"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut project = Project::restore(&candidate, config(&dir)).unwrap();
+        // Every stroke's dabs placed by the last save point, by its op: the ops are the strokes'
+        // in order, the first the first stroke's.
+        let batches: Vec<DabBatch> = project
+            .store()
+            .working()
+            .batches()
+            .map(Result::unwrap)
+            .collect();
+        let first = batches.iter().map(DabBatch::op).min().unwrap();
+        let mut placed: BTreeMap<u64, u32> = BTreeMap::new();
+        for batch in &batches {
+            let stroke = batch.op().seq() - first.seq();
+            let most = placed.entry(stroke).or_default();
+            *most = (*most).max(batch.placed());
+        }
+        let found = project.take_open_strokes();
+        if found.len() >= 2 {
+            chains += 1;
+        }
+        let ops: Vec<OpId> = found
+            .iter()
+            .map(|open| open.as_ref().unwrap_or_else(|e| panic!("{what}: {e}")).op())
+            .collect();
+        assert!(ops.is_sorted(), "{what}: in op order: {ops:?}");
+        for open in found {
+            let open = open.unwrap();
+            let stroke = open.op().seq() - first.seq();
+            let edits = chain_edits(&mesh, stroke);
+            let (landed, rest) = (open.landed(), u32::try_from(open.dabs().len()).unwrap());
+            let placed_by = landed + rest;
+            let journalled: Vec<[u8; DAB_BYTES]> = (landed..placed_by).map(dab_at).collect();
+            assert_eq!(
+                open.dabs(),
+                journalled,
+                "{what}: stroke {stroke}'s dabs not landed"
+            );
+            project.resume_stroke(open).unwrap();
+            project.wait_to_land().unwrap();
+            let mut done = landed;
+            while done < placed_by {
+                let next = (done + CHAIN_LAND_EACH).min(placed_by);
+                apply_dabs(
+                    project.store(),
+                    &mut CorrectionMap::new(),
+                    &edits[done as usize..next as usize],
+                );
+                project.journal_landed(next).unwrap();
+                done = next;
+            }
+            project.end_unrecorded_stroke().unwrap();
+        }
+        let mut placed_all = CorrectionMap::new();
+        for (&stroke, &count) in &placed {
+            let edits = chain_edits(&mesh, stroke);
+            record(&mesh, &mut placed_all, &edits[..count as usize]);
+        }
+        assert_positions(
+            project.store(),
+            &dense(&mesh, &placed_all),
+            &tiles(&mesh, 1, TOP),
+            &what,
+        );
+        project.close(false).unwrap();
+    }
+    assert!(
+        chains > 0,
+        "some run was killed with two strokes open or more"
+    );
 }

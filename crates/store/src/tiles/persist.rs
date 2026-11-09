@@ -180,6 +180,7 @@ impl TileStore {
             reserved: super::pen_down::Reserved::default(),
             pen_down_beyond: 0,
             handed_out: None,
+            resumed: None,
             strokes_waiting: Vec::new(),
             journals: super::journal::Journals::default(),
             floor: std::collections::BTreeMap::new(),
@@ -508,7 +509,7 @@ impl TileStore {
         self.since_rebase.clear();
         self.forget_copied_ahead();
         self.forget_saved_strokes(strokes);
-        self.rebase_journal(Rebase::Save);
+        self.rebase_journal(&Rebase::Save);
         self.bounds.rebased();
         self.display.rebased();
         self.generation += 1;
@@ -595,13 +596,14 @@ impl TileStore {
     /// every one waiting for a flush (which the roll-over forgets): a stroke whose edits the new
     /// file holds has its record there too.
     ///
-    /// # The open stroke
+    /// # The open strokes
     ///
-    /// A stroke open as the old file failed (its dabs still landing, waiting for its cut, or its
-    /// pen still down) is **carried**: the fresh file holds its pen-down surface and its journal,
-    /// so a crash after the roll-over restores it as a crash before would have (the dab journal
-    /// spec, "Durable"). Its pen-down surface is in no save point of the fresh file otherwise,
-    /// and is written from memory, so `fresh` holds, in order:
+    /// The writing stroke open as the old file failed (its dabs still landing, waiting for its
+    /// cut, or its pen still down) is **carried**, with every stroke reserved behind it: the fresh
+    /// file holds its pen-down surface and their journals, so a crash after the roll-over
+    /// restores them as a crash before would have (the dab journal spec, "Durable"). Its pen-down
+    /// surface is in no save point of the fresh file otherwise, and is written from memory, so
+    /// `fresh` holds, in order:
     ///
     /// 1. Every tile the stroke hasn't changed, as above; the stroke records; each tile it changed
     ///    as it found it: its pen-down shape ([`TileStore::pen_down_shape`]), written as a record
@@ -613,8 +615,10 @@ impl TileStore {
     ///    across sites the head is the greatest op, so it can be another site's later.
     /// 2. The tiles the stroke changed, as they are now; the bounds and display tiles, as above,
     ///    over the unknown ones; the stroke's batches from its landed count, naming the pen-down
-    ///    cut ([`TileStore::carry_journal`]); and the fill's own save point, which holds them all,
-    ///    so the batches' landed count describes exactly the tiles it names.
+    ///    cut, then those of each stroke reserved behind it, in op order, naming the stroke before
+    ///    it ([`TileStore::carry_journal`]); and the fill's own save point, which holds them all,
+    ///    so the batches' landed count describes exactly the tiles it names, and a restore finds
+    ///    the strokes reserved landing on what the carried one leaves.
     ///
     /// A restore finds the stroke's changed tiles as those whose records differ between the two
     /// save points, and reads them at the pen-down cut, bit for bit the shapes the store keeps
@@ -834,9 +838,9 @@ impl TileStore {
             .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))
     }
 
-    /// Appends the open stroke's journal, as a roll-over carries it ([`TileStore::carry_journal`])
-    /// with its pen-down cut at `pen_down_cut`, to `fresh`; returns what it carried, `None` with
-    /// no stroke open.
+    /// Appends the open strokes' journals, as a roll-over carries them
+    /// ([`TileStore::carry_journal`]) with the writing one's pen-down cut at `pen_down_cut`, to
+    /// `fresh`; returns what it carried, `None` with no stroke writing.
     ///
     /// # Errors
     ///
@@ -954,7 +958,7 @@ impl TileStore {
         // The new file holds every bound as it is now, every stroke record waiting, and, if the
         // fill carried the open stroke, its pen-down cut and its journal (see `rebase_journal`).
         self.forget_saved_strokes(strokes);
-        self.rebase_journal(Rebase::RollOver(journal));
+        self.rebase_journal(&Rebase::RollOver(journal));
         self.bounds.all_flushed();
         self.display.all_flushed();
         self.generation += 1;
@@ -1016,8 +1020,9 @@ impl TileStore {
     }
 
     /// The bytes the pools may hold together, as the store opened with them, before any of it
-    /// is withheld for a stroke's pen-down data: what bounds the memory a restore spends on a
-    /// stroke it finds in a file, which may be hostile (see [`crate::Project::take_open_stroke`]).
+    /// is withheld for a stroke's pen-down data: what bounds the memory a restore spends on the
+    /// strokes it finds in a file, which may be hostile (see
+    /// [`crate::Project::take_open_strokes`]).
     pub(crate) const fn pools_budget(&self) -> usize {
         self.budget.opened()
     }

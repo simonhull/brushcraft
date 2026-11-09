@@ -814,6 +814,38 @@ fn no_op_resumes_once_one_was_handed_out() {
     );
 }
 
+/// Ops a restore found resume in op order, one after another, the second once the first has
+/// landed: never one at or before an op resumed already, and none once a fresh op was handed out.
+#[test]
+fn ops_resume_one_after_another_in_op_order_until_a_fresh_one_is_handed_out() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "chain.bcp", &mesh, roomy());
+    let [a, b, c] = [3, 4, 6].map(|seq| OpId::new(SITE, seq).unwrap());
+    store.resume_op(a).unwrap();
+    assert_eq!(store.current_op(), Some(a), "the first");
+    store.resume_op(b).unwrap();
+    assert_eq!(store.current_op(), Some(b), "then the second, after it");
+    for again in [a, b] {
+        let refused = store.resume_op(again);
+        assert!(
+            matches!(refused, Err(CacheError::OpBegun(op)) if op == b),
+            "{again:?}, not past the last resumed: {refused:?}"
+        );
+    }
+    assert_eq!(store.current_op(), Some(b), "unchanged");
+    store.resume_op(c).unwrap();
+    let fresh = store.begin_op().unwrap();
+    assert!(fresh > c, "{fresh:?}: past every op resumed");
+    store.end_op();
+    let past = OpId::new(SITE, fresh.seq() + 5).unwrap();
+    let refused = store.resume_op(past);
+    assert!(
+        matches!(refused, Err(CacheError::OpBegun(op)) if op == fresh),
+        "a fresh op was handed out: {refused:?}"
+    );
+}
+
 /// A reserved op let go without being begun or dropped is a bug, which a debug build reports.
 #[cfg(debug_assertions)]
 #[test]

@@ -1,7 +1,7 @@
 //! The open strokes' journals and landing.
 //!
 //! Whether a stroke may land, its pen-down cut as it begins, the dabs it places and lands,
-//! strokes begun behind one still landing, resuming one a restore found, and the flush a close
+//! strokes begun behind one still landing, resuming those a restore found, and the flush a close
 //! asks for to make it all durable.
 //!
 //! See [`crate::DabBatch`] for the record, and `crate::recovery` for the cut a stroke's first
@@ -20,6 +20,19 @@
 //! batches name the stroke before ([`PenDown::After`]), then that save point. A stroke reserved
 //! that won't land, as when a stroke before it fails, is let go with every stroke behind it
 //! ([`Project::drop_stroke_after`]).
+//!
+//! # Resuming the strokes a restore found
+//!
+//! A restore finds the strokes still landing in op order ([`Project::take_open_strokes`]), and
+//! they resume one at a time, in that order, each once the one before has landed and ended
+//! ([`Project::resume_stroke`]): one stroke writes at a time, as live. A stroke whose batches
+//! name a save point resumes on it, its pen-down shapes read from there, and may land at once:
+//! the restored state is its cut. One whose batches name the stroke before it ([`PenDown::After`])
+//! has landed nothing, and its surface is what that stroke left, the store's state as it resumes;
+//! so it resumes as a reserved stroke begins its op ([`Project::begin_reserved_stroke`]): its
+//! pen-down cut is taken then, it lands nothing until that cut is taken, and its batches go on
+//! naming the stroke before until the cut is durable. A crash before then restores the chain as
+//! it was, or, once the stroke before has closed in the file, this one on the tiles that hold it.
 
 use std::time::Instant;
 
@@ -48,11 +61,15 @@ impl Project {
     /// [`CacheError::OpenStrokesFull`] when the open strokes' pen-down data holds its share of the
     /// budget (the stroke waits for those before it to land, and begins its own then), or
     /// [`CacheError::OpsExhausted`] if the site's ops are used up.
+    ///
+    /// The strokes a restore found and nobody resumed end here, as at [`Project::begin_stroke`]:
+    /// none resumes behind a fresh op, and the file says so.
     pub fn begin_stroke_after(&mut self) -> Result<ReservedOp, ProjectError> {
         if self.store.newest_open_stroke().is_none() {
             return Err(ProjectError::NoStroke);
         }
         let reserved = self.store.reserve_op()?;
+        self.close_unresumed();
         self.store.begin_journal_after(reserved.op());
         Ok(reserved)
     }
@@ -246,6 +263,14 @@ impl Project {
     /// stroke began on: the stroke is open again, as [`Project::begin_stroke`] leaves one, and may
     /// land at once (its pen-down surface is in the file, and its cut is the restored state).
     ///
+    /// A restore may find several strokes open: they resume in op order, one at a time, each once
+    /// the one before it has landed every dab and ended (see the module notes). A stroke begun
+    /// behind the one before it ([`OpenStroke::after`]) resumes on what that one left, the store's
+    /// state now, and installs no shapes: it has landed nothing. Its pen-down cut is taken now, as
+    /// for a stroke reserved whose op begins, and it **lands nothing until that cut is taken**
+    /// ([`Project::may_land`], [`Project::wait_to_land`]); its batches go on naming the stroke
+    /// before until the cut is durable, then name its save point.
+    ///
     /// What the store gives back is exact: the tiles, the rows, the pen-down shapes and the
     /// journal. The landing above it isn't quite: the app's stroke restarted on the restored tiles
     /// takes each vertex's start from its stored, quantized correction, so the result matches the
@@ -266,15 +291,27 @@ impl Project {
     /// # Errors
     ///
     /// [`NotResumed`], with `stroke` given back and the project as it was, for
-    /// [`ProjectError::NotResumable`] if another op was handed out since the restore (begun,
-    /// edited as or reserved, even one ended or let go since), the project has moved onto another
-    /// recovery file (a save or a roll-over), or `stroke` isn't this project's; or for
+    /// [`ProjectError::NotResumable`] if a fresh op was handed out since the restore (begun,
+    /// edited as or reserved, even one ended or let go since), a stroke is open (the one before
+    /// it, still landing: end it first), the stroke before it ([`OpenStroke::after`]) hasn't been
+    /// resumed and ended, a stroke at or after it was resumed already, the project has moved onto
+    /// another recovery file (a save or a roll-over), or `stroke` isn't this project's; or for
     /// [`ProjectError::Cache`] if a shape can't be installed (evaluating a tile's parents
     /// fails), which a call made again may get past.
     pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), NotResumed> {
         let op = stroke.op();
-        if !stroke.found_in(&self.store) || self.store.op_handed_out().is_some() {
+        let earlier_ended = stroke.after().is_none_or(|earlier| {
+            self.store.last_resumed_op() == Some(earlier) && !self.store.journal_open_for(earlier)
+        });
+        let resumable = stroke.found_in(&self.store)
+            && self.stroke.is_none()
+            && earlier_ended
+            && self.store.may_resume(op).is_ok();
+        if !resumable {
             return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
+        }
+        if let PenDown::After(earlier) = stroke.pen_down() {
+            return self.resume_after(stroke, earlier);
         }
         // The test hook's shape, found by its index before the loop, so the loop carries no index.
         #[cfg(test)]
@@ -313,7 +350,41 @@ impl Project {
             return Err(NotResumed::new(stroke, e.into()));
         }
         self.stroke = Some(op);
-        self.unresumed = None;
+        self.unresumed.retain(|unresumed| unresumed.op != op);
+        Ok(())
+    }
+
+    /// [`Project::resume_stroke`] for `stroke`, whose batches name `earlier`, the stroke it began
+    /// behind ([`PenDown::After`]): it has landed nothing, and its surface is what `earlier` left,
+    /// the store's state now (see the module notes).
+    ///
+    /// Its journal opens as a reserved stroke's, its dabs already in the file and its batches
+    /// naming `earlier`; its op becomes the store's; then its pen-down cut is taken, as
+    /// [`Project::begin_reserved_stroke`] takes one. The journal is open before the cut, so a
+    /// roll-over the cut makes carries the stroke, its dabs written again into the fresh file
+    /// naming the pen-down cut there, which then stands.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::resume_stroke`], once its checks have passed.
+    fn resume_after(&mut self, stroke: OpenStroke, earlier: OpId) -> Result<(), NotResumed> {
+        let op = stroke.op();
+        let opened =
+            self.store
+                .resume_journal_after(op, stroke.dabs(), earlier, stroke.dab_format());
+        if let Err(e) = opened {
+            return Err(NotResumed::new(stroke, e.into()));
+        }
+        if let Err(e) = self.resume_op(op) {
+            self.store.discard_journal(op);
+            return Err(NotResumed::new(stroke, e.into()));
+        }
+        // The op is current and has edited nothing, and every edit of the stroke before is in
+        // the store: the cut holds the surface it left and none of this stroke's own.
+        let pen_down = self.cut_before_op(Instant::now());
+        self.store.journal_op_began(op, pen_down);
+        self.stroke = Some(op);
+        self.unresumed.retain(|unresumed| unresumed.op != op);
         Ok(())
     }
 

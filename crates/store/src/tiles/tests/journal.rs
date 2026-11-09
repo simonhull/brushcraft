@@ -58,7 +58,7 @@ fn a_reserved_op_begins_only_once_the_writing_stroke_s_journal_closes() {
 fn a_save_names_a_reserved_stroke_after_an_open_one_and_at_the_base_after_an_ended_one() {
     let dir = TestDir::new();
     let (mut store, a, b) = a_with_b_behind(&dir);
-    store.rebase_journal(Rebase::Save);
+    store.rebase_journal(&Rebase::Save);
     assert_eq!(
         cut_pen_downs(&mut store, b.op()),
         vec![PenDown::After(a)],
@@ -66,7 +66,7 @@ fn a_save_names_a_reserved_stroke_after_an_open_one_and_at_the_base_after_an_end
     );
     store.end_journal();
     store.end_op();
-    store.rebase_journal(Rebase::Save);
+    store.rebase_journal(&Rebase::Save);
     assert_eq!(
         cut_pen_downs(&mut store, b.op()),
         vec![PenDown::Base],
@@ -102,7 +102,7 @@ fn a_reserved_stroke_carried_as_it_begins_is_begun_from_then_on() {
     store.end_op();
     let b_op = store.begin_reserved_op(b).unwrap();
     let (_, carried) = store.carry_journal(7).unwrap().unwrap();
-    store.rebase_journal(Rebase::RollOver(Some(carried)));
+    store.rebase_journal(&Rebase::RollOver(Some(carried)));
     store.journal_op_began(b_op, PenDownPoint::Known(PenDown::At(99)));
     store.journal(b_op, &rows(2, 1)).unwrap();
     assert_eq!(
@@ -110,7 +110,7 @@ fn a_reserved_stroke_carried_as_it_begins_is_begun_from_then_on() {
         vec![PenDown::At(7)],
         "the carried pen-down stands"
     );
-    store.rebase_journal(Rebase::Save);
+    store.rebase_journal(&Rebase::Save);
     assert_eq!(
         cut_pen_downs(&mut store, b_op),
         vec![PenDown::Base],

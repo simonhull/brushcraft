@@ -13,6 +13,7 @@ use crate::fixture::Edit;
 use crate::tiles::PenDownShape;
 use crate::{JournalUnusable, OpenStroke};
 
+mod chain;
 mod roll_over;
 
 /// The dab format the tests' app sets.
@@ -418,11 +419,14 @@ fn a_stroke_that_had_landed_restores_no_open_stroke() {
     });
 }
 
-/// Asserts that `project`'s restore found a journal and didn't use it, for `why`, and that its
-/// tiles are those of `map`, the dabs landed. Closes it.
+/// Asserts that the newest stroke `project`'s restore found was a journal it didn't use, for
+/// `why`, and that its tiles are those of `map`, the dabs landed. Closes it.
 fn assert_tiles_alone(mut project: Project, map: &CorrectionMap, why: &JournalUnusable) {
     assert_eq!(
-        project.take_open_stroke().map(|found| found.map(|_| ())),
+        project
+            .take_open_strokes()
+            .pop()
+            .map(|found| found.map(drop)),
         Some(Err(why.clone())),
         "unusable, and why"
     );
@@ -482,7 +486,8 @@ fn a_gap_or_overlap_in_the_batches_restores_the_tiles_alone_and_says_why() {
         found: 15,
     };
     assert_appended_unusable(53, config, |op| vec![batch_of(op, 15..27, 8)], &overlap);
-    // The stroke's first batch read must start at or before the landed count.
+    // The stroke's first batch read must start at or before the landed count: a stroke of the
+    // next op, open after the crashed one.
     let late = JournalUnusable::Gap {
         expected: 2,
         found: 4,

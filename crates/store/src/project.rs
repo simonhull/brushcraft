@@ -87,12 +87,14 @@
 //! What a restore gets is the recovery file's last durable save point. Whatever was appended
 //! after it, a flush cut short or tiles of the stroke in progress written back to make room,
 //! is discarded: a save point is the unit of durability, and replaying the tail could bring
-//! back half a stroke. A stroke whose dabs were still landing comes back from the dab journal
-//! that save point holds ([`Project::take_open_stroke`], [`Project::resume_stroke`]): its tiles
-//! as far as it had landed, its dabs not landed, and the surface it began on, all exact, to land
-//! the rest on; the app's landing gives the live result within half a quantization step per
-//! vertex it touches. At worst, about a second of placed dabs is lost, or, with a journal
-//! that can't be used, the dabs not landed.
+//! back half a stroke. The strokes whose dabs were still landing come back from the dab journal
+//! that save point holds ([`Project::take_open_strokes`], [`Project::resume_stroke`]), in op
+//! order: each one's tiles as far as it had landed, its dabs not landed, and the surface it began
+//! on (for a stroke begun behind one still landing, the surface that one leaves), all exact, to
+//! land the rest on, one stroke after another; the app's landing gives the live result within
+//! half a quantization step per vertex it touches. At worst, about a second of placed dabs is
+//! lost, or, with a journal that can't be used, the dabs not landed of that stroke and of every
+//! one after it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -504,12 +506,14 @@ pub struct Project {
     stroke: Option<OpId>,
     /// The op of the last stroke record kept: a second record of it is refused.
     recorded: Option<OpId>,
-    /// What [`Project::restore`] found of a stroke still landing, until
-    /// [`Project::take_open_stroke`] takes it; `None` for a project not restored, or with none.
-    open_stroke: Option<Result<OpenStroke, JournalUnusable>>,
-    /// The stroke [`Project::restore`] found still landing, until it is resumed or the next op
-    /// begins: then [`Project::begin_stroke`] closes it in the file.
-    unresumed: Option<Unresumed>,
+    /// What [`Project::restore`] found of the strokes still landing, in op order, until
+    /// [`Project::take_open_strokes`] takes them; empty for a project not restored, or with
+    /// none.
+    open_strokes: Vec<Result<OpenStroke, JournalUnusable>>,
+    /// The strokes [`Project::restore`] found still landing and usable, in op order, each until
+    /// it is resumed or a fresh op is handed out: then [`Project::begin_stroke`] (or
+    /// [`Project::begin_stroke_after`]) closes those left in the file.
+    unresumed: Vec<Unresumed>,
     /// Test hook: makes the next [`Project::resume_stroke`] fail at its last step, reopening the
     /// op, after its journal is seeded.
     #[cfg(test)]
@@ -630,11 +634,13 @@ impl Project {
     /// cut short, tiles of the stroke in progress) is discarded. The project's ops start past
     /// the newest edit of every recovery file of the project, as [`Project::open`]'s do.
     ///
-    /// A stroke still landing when the recovery file was last written is found then, its dabs
-    /// not landed and its pen-down surface read from the file, for the app to take
-    /// ([`Project::take_open_stroke`]) and land on ([`Project::resume_stroke`]). A journal that
-    /// can't be used never fails the restore: the restored tiles stand, and
-    /// [`Project::take_open_stroke`] says why.
+    /// The strokes still landing when the recovery file was last written are found then, in op
+    /// order, each one's dabs not landed and its pen-down surface read from the file, for the
+    /// app to take ([`Project::take_open_strokes`]) and land on, one after another
+    /// ([`Project::resume_stroke`]). A journal that can't be used never fails the restore: the
+    /// restored tiles stand, and [`Project::take_open_strokes`] says why. The ops handed out
+    /// from then on start past every op the journal names too: a stroke never resumed, which may
+    /// hold no edit, never has its op handed out again.
     ///
     /// # Errors
     ///
@@ -645,18 +651,18 @@ impl Project {
     /// can't be opened (the recovery file is held by a running instance:
     /// [`FileError::Locked`]); [`ProjectError::Cache`] if the store refuses `config.store`;
     /// [`ProjectError::Recovery`] if the writer's thread can't be started. The recovery file is
-    /// kept on error.
+    /// kept on error. [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if a batch names
+    /// its site's last op, so no op is left to hand out.
     pub fn restore(
         candidate: &RecoveryCandidate,
         config: ProjectConfig,
     ) -> Result<Self, ProjectError> {
         let mut project = Self::restore_tiles(candidate, config)?;
         let found = resume::find(&project.store);
-        project.unresumed = found
-            .as_ref()
-            .and_then(|found| found.as_ref().ok())
-            .map(OpenStroke::unresumed);
-        project.open_stroke = found;
+        project.store.skip_ops_past([found.newest_op])?;
+        let usable = found.strokes.iter().filter_map(|found| found.as_ref().ok());
+        project.unresumed = usable.map(OpenStroke::unresumed).collect();
+        project.open_strokes = found.strokes;
         Ok(project)
     }
 
@@ -804,8 +810,8 @@ impl Project {
             stranded: None,
             stroke: None,
             recorded: None,
-            open_stroke: None,
-            unresumed: None,
+            open_strokes: Vec::new(),
+            unresumed: Vec::new(),
             #[cfg(test)]
             fail_next_resume: false,
             #[cfg(test)]
@@ -1105,7 +1111,7 @@ impl Project {
     }
 
     /// Whether the project has work no save holds: any edit since the last save (or, for a
-    /// project never saved, any edit at all), dabs the open stroke placed and hasn't landed, or
+    /// project never saved, any edit at all), dabs an open stroke placed and hasn't landed, or
     /// a stroke a restore found still landing and nobody has resumed or closed yet. The last two
     /// may hold no tile edit (a stroke that has landed nothing), but they are work the recovery
     /// file keeps: a close must keep it ([`Project::close`]).
@@ -1115,9 +1121,11 @@ impl Project {
     /// holds none of its batches, and the stroke resumes no more. Resume it first to keep it.
     #[must_use]
     pub fn has_unsaved_edits(&self) -> bool {
+        let generation = self.store.generation();
         let unresumed = self
             .unresumed
-            .is_some_and(|unresumed| unresumed.generation == self.store.generation());
+            .iter()
+            .any(|unresumed| unresumed.generation == generation);
         self.store.has_unsaved_edits() || self.store.is_landing() || unresumed
     }
 
@@ -1241,20 +1249,10 @@ impl Project {
             "a stroke began while the last one's dabs were still landing"
         );
         // The stroke before ends here if it hasn't, its dabs counted landed, before the cut. So
-        // does a stroke a restore found still landing and nobody resumed: the file says so, or a
-        // second crash would offer it again over this op's edits.
+        // do the strokes a restore found still landing and nobody resumed: the file says so, or
+        // a second crash would offer them again over this op's edits.
         self.store.end_journal();
-        if let Some(unresumed) = self.unresumed.take()
-            && unresumed.generation == self.store.generation()
-        {
-            self.store.close_restored_journal(
-                unresumed.op,
-                unresumed.landed,
-                unresumed.placed,
-                unresumed.pen_down,
-                unresumed.dab_format,
-            );
-        }
+        self.close_unresumed();
         let pen_down = self.cut_before_op(Instant::now());
         let op = self.store.begin_op()?;
         self.store.begin_journal(op, pen_down);
@@ -1360,17 +1358,53 @@ impl Project {
         self.end_stroke_at(Instant::now())
     }
 
-    /// What [`Project::restore`] found of a stroke still landing when the recovery file was last
-    /// written, once: `None` if it found none (no journal, or its last stroke's dabs had all
-    /// landed), or for a project not restored, or once taken.
+    /// What [`Project::restore`] found of the strokes still landing when the recovery file was
+    /// last written, in op order, once: empty if it found none (no journal, or every stroke's
+    /// dabs had landed), or for a project not restored, or once taken.
     ///
-    /// `Some(Ok(stroke))` is a stroke to land on ([`Project::resume_stroke`]): its op, its dabs
-    /// not landed and its pen-down surface, read from the save point its batches name.
-    /// `Some(Err(why))` is a journal found and not used: the restored tiles stand, and the
-    /// stroke's dabs not landed are lost (see [`JournalUnusable`]). Either way the project is
-    /// open, its tiles as the recovery file's last save point holds them.
+    /// `Ok(stroke)` is a stroke to land on ([`Project::resume_stroke`]): its op, its dabs not
+    /// landed and its pen-down surface, read from the save point its batches name, or the
+    /// surface the stroke before it leaves. Resume them in op order, each once the one before
+    /// it has landed and ended ([`OpenStroke::after`]): resume the first, land every dab not
+    /// landed, end it ([`Project::end_unrecorded_stroke`]), then the next. `Err(why)` is a
+    /// journal found and not used: the restored tiles stand, and the stroke's dabs not landed are
+    /// lost (see [`JournalUnusable`]); every stroke after an unusable one is unusable too
+    /// ([`JournalUnusable::EarlierUnusable`]). Either way the project is open, its tiles as the
+    /// recovery file's last save point holds them.
+    ///
+    /// Any fresh op handed out ([`Project::begin_stroke`], [`Project::begin_stroke_after`], or one
+    /// the store begins for an edit) ends every stroke not resumed yet: none of them resumes after
+    /// it. The first two close them in the file.
+    pub fn take_open_strokes(&mut self) -> Vec<Result<OpenStroke, JournalUnusable>> {
+        std::mem::take(&mut self.open_strokes)
+    }
+
+    /// The oldest of [`Project::take_open_strokes`], the rest let go (they end once another op
+    /// is handed out, as any stroke never resumed): for an app that lands one restored stroke.
     pub fn take_open_stroke(&mut self) -> Option<Result<OpenStroke, JournalUnusable>> {
-        self.open_stroke.take()
+        self.take_open_strokes().into_iter().next()
+    }
+
+    /// Closes in the file every stroke a restore found still landing and nobody resumed, as a
+    /// fresh op is handed out ([`Project::begin_stroke`], [`Project::begin_stroke_after`]):
+    /// their dabs not landed are dropped, and a second crash's restore never offers them again
+    /// over that op's edits. Strokes found in a working file the project has moved off since are
+    /// in none it writes, and are let go.
+    pub(super) fn close_unresumed(&mut self) {
+        let generation = self.store.generation();
+        let found = std::mem::take(&mut self.unresumed);
+        let here = found
+            .iter()
+            .filter(|unresumed| unresumed.generation == generation);
+        for unresumed in here {
+            self.store.close_restored_journal(
+                unresumed.op,
+                unresumed.landed,
+                unresumed.placed,
+                unresumed.pen_down,
+                unresumed.dab_format,
+            );
+        }
     }
 
     /// [`Project::end_stroke`] at `now`.

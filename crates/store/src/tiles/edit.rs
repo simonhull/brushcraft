@@ -913,45 +913,59 @@ impl TileStore {
         self.release_pen_down();
     }
 
-    /// Makes `op`, a stroke's op the working file holds edits of, the op edits are made as again,
-    /// as [`TileStore::begin_op`] would have left it: the edits that land the rest of a stroke
-    /// restored after a crash are its own (see [`crate::Project::resume_stroke`]). The op
+    /// Makes `op`, a stroke's op the working file holds edits or batches of, the op edits are made
+    /// as again, as [`TileStore::begin_op`] would have left it: the edits that land the rest of a
+    /// stroke restored after a crash are its own (see [`crate::Project::resume_stroke`]). The op
     /// generator is moved past `op` if it isn't already, so no op is handed out twice: it starts
-    /// past every op of the files ([`ProjectFile::last_op`](crate::file::ProjectFile::last_op)),
-    /// a stroke that landed nothing included, and this keeps it so whatever `op` the caller
-    /// gives. The pen-down shapes stay: the stroke's own, installed first
-    /// ([`TileStore::install_pen_down`]).
+    /// past every op of the files ([`ProjectFile::last_op`](crate::file::ProjectFile::last_op),
+    /// and every op a restore finds in the journal), a stroke that landed nothing included, and
+    /// this keeps it so whatever `op` the caller gives. The pen-down shapes stay: the stroke's
+    /// own, installed first ([`TileStore::install_pen_down`]).
     ///
-    /// Only on a store no op has been handed out on since it opened
-    /// ([`TileStore::op_handed_out`]): begun, edited as or reserved, whether it ended or was let
-    /// go since. The stroke's edits must be the last before its own.
+    /// Only as [`TileStore::may_resume`] says: so the strokes a restore found resume in op order,
+    /// one after another (the last one's op ends as this one's begins), and none after a fresh
+    /// op. The stroke's edits must be the last before its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::may_resume`]; [`CacheError::OpsExhausted`] if `op` is its site's last. The
+    /// store is unchanged then.
+    pub(crate) fn resume_op(&mut self, op: OpId) -> Result<(), CacheError> {
+        self.may_resume(op)?;
+        self.skip_ops_past([Some(op)])?;
+        self.op = Some(op);
+        self.resumed = Some(op);
+        Ok(())
+    }
+
+    /// Whether `op`, a stroke's op a restore found, may resume ([`TileStore::resume_op`]): no
+    /// op is reserved, no fresh op has been handed out since the store opened (begun, edited as
+    /// or reserved, whether it ended or was let go since), and `op` is past every op resumed so
+    /// far. A resumed stroke's edits come before every fresh op's, and after every earlier
+    /// stroke's.
     ///
     /// # Errors
     ///
     /// [`CacheError::OpReserved`] while an op is reserved ([`TileStore::reserve_op`]);
-    /// [`CacheError::OpBegun`] if an op was handed out since the store opened;
-    /// [`CacheError::OpsExhausted`] if `op` is its site's last. The store is unchanged then.
-    pub(crate) fn resume_op(&mut self, op: OpId) -> Result<(), CacheError> {
+    /// [`CacheError::OpBegun`] with the fresh op handed out since the store opened, or with the
+    /// last op resumed if `op` isn't past it.
+    pub(crate) fn may_resume(&self, op: OpId) -> Result<(), CacheError> {
         if let Some(reserved) = self.reserved.oldest() {
             return Err(CacheError::OpReserved(reserved));
         }
-        if let Some(handed) = self.op_handed_out() {
+        if let Some(handed) = self.handed_out {
             return Err(CacheError::OpBegun(handed));
         }
-        self.skip_ops_past([Some(op)])?;
-        self.op = Some(op);
-        self.handed_out = Some(op);
-        Ok(())
+        match self.resumed {
+            Some(resumed) if op <= resumed => Err(CacheError::OpBegun(resumed)),
+            _ => Ok(()),
+        }
     }
 
-    /// The op current, if one is, else the last op handed out since the store opened (begun,
-    /// edited as, reserved or resumed), whether it has ended or been let go since; `None` while
-    /// none has been. A stroke a restore found resumes only while this is `None`.
-    pub(crate) const fn op_handed_out(&self) -> Option<OpId> {
-        match self.op {
-            Some(op) => Some(op),
-            None => self.handed_out,
-        }
+    /// The last op resumed since the store opened ([`TileStore::resume_op`]), whether its stroke
+    /// has ended since or not; `None` while none has been.
+    pub(crate) const fn last_resumed_op(&self) -> Option<OpId> {
+        self.resumed
     }
 
     /// Starts the site's next op, as [`TileStore::begin_op`] does, the pen-down shapes kept: for
