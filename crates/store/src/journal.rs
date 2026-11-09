@@ -450,10 +450,11 @@ mod proofs {
             placed.is_some_and(|placed| head.landed <= placed),
             "landed within the dabs"
         );
-        assert_eq!(
-            payload.get(..4),
-            Some([VERSION, 0, 0, 0].as_slice()),
-            "this build's version, the reserved bytes clear"
+        // Byte by byte: a slice comparison lowers to a `memcmp` loop the proof would unwind.
+        assert_eq!(payload.first(), Some(&VERSION), "this build's version");
+        assert!(
+            payload.get(1) == Some(&0) && payload.get(2) == Some(&0) && payload.get(3) == Some(&0),
+            "the reserved bytes clear"
         );
     }
 }
