@@ -24,9 +24,9 @@
 //!   brush whose frame can't fit it all; the same dabs land later through [`apply_dabs`].
 //! - [`radius_covering`] sizes a brush by the vertices it covers about a point: the radius whose
 //!   ball holds that many, as the M1 spec's "brush of 1M vertices" is named.
-//! - [`future_of`] is a tile as it will be once the open strokes still landing have landed their
-//!   remaining dabs, made by the landing's own per-tile arithmetic without writing: the surface a
-//!   stroke started while earlier ones land reads.
+//! - [`FuturePlan`] gives a tile as it will be once the open strokes still landing have landed
+//!   their remaining dabs, made by the landing's own per-tile arithmetic without writing: the
+//!   surface a stroke started while earlier ones land reads.
 //! - [`StoreSurface`] is the store's pen-down surface as the stroke engine's [`stroke::Surface`]:
 //!   raycasts through the index, the stroke's connected region near a point, and area normals.
 //!
@@ -52,7 +52,7 @@ mod testing;
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
 pub use footprint::radius_covering;
-pub use future::{FutureError, Remaining, future_of};
+pub use future::{FutureError, FuturePlan, Remaining};
 pub use preview::{Drawn, DrawsAll, Preview, PreviewStats, WAITING_A_CALL};
 pub use state::Stroke;
 pub use surface::StoreSurface;

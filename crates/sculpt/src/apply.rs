@@ -161,7 +161,7 @@ use crate::state::{Book, Stroke, TileStroke};
 
 mod replay;
 
-/// Why [`apply_dabs`], [`draw_step`](crate::draw_step) or [`future_of`](crate::future_of) failed.
+/// Why [`apply_dabs`], [`draw_step`](crate::draw_step) or [`FuturePlan`](crate::FuturePlan) failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SculptError {
@@ -181,7 +181,7 @@ pub enum SculptError {
     /// The spatial index couldn't be brought up to date.
     #[error("updating the spatial index failed")]
     Index(#[from] IndexError),
-    /// A tile's future couldn't be made ([`crate::future_of`]).
+    /// A tile's future couldn't be made ([`crate::FuturePlan`]).
     #[error("a tile's future couldn't be made")]
     Future(#[from] FutureError),
 }

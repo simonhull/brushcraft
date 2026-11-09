@@ -35,7 +35,7 @@ pub(crate) enum Plan {
 
 /// For each tile, the grant of its stroke state at each dab of a run that edited it, in dab
 /// order (dabs counted from the run's first).
-pub(super) type Grants = BTreeMap<TileKey, Vec<(usize, Grant)>>;
+pub(crate) type Grants = BTreeMap<TileKey, Vec<(usize, Grant)>>;
 
 impl Plan {
     /// The grants a book gives the tiles that `outcomes` edited, dab by dab, from a copy of
@@ -51,6 +51,17 @@ impl Plan {
                 }
             }
         }
+        Self::decide(book, edited)
+    }
+
+    /// The grants a book gives `edited[k]`, the tiles dab `k` of a run edits (any order), dab by
+    /// dab, from a copy of `book` (the stroke's as the run begins), with that copy after the run,
+    /// and the tiles written per dab, summed over the dabs: the decisions of "Releasing tiles" on
+    /// [`Stroke`], which depend on nothing else.
+    ///
+    /// What [`Plan::of`] makes of a replay's outcomes, and a tile's future
+    /// ([`crate::FuturePlan`]) of the tiles each remaining dab edits, found without writing.
+    pub(crate) fn decide(book: &Book, edited: Vec<Vec<TileKey>>) -> (Grants, Book, usize) {
         let mut book = book.clone();
         let mut grants = Grants::new();
         let mut released = Vec::new();
@@ -97,7 +108,7 @@ impl Plan {
 
 /// What every tile of a run reads: its dabs, the plan, the stroke and the mesh.
 ///
-/// A tile's future ([`crate::future_of`]) is a run too, its dabs those of an open stroke not
+/// A tile's future ([`crate::FuturePlan`]) is a run too, its dabs those of an open stroke not
 /// landed yet, replayed by the same [`replay_tile`] and written nowhere.
 #[derive(Clone, Copy)]
 pub(crate) struct Run<'a> {
@@ -389,7 +400,7 @@ struct Owner {
 /// One tile's replay of the run: see "Tile by tile" in the module notes of [`super`].
 ///
 /// The one per-tile arithmetic of a run's dabs: a run lands its tiles' outcomes, and a tile's
-/// future ([`crate::future_of`]) is its outcome over the dabs not landed yet, kept apart.
+/// future ([`crate::FuturePlan`]) is its outcome over the dabs not landed yet, kept apart.
 pub(crate) fn replay_tile(run: Run<'_>, input: TileInput<'_>) -> TileOutcome {
     let mut tile = Replay::new(run, input);
     let stopped = tile.dabs().err();

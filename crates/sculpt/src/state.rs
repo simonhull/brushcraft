@@ -1,7 +1,7 @@
 //! A stroke's state: the value each touched vertex's correction is being built to, kept in `f32`
 //! so a dab's small delta isn't rounded away by the tile's quantization (see [`Stroke`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use geom::{TILE_QUADS, TileKey, Vec3};
@@ -115,8 +115,10 @@ pub(crate) struct Book {
 }
 
 impl Book {
-    /// A book of `buffers` free buffers and no dab counted.
-    const fn new(buffers: usize) -> Self {
+    /// A book of `buffers` free buffers and no dab counted: a stroke's at its first dab over a
+    /// store reserving that many ([`Stroke::begin_frame`]; a book whose every tile is released
+    /// decides the same, whatever dabs it counted before).
+    pub(crate) const fn new(buffers: usize) -> Self {
         Self {
             dab: 0,
             held: BTreeMap::new(),
@@ -165,18 +167,6 @@ impl Book {
     /// Whether `key` holds state now.
     pub(crate) fn holds(&self, key: &TileKey) -> bool {
         self.held.contains_key(key)
-    }
-
-    /// Whether dabs that edit only tiles of `reach` give every tile they edit state without
-    /// releasing any: the tiles of `reach` holding none number at most the buffers free.
-    ///
-    /// Then every grant they make is [`Grant::Held`] for a tile holding state, and
-    /// [`Grant::Taken`] at the first edit of one that doesn't, never [`Grant::Without`]: a buffer
-    /// is released only when none is free and an edited tile needs one, and each tile of `reach`
-    /// takes at most one. Which tiles the dabs edit, and in what order, doesn't matter.
-    fn has_room_for(&self, reach: &BTreeSet<TileKey>) -> bool {
-        let unheld = reach.iter().filter(|key| !self.holds(key)).count();
-        unheld <= self.free
     }
 
     /// Releases every tile: a new stroke begins.
@@ -289,32 +279,26 @@ impl Stroke {
     }
 
     /// The state the next dab of the stroke of op `op` over `store` goes on from: this one if it
-    /// is that stroke's, the store's and the op it last wrote ([`Stroke::end_dab`]); `None` if the
-    /// next dab starts afresh ([`Stroke::begin_frame`] releases every tile when it finds another
-    /// store or op).
+    /// is that stroke's, the store's, with `op` the store's current op and the op the state last
+    /// wrote in ([`Stroke::end_dab`]); `None` if the next dab starts afresh
+    /// ([`Stroke::begin_frame`] releases every tile when it finds another store or op).
     ///
     /// A stroke whose op hasn't written yet (one not begun, or one waiting on the stroke before
-    /// it) never matches: its first dab finds the state at another op, and releases it.
+    /// it) never matches: its first dab finds the state at another op, and releases it. Nor does
+    /// an op that isn't current: the store's op will have changed before it writes again.
     pub(crate) fn continued(&self, store: &TileStore, op: OpId) -> Option<&Self> {
-        (self.store == store.id() && self.op == Some(op)).then_some(self)
+        let current = store.current_op() == Some(op);
+        (current && self.store == store.id() && self.op == Some(op)).then_some(self)
     }
 
-    /// Whether the dabs of a stroke that edit only tiles of `reach`, over `store`, from `state`
-    /// (as [`Stroke::continued`] gives it; `None`: afresh, every buffer of the store's
-    /// reservation free) make no decision but [`Grant::Held`] and a first [`Grant::Taken`]: no
-    /// tile's state is released or denied (see [`Book::has_room_for`]).
-    ///
-    /// What a replay under [`crate::apply::Plan::Continuous`] assumes, so then its tiles are, bit
-    /// for bit, what the dabs one at a time leave, whichever tiles they edit.
-    pub(crate) fn has_room_for(
-        state: Option<&Self>,
-        store: &TileStore,
-        reach: &BTreeSet<TileKey>,
-    ) -> bool {
-        match state {
-            Some(stroke) => stroke.book.has_room_for(reach),
-            None => reach.len() <= store.stroke_tiles(),
-        }
+    /// The book the next dab of the stroke of op `op` over `store` counts on: this stroke's if it
+    /// goes on ([`Stroke::continued`]), else a fresh one of the store's reservation, every buffer
+    /// free, as [`Stroke::begin_frame`] leaves it.
+    pub(crate) fn book_for(&self, store: &TileStore, op: OpId) -> Book {
+        self.continued(store, op).map_or_else(
+            || Book::new(store.stroke_tiles()),
+            |stroke| stroke.book.clone(),
+        )
     }
 
     /// The stroke's bookkeeping as it is now: a frame makes its dabs' decisions on a copy (see
