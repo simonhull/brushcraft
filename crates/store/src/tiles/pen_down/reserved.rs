@@ -108,6 +108,8 @@ impl Reserved {
 pub struct PenDownReading<'a> {
     /// The store, its reads going to the op's shapes.
     store: &'a mut TileStore,
+    /// Its place in the store's stack of readings: where what it replaced is noted.
+    depth: usize,
 }
 
 impl Deref for PenDownReading<'_> {
@@ -125,9 +127,10 @@ impl DerefMut for PenDownReading<'_> {
 }
 
 /// Gives back the shapes read before the reading: as it ends, or as a panic unwinds through it.
+/// Readings nested in it and never dropped (forgotten) end with it.
 impl Drop for PenDownReading<'_> {
     fn drop(&mut self) {
-        self.store.end_reading();
+        self.store.end_reading(self.depth);
     }
 }
 
@@ -135,8 +138,8 @@ impl TileStore {
     /// The store, its pen-down reads going to the current stroke's shapes until the reading is
     /// dropped: what a stroke's surface reads. Outside any reading they always do.
     pub fn read_pen_down(&mut self) -> PenDownReading<'_> {
-        self.begin_reading(None);
-        PenDownReading { store: self }
+        let depth = self.begin_reading(None);
+        PenDownReading { store: self, depth }
     }
 
     /// The store, its pen-down reads going to reserved op `reserved`'s shapes until the reading
@@ -156,8 +159,8 @@ impl TileStore {
         if reserved.store() != self.id() || !self.reserved.holds(op) {
             return Err(CacheError::NotReserved(op));
         }
-        self.begin_reading(Some(op));
-        Ok(PenDownReading { store: self })
+        let depth = self.begin_reading(Some(op));
+        Ok(PenDownReading { store: self, depth })
     }
 
     /// The reserved op whose pen-down shapes the store reads now ([`TileStore::read_pen_down_of`]);
@@ -169,15 +172,21 @@ impl TileStore {
     }
 
     /// Starts a reading of `op`'s set (a reserved op's, the current stroke's for `None`), held
-    /// by the caller to be one: noting what it replaces, for [`TileStore::end_reading`].
-    fn begin_reading(&mut self, op: Option<OpId>) {
+    /// by the caller to be one: noting what it replaces, for [`TileStore::end_reading`]. Returns
+    /// the reading's depth, where that is noted.
+    fn begin_reading(&mut self, op: Option<OpId>) -> usize {
+        let depth = self.reserved.replaced.len();
         self.reserved.replaced.push(self.reserved.reading);
         self.switch_reading(op);
+        depth
     }
 
-    /// Ends the innermost reading under way: the set it replaced is read again.
-    fn end_reading(&mut self) {
-        if let Some(replaced) = self.reserved.replaced.pop() {
+    /// Ends the reading at `depth`, and every reading nested in it still noted (one forgotten
+    /// rather than dropped): the set it replaced is read again.
+    fn end_reading(&mut self, depth: usize) {
+        let ended = self.reserved.replaced.get(depth).copied();
+        self.reserved.replaced.truncate(depth);
+        if let Some(replaced) = ended {
             self.switch_reading(replaced);
         }
     }

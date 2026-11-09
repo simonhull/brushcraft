@@ -824,3 +824,24 @@ fn a_reserved_op_let_go_is_reported() {
     let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
     drop(store.reserve_op().unwrap());
 }
+
+/// A token whose store is gone is given back on its own; one given to another store that lives
+/// is a bug, which a debug build reports.
+#[test]
+fn a_token_of_a_store_gone_is_abandoned_and_not_given_to_another() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut gone = new_store(&dir, "gone.bcp", &mesh, roomy());
+    let orphan = gone.reserve_op().unwrap();
+    drop(gone);
+    orphan.abandon_with_store_gone();
+    if cfg!(debug_assertions) {
+        let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+        let mut other = new_store(&dir, "other.bcp", &mesh, roomy());
+        let elsewhere = store.reserve_op().unwrap();
+        let given = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            other.drop_reserved_op(elsewhere)
+        }));
+        assert!(given.is_err(), "another store's token is reported");
+    }
+}

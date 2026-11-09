@@ -1089,6 +1089,35 @@ fn a_write_through_a_reading_of_a_reserved_op_is_refused() {
 }
 
 #[test]
+fn a_reading_forgotten_inside_another_is_ended_with_it() {
+    let dir = TestDir::new();
+    let (mut store, _, b, reached) = reserved_with_futures(&dir);
+    let key = reached[0];
+    let own = store.pen_down_positions(key).expect("reads").to_vec();
+    let c = store.reserve_op().expect("reserved");
+    {
+        let mut of_b = store.read_pen_down_of(&b).expect("reserved here");
+        let _forgotten =
+            std::mem::ManuallyDrop::new(of_b.read_pen_down_of(&c).expect("reserved here"));
+        assert_eq!(
+            of_b.reading_op(),
+            Some(c.op()),
+            "the forgotten one reads on"
+        );
+    }
+    assert_eq!(store.reading_op(), None, "the outer reading ended both");
+    assert_eq!(
+        bits(store.pen_down_positions(key).expect("reads")),
+        bits(&own),
+        "the current op's shapes are read again"
+    );
+    let both = vec![b.op(), c.op()];
+    store.end_op();
+    assert_eq!(store.drop_reserved_op(b), both, "nothing is left reading");
+    store.drop_reserved_op(c);
+}
+
+#[test]
 #[should_panic(expected = "a reserved op's pen-down shapes are read")]
 fn releasing_the_current_op_s_shapes_through_a_reading_is_refused() {
     let dir = TestDir::new();

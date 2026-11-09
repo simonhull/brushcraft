@@ -602,7 +602,8 @@ impl TileEdit<'_> {
 /// One dropped otherwise would stay reserved and hold every later op back, so a debug build
 /// panics as it is dropped (but while a panic unwinds). One whose op went otherwise (with an op
 /// before it, or with every reserved op, [`TileStore::drop_every_reserved_op`]) is given back
-/// all the same, and lets nothing more go.
+/// all the same, and lets nothing more go; one whose store is gone (a close, a takeover) is
+/// abandoned ([`ReservedOp::abandon_with_store_gone`]).
 #[derive(Debug)]
 #[must_use = "an op reserved and let go stays reserved, and holds every later op back"]
 pub struct ReservedOp {
@@ -626,6 +627,13 @@ impl ReservedOp {
         self.store
     }
 
+    /// Lets the op go with its store, which is gone (closed, or taken over): nothing is left to
+    /// give it back to, and nothing more is reserved. For a store still open, drop it there
+    /// instead ([`TileStore::drop_reserved_op`]), or it stays reserved.
+    pub fn abandon_with_store_gone(self) {
+        self.give_back();
+    }
+
     /// Gives the op back to the store: it has begun or gone.
     fn give_back(mut self) {
         self.given_back = true;
@@ -645,13 +653,25 @@ impl Drop for ReservedOp {
 
 /// A reserved op that couldn't begin ([`TileStore::begin_reserved_op`]): the op, given back, and
 /// why.
-#[derive(Debug, thiserror::Error)]
-#[error("reserved op {:?} can't begin", reserved.op)]
+///
+/// It holds the op's token, so it is no [`std::error::Error`]: an error passed up with `?` would
+/// take the token with it and drop it far from here, the op reserved for good. It is to be taken
+/// apart ([`NotBegun::into_parts`], [`NotBegun::into_reserved`]), and the op begun later or
+/// dropped. So `?` doesn't compile:
+///
+/// ```compile_fail
+/// # fn begin(store: &mut store::TileStore) -> Result<(), Box<dyn std::error::Error>> {
+/// let reserved = store.reserve_op()?;
+/// store.begin_reserved_op(reserved)?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "it holds the reserved op, which is to be begun later or dropped"]
 pub struct NotBegun {
     /// The op, still reserved (or never this store's).
     reserved: ReservedOp,
     /// Why it couldn't begin.
-    #[source]
     error: CacheError,
 }
 
@@ -671,6 +691,11 @@ impl NotBegun {
     /// The op back, to begin later or drop.
     pub fn into_reserved(self) -> ReservedOp {
         self.reserved
+    }
+
+    /// The op back, and why it couldn't begin.
+    pub fn into_parts(self) -> (ReservedOp, CacheError) {
+        (self.reserved, self.error)
     }
 }
 
@@ -790,8 +815,10 @@ impl TileStore {
     /// Lets reserved op `reserved` go, and with it every op reserved after it, whose futures read
     /// its dabs (see [`TileStore::drop_reserved_ops_from`]); returns the ops let go, in op order.
     /// For a stroke that ends before its op begins, as when a stroke before it fails to land its
-    /// dabs. Nothing for an op not reserved on this store (begun, let go already, or another
-    /// store's): the token is given back all the same.
+    /// dabs. Nothing for an op no longer reserved (let go already, with an op before it): the
+    /// token is given back all the same. A token of another store is a bug (a debug assertion
+    /// says so), as that store's op would stay reserved; one whose store is gone is abandoned
+    /// instead ([`ReservedOp::abandon_with_store_gone`]).
     ///
     /// # Panics
     ///
@@ -800,6 +827,10 @@ impl TileStore {
         self.assert_not_reading();
         let (op, store) = (reserved.op, reserved.store);
         reserved.give_back();
+        debug_assert!(
+            store == self.id(),
+            "a reserved op is dropped on the store it was reserved on: {op:?}"
+        );
         if store != self.id() {
             return Vec::new();
         }
