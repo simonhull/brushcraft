@@ -153,13 +153,15 @@ use store::{
 use stroke::Dab;
 use thiserror::Error;
 
-use self::replay::{Plan, Run, TileOutcome};
+use self::replay::TileOutcome;
+pub(crate) use self::replay::{Plan, Run, Stopped, TileInput, replay_tile};
 use crate::draw::{DrawParamsError, check_dab};
+use crate::future::FutureError;
 use crate::state::{Book, Stroke, TileStroke};
 
 mod replay;
 
-/// Why [`apply_dabs`] or [`draw_step`](crate::draw_step) failed.
+/// Why [`apply_dabs`], [`draw_step`](crate::draw_step) or [`future_of`](crate::future_of) failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SculptError {
@@ -179,6 +181,9 @@ pub enum SculptError {
     /// The spatial index couldn't be brought up to date.
     #[error("updating the spatial index failed")]
     Index(#[from] IndexError),
+    /// A tile's future couldn't be made ([`crate::future_of`]).
+    #[error("a tile's future couldn't be made")]
+    Future(#[from] FutureError),
 }
 
 /// How long each phase of an [`apply_dabs`] or a [`draw_step`](crate::draw_step) took (see the
@@ -745,12 +750,12 @@ fn replay_run(
     let run = Run {
         imprints,
         plan,
-        stroke,
+        stroke: Some(stroke),
         topology: store.mesh().topology(),
         #[cfg(test)]
         break_twins: replay::injected(store.id(), replay::Fault::BreakTwins),
     };
-    Some(store.par_map(&inputs, |&input| replay::replay_tile(run, input)))
+    Some(store.par_map(&inputs, |&input| replay_tile(run, input)))
 }
 
 /// Takes a run's `outcomes` (in key order), its tiles written, as done.

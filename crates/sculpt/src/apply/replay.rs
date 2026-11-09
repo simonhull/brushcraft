@@ -22,7 +22,7 @@ use crate::state::{Book, FinalState, Grant, Stroke, stroke_sum};
 /// What a replay assumes of the decisions [`Book::begin_dab`] makes, which depend on the tiles
 /// every dab edits and so can only be checked once the run is replayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Plan {
+pub(crate) enum Plan {
     /// No tile's state is released or denied during the run: each tile goes on with the state
     /// the stroke holds for it, or, if it holds none, with fresh state at its first edit. What
     /// every run whose dabs fit in the stroke's free buffers gets, and what nearly every other
@@ -96,21 +96,26 @@ impl Plan {
 }
 
 /// What every tile of a run reads: its dabs, the plan, the stroke and the mesh.
+///
+/// A tile's future ([`crate::future_of`]) is a run too, its dabs those of an open stroke not
+/// landed yet, replayed by the same [`replay_tile`] and written nowhere.
 #[derive(Clone, Copy)]
-pub(super) struct Run<'a> {
+pub(crate) struct Run<'a> {
     /// The run's dabs, in order.
-    pub(super) imprints: &'a [Imprint],
+    pub(crate) imprints: &'a [Imprint],
     /// What the replay assumes of the stroke state's grants.
-    pub(super) plan: &'a Plan,
-    /// The stroke, as the run begins: the state each tile and each vertex starts from.
-    pub(super) stroke: &'a Stroke,
+    pub(crate) plan: &'a Plan,
+    /// The stroke, as the run begins: the state each tile and each vertex starts from. `None`
+    /// for a stroke holding no state, as one whose dabs over the store haven't begun, or whose
+    /// state the next dab releases ([`Stroke::begin_frame`]): every value is captured afresh.
+    pub(crate) stroke: Option<&'a Stroke>,
     /// The mesh's topology: the copies and owners of border vertices.
-    pub(super) topology: &'a Topology,
+    pub(crate) topology: &'a Topology,
     /// Whether the tiles write their copies of a neighbour's border vertices off by one, as a
     /// broken replay would: the tests' way to see the store refuse the run's twins, and the run
     /// applied one dab at a time ([`Fault::BreakTwins`]).
     #[cfg(test)]
-    pub(super) break_twins: bool,
+    pub(crate) break_twins: bool,
 }
 
 /// A fault the tests inject into the runs over one store (see [`inject`]).
@@ -194,18 +199,18 @@ pub(super) fn injected(id: store::StoreId, fault: Fault) -> bool {
 
 /// One tile's part of a run, as the store holds it when the run begins.
 #[derive(Clone, Copy)]
-pub(super) struct TileInput<'a> {
+pub(crate) struct TileInput<'a> {
     /// The tile.
-    pub(super) key: TileKey,
+    pub(crate) key: TileKey,
     /// Its pen-down positions, which every dab of the run is weighed at.
-    pub(super) pen_down: PenDownTile<'a>,
-    /// Its corrections, as stored.
-    pub(super) corrections: CorrectionView<'a>,
+    pub(crate) pen_down: PenDownTile<'a>,
+    /// Its corrections, as stored (or, for a future, as the strokes before left them).
+    pub(crate) corrections: CorrectionView<'a>,
     /// The prediction the store keeps of it, if it keeps one: its frames.
-    pub(super) prediction: Option<&'a Prediction>,
+    pub(crate) prediction: Option<&'a Prediction>,
     /// Its frames, row-major, for a tile without a prediction: the axes its deltas are written
     /// along ([`frame_delta`]). With a prediction, its frames are the prediction's.
-    pub(super) frames: Option<&'a [Frame]>,
+    pub(crate) frames: Option<&'a [Frame]>,
 }
 
 impl TileInput<'_> {
@@ -236,7 +241,7 @@ pub(super) struct DabEdit {
 /// Why a tile's replay stopped: the run is then applied one dab at a time instead, the way
 /// that gives its own errors, as nothing has been written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Stopped {
+pub(crate) enum Stopped {
     /// A value the tile can't hold ([`CorrectionError::TooLarge`] or
     /// [`CorrectionError::NotFinite`]).
     Refused(CorrectionError),
@@ -251,12 +256,12 @@ pub(super) enum Stopped {
 
 /// What a run did to one tile.
 #[derive(Debug)]
-pub(super) struct TileOutcome {
+pub(crate) struct TileOutcome {
     /// The tile.
     pub(super) key: TileKey,
     /// Its corrections after the run, if a dab wrote any of its vertices (its own, or its copies
     /// of a neighbour's).
-    pub(super) written: Option<CorrectionTile>,
+    pub(crate) written: Option<CorrectionTile>,
     /// Whether a vertex of it was within a dab's radius: its positions moved.
     pub(super) reached: bool,
     /// Each dab that edited it, in order.
@@ -266,7 +271,7 @@ pub(super) struct TileOutcome {
     /// Its own stroke state after the run, if a dab wrote it with state.
     pub(super) state: Option<FinalState>,
     /// Why the replay stopped, if it did.
-    pub(super) stopped: Option<Stopped>,
+    pub(crate) stopped: Option<Stopped>,
 }
 
 /// A value not captured yet, as the stroke holds one: every component `NaN`.
@@ -284,10 +289,10 @@ struct Entry {
 
 impl Entry {
     /// `owner`'s entry `at` as the stroke holds it when the run begins: fresh if it holds no
-    /// state for `owner`.
-    fn found(stroke: &Stroke, owner: &TileKey, at: usize) -> Self {
+    /// state for `owner` (or none at all).
+    fn found(stroke: Option<&Stroke>, owner: &TileKey, at: usize) -> Self {
         let value = stroke
-            .held(owner)
+            .and_then(|stroke| stroke.held(owner))
             .and_then(|state| state.entry(at))
             .unwrap_or(UNCAPTURED);
         Self { value, as_of: None }
@@ -331,8 +336,8 @@ struct StrokeState {
 
 impl StrokeState {
     /// `key`'s state as the stroke holds it when the run begins (`entries` of them), or fresh.
-    fn found(stroke: &Stroke, key: &TileKey, entries: usize) -> Self {
-        let held = stroke.held(key);
+    fn found(stroke: Option<&Stroke>, key: &TileKey, entries: usize) -> Self {
+        let held = stroke.and_then(|stroke| stroke.held(key));
         let value = (0..entries)
             .map(|at| held.and_then(|state| state.entry(at)).unwrap_or(UNCAPTURED))
             .collect();
@@ -382,7 +387,10 @@ struct Owner {
 }
 
 /// One tile's replay of the run: see "Tile by tile" in the module notes of [`super`].
-pub(super) fn replay_tile(run: Run<'_>, input: TileInput<'_>) -> TileOutcome {
+///
+/// The one per-tile arithmetic of a run's dabs: a run lands its tiles' outcomes, and a tile's
+/// future ([`crate::future_of`]) is its outcome over the dabs not landed yet, kept apart.
+pub(crate) fn replay_tile(run: Run<'_>, input: TileInput<'_>) -> TileOutcome {
     let mut tile = Replay::new(run, input);
     let stopped = tile.dabs().err();
     tile.finish(stopped)
