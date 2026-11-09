@@ -104,6 +104,86 @@ fn a_damaged_batch_of_the_stroke_before_never_lets_the_later_one_land() {
     );
 }
 
+/// Crashes a project in `dir` with x's only batch damaged; returns what a restore offers, and
+/// w's op.
+///
+/// w lands (20 placed, 5 landed), x is behind it and b behind x (3 placed each), flushed; then,
+/// if `w_goes_on`, w lands 2 more and is flushed again.
+fn crash_with_x_damaged(
+    dir: &TestDir,
+    w_goes_on: bool,
+) -> (Vec<Result<OpId, JournalUnusable>>, OpId) {
+    let mut map = CorrectionMap::new();
+    let mut project = new_project(dir);
+    let mut w = begin_on_top(&mut project, 20, 186);
+    w.place(&mut project, 20);
+    w.land(&mut project, &mut map, 5);
+    let mut x = Behind::begin(&mut project, 3, 187);
+    x.place(&mut project, 3);
+    let mut b = Behind::begin(&mut project, 3, 188);
+    b.place(&mut project, 3);
+    flush(&mut project);
+    if w_goes_on {
+        w.land(&mut project, &mut map, 2);
+        flush(&mut project);
+    }
+    let ops: Vec<OpId> = batches(&mut project).iter().map(DabBatch::op).collect();
+    assert_eq!(ops.get(1), Some(&x.op()), "x's batch second: {ops:?}");
+    let loc = project.store().working().batch_locations().nth(1).unwrap();
+    let path = project.recovery_path().unwrap().to_path_buf();
+    drop(project);
+    drop((x.crashed(), b.crashed()));
+    damage(&path, loc);
+    (offered_ops(restore(dir)), w.op)
+}
+
+#[test]
+fn a_stroke_whose_every_batch_is_damaged_never_ends_the_strokes_before_it() {
+    // x's one batch doesn't read, and b names it. Nothing says x closed, so no chain starts at
+    // b: w's stands, and b can't be landed.
+    let dir = TestDir::new();
+    let (found, w) = crash_with_x_damaged(&dir, true);
+    assert_eq!(
+        found,
+        vec![Ok(w), Err(JournalUnusable::Damaged)],
+        "w, whose later batch reads, usable; b not"
+    );
+    // With w's last batch before the damaged one, that one may have been w's closing batch:
+    // w can't be landed either, but it never ended.
+    let alone = TestDir::new();
+    let (found_alone, w_alone) = crash_with_x_damaged(&alone, false);
+    let why = JournalUnusable::Damaged;
+    let behind = JournalUnusable::EarlierUnusable {
+        earlier: w_alone,
+        why: Box::new(why.clone()),
+    };
+    assert_eq!(found_alone, vec![Err(why), Err(behind)]);
+}
+
+#[test]
+fn a_run_missing_a_batch_that_doesn_t_read_is_damaged() {
+    // a's batches 0..10 and 10..14; the second doesn't read, and a third, after it, goes on from
+    // 14: the run needs the missing one.
+    let dir = TestDir::new();
+    let mut project = new_project(&dir);
+    let mut a = begin_on_top(&mut project, 20, 189);
+    a.place(&mut project, 10);
+    flush(&mut project);
+    a.place(&mut project, 4);
+    flush(&mut project);
+    a.place(&mut project, 2);
+    flush(&mut project);
+    let loc = project.store().working().batch_locations().nth(1).unwrap();
+    let path = project.recovery_path().unwrap().to_path_buf();
+    drop(project);
+    damage(&path, loc);
+    assert_eq!(
+        offered_ops(restore(&dir)),
+        vec![Err(JournalUnusable::Damaged)],
+        "not a gap: the batch between didn't read"
+    );
+}
+
 /// The batches a hostile file appends: `count` of them.
 const HOSTILE_BATCHES: u32 = 300_000;
 

@@ -38,8 +38,11 @@
 //! its own cut only once every stroke before it has ended, so an open stroke before the last
 //! chain's start is one left open by an earlier session (unusable then, never closed in the
 //! file, or a crash before its closing batch) and has ended ([`JournalUnusable::Ended`]); it
-//! never makes a later stroke unusable. A stroke naming one that isn't open starts a chain too,
-//! on the surface that one left, if the file holds it (see below). A restored project closes
+//! never makes a later stroke unusable. A stroke naming one the scan found closed starts a chain
+//! too, on the surface that one left (see below). One naming a stroke the scan didn't find at
+//! all starts none: that one may be a stroke whose every batch doesn't read, still open behind
+//! those before it, so nothing says they ended; the stroke naming it can't be landed (damaged,
+//! or a mismatch with every batch read), and those behind it with it. A restored project closes
 //! every stroke it found open, usable or not, as it hands out a fresh op, so a later restore
 //! finds none of them.
 //!
@@ -421,6 +424,10 @@ pub(super) fn find(store: &TileStore) -> Found {
     let file = store.working();
     let scan = Scan::of(file, store.pools_budget());
     if scan.too_large {
+        // Nothing is closed in the file then: no op is kept to close. Only a hostile file gets
+        // here (a real one keeps a few batches of a few strokes), and its batches stay as they
+        // are until a save moves the project onto a fresh recovery file; a restore of it again
+        // finds the same.
         return Found {
             strokes: vec![Err(JournalUnusable::TooLarge)],
             open: Vec::new(),
@@ -456,6 +463,13 @@ pub(super) fn find(store: &TileStore) -> Found {
                     stroke.after = Some(named);
                     stroke
                 })
+            }
+            // Naming a stroke the scan didn't find, after a batch that doesn't read: that one
+            // may have been it, still open.
+            (Some(_), PenDown::After(named))
+                if scan.first_damaged.is_some() && !scan.open.contains_key(&named) =>
+            {
+                Err(JournalUnusable::Damaged)
             }
             (Some(_), _) => Err(JournalUnusable::Mismatch),
             (None, PenDown::After(named)) => scan
@@ -515,10 +529,12 @@ impl Opened {
 
     /// `next`, the stroke's next batch: kept if it follows the one before, from which the batches
     /// before the last at or before its landed count go (the landed count only grows, so they
-    /// are never needed again); else the stroke is broken.
+    /// are never needed again); else the stroke is broken, [`JournalUnusable::Damaged`] if a
+    /// batch that doesn't read came between them, which may have been the one missing.
     fn push(&mut self, next: Kept) {
         self.last = next.head;
-        self.damaged = false;
+        // A batch between the last kept and this one didn't read: it may have been the stroke's.
+        let damaged_between = std::mem::take(&mut self.damaged);
         if self.broken.is_some() {
             return;
         }
@@ -527,7 +543,12 @@ impl Opened {
             .back()
             .map_or(Ok(()), |before| follows(&before.head, &next.head));
         if let Err(why) = followed {
-            self.broken = Some(why);
+            // A run that doesn't go on may only have lost the batch that didn't read.
+            self.broken = Some(if damaged_between {
+                JournalUnusable::Damaged
+            } else {
+                why
+            });
             self.batches.clear();
             return;
         }
@@ -664,14 +685,18 @@ impl Scan {
 
     /// Where the last chain of open strokes starts, as a place among them in op order (see the
     /// module notes, "Chains"): the last stroke whose batches name a surface of its own (a save
-    /// point, or unknown), or the stroke before it as one not open; 0 with none.
+    /// point, or unknown), or the stroke before it as one the scan found closed; 0 with none.
     fn chain_start(&self) -> usize {
+        // A stroke naming one the scan found closed: that one ended, so every stroke before it
+        // did. One the scan didn't find at all may be one whose every batch doesn't read, still
+        // open behind those before it: no evidence they ended, so no chain starts there (the
+        // stroke naming it can't be landed, see `find`).
         let starts =
             self.open
                 .values()
                 .enumerate()
                 .filter(|(_, opened)| match opened.last.pen_down {
-                    PenDown::After(named) => !self.open.contains_key(&named),
+                    PenDown::After(named) => self.closed.contains_key(&named),
                     PenDown::Base | PenDown::At(_) | PenDown::Unknown => true,
                 });
         starts.map(|(at, _)| at).next_back().unwrap_or(0)

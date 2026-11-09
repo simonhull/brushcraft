@@ -492,11 +492,9 @@ fn a_stroke_named_after_one_the_file_holds_nothing_of_is_unusable() {
     append_and_save(&dir, &after_none(stroke.op));
     assert_eq!(
         offered_ops(restore(&dir)),
-        vec![
-            Err(JournalUnusable::Ended),
-            Err(JournalUnusable::PenDownUnknown)
-        ],
-        "a chain of its own, which ends the open one before it, on a surface no save point holds"
+        vec![Ok(stroke.op), Err(JournalUnusable::Mismatch)],
+        "nothing says the one it names closed, so no chain starts there, and that one isn't the \
+         open one before it"
     );
 
     // With no stroke open before it: its surface is in no save point.
