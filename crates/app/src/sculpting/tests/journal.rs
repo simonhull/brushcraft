@@ -304,7 +304,8 @@ fn a_stroke_shown_ahead_is_journalled_before_any_dab_lands() {
         shown += report.dabs_shown;
     }
     assert!(shown > 3, "{shown} dabs shown");
-    assert!(!run.project.has_unsaved_edits(), "no dab has landed");
+    // The project counts dabs still landing as unsaved work: the stroke says none landed.
+    assert_eq!(run.stroke().landed, 0, "no dab has landed");
     let placed = run.queued_rows();
     assert_eq!(placed.len(), shown);
     run.cut();
