@@ -392,6 +392,37 @@ impl SaveFailure {
         format!("Couldn't save: {}", self.trouble.said())
     }
 
+    /// What the finisher's desktop notification says of this failure of a save of the project
+    /// named `name` (the dab journal spec, "Finishing unseen"): its summary and body, which say
+    /// only what is true, as the bar does. The reason comes first in the body, in the user's
+    /// words.
+    pub(crate) fn notice(self, name: &str) -> (String, String) {
+        if matches!(self.work, Work::SavedLessEdits) {
+            let summary = format!("BrushCraft saved {name}, less part of a stroke");
+            let body = "Part of a stroke is gone. The rest of your work was saved.".to_owned();
+            return (summary, body);
+        }
+        let summary = format!("BrushCraft couldn't save {name}");
+        let said = self.trouble.said();
+        let mut letters = said.chars();
+        let reason: String = letters
+            .next()
+            .map(|first| first.to_uppercase().chain(letters).collect())
+            .unwrap_or_default();
+        let rest = match (self.work, self.cover) {
+            (_, Cover::Exposed) => {
+                "Open it to see what was kept: crash protection was off, so recent work may be lost."
+            }
+            (Work::LessAStroke, Cover::Protected) => {
+                "Your other work is safe and comes back when you open it."
+            }
+            (Work::Whole | Work::Found | Work::SavedLessEdits, Cover::Protected) => {
+                "Your work is safe and comes back when you open it."
+            }
+        };
+        (summary, format!("{reason}. {rest}"))
+    }
+
     /// What the bar says under it, of the work.
     pub(crate) const fn detail(self) -> &'static str {
         match (self.work, self.cover) {
@@ -405,6 +436,12 @@ impl SaveFailure {
             }
         }
     }
+}
+
+/// Whether `error` says the recovery file may not hold the edits, in any link of its chain: a
+/// close that failed so leaves a recovery file a finisher's notification can't call safe.
+pub(crate) fn says_uncovered(error: &Error) -> bool {
+    error.chain().any(says_edits_arent_covered)
 }
 
 /// Whether `cause`, a link of an error's chain, says the recovery file may not hold the edits.
@@ -790,6 +827,58 @@ mod tests {
         assert_eq!(
             failure(&no_path).title(),
             "Couldn't save: something went wrong"
+        );
+    }
+
+    /// The finisher's notification says what is true, kind by kind, as the bar does.
+    #[test]
+    fn a_finishers_notice_says_only_what_is_true() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        let couldnt = "BrushCraft couldn't save first-sculpt".to_owned();
+        let notice = |failure: SaveFailure| failure.notice("first-sculpt");
+        assert_eq!(
+            notice(failure(&full)),
+            (
+                couldnt.clone(),
+                "The disk is full. Your work is safe and comes back when you open it.".to_owned()
+            ),
+            "whole, protected"
+        );
+        let less = SaveFailure::of(&full, Work::LessAStroke, &Protection::Active);
+        assert_eq!(
+            notice(less),
+            (
+                couldnt.clone(),
+                "The disk is full. Your other work is safe and comes back when you open it."
+                    .to_owned()
+            ),
+            "a stroke's dabs dropped"
+        );
+        let exposed = "The disk is full. Open it to see what was kept: crash protection was off, \
+                       so recent work may be lost."
+            .to_owned();
+        assert_eq!(
+            notice(SaveFailure::of(&full, Work::Whole, &paused())),
+            (couldnt.clone(), exposed.clone()),
+            "protection paused"
+        );
+        assert_eq!(
+            notice(failure(&full).exposed()),
+            (couldnt, exposed),
+            "a flush failed meanwhile"
+        );
+        let gone = Error::new(TilesLost(2));
+        assert_eq!(
+            notice(failure(&gone)),
+            (
+                "BrushCraft saved first-sculpt, less part of a stroke".to_owned(),
+                "Part of a stroke is gone. The rest of your work was saved.".to_owned()
+            ),
+            "saved less part of a stroke"
+        );
+        assert_eq!(
+            notice(SaveFailure::stroke_lost_but_saved()).0,
+            "BrushCraft saved first-sculpt, less part of a stroke"
         );
     }
 

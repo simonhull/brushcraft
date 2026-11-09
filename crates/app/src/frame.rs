@@ -536,6 +536,14 @@ pub(crate) trait Brush {
         false
     }
 
+    /// How many of the pen events a save holds the brush hasn't placed as dabs yet: a stroke
+    /// waiting behind the one landing, held as raw samples. They aren't in the journal until they
+    /// are placed, so the window can't go before the save is written while any is left
+    /// ([`Owner::finish_unseen`]). None by default.
+    fn unplaced_for_save(&self) -> usize {
+        0
+    }
+
     /// A save was asked for at `asked`: from now on a stroke whose `Down` came later waits, its
     /// samples kept, until [`Brush::end_saving`], and isn't in the save.
     fn begin_saving(&mut self, _asked: Instant) {}
@@ -1946,10 +1954,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 if failure.is_some_and(SaveFailure::of_found_work) {
                     self.act(Action::OpenCopy, now);
                 } else {
+                    let exit = self.after_retry == AfterSave::Exit;
+                    let unseen = exit && self.may_finish_unseen(now);
                     self.request_save(now);
                     self.after_save = self.after_retry;
-                    if self.after_save != AfterSave::Stay {
+                    if exit {
                         self.dialogs.finish(self.save_counts(), now);
+                    }
+                    if unseen {
+                        self.flush_to_finish(now);
                     }
                 }
             }
@@ -3653,19 +3666,30 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// told.
     fn save_failed(&mut self, error: &anyhow::Error, now: Instant) {
         self.saving.failed(error, self.closing());
-        self.after_retry = self.after_save;
+        // A retry decides afresh whether the window can go before its save is written.
+        self.after_retry = match self.after_save {
+            AfterSave::Unseen(_) => AfterSave::Exit,
+            after @ (AfterSave::Stay | AfterSave::Exit) => after,
+        };
+        let failure = self.failure_of(error);
+        self.told_drops = self.brush.drops();
+        self.tell_failure(failure, now);
+    }
+
+    /// The failed save `error` as the user hears of it: whatever the error, it owns up to any dabs
+    /// dropped that the user hasn't heard of, and says the work isn't safe if the recovery file
+    /// may lack it.
+    fn failure_of(&self, error: &anyhow::Error) -> SaveFailure {
         let work = match self.brush.dropped_since(self.told_drops) {
             Ok(()) => Work::Whole,
             Err(_) => Work::LessAStroke,
         };
-        self.told_drops = self.brush.drops();
         let failure = SaveFailure::of(error, work, &self.project.protection());
-        let failure = if self.exposed.is_some() {
+        if self.exposed.is_some() {
             failure.exposed()
         } else {
             failure
-        };
-        self.tell_failure(failure, now);
+        }
     }
 
     /// The bar says `failure` at `now`, which a close can leave on.
@@ -3729,21 +3753,25 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Whether the close bar's Save at `now` can let the window go before the save is written, the
     /// landing and the save finishing unseen: dabs are still landing, the brush journals them, the
-    /// pen holds none back, the project has a file to save to, and the recovery file guards the
-    /// work. Otherwise the window waits for the save, as for any: a pen still down or a stroke
-    /// not yet routed needs frames, and with crash protection paused, or a flush failed or short,
-    /// the journal can't be trusted to keep what a failure would leave.
+    /// pen holds none back, the project has a file to save to, and the journal holds everything
+    /// the save does ([`Owner::journal_holds_it`]). Otherwise the window waits for the save, as for
+    /// any: a pen still down or a stroke not yet routed needs frames.
     fn may_finish_unseen(&self, now: Instant) -> bool {
         let landing = self.brush.journals() && self.brush.landing_for_save() > 0;
         let pen = self.brush.pen_down() || self.pen_queued(now);
         let saved_to = self.project.path().is_some();
-        landing && !pen && saved_to && self.saving.stage().is_none() && self.journal_guards()
+        landing && !pen && saved_to && self.saving.stage().is_none() && self.journal_holds_it()
     }
 
-    /// Whether the recovery file guards the work as far as the frame loop knows: crash protection
-    /// is running and no flush has failed or fallen short since the last save.
-    fn journal_guards(&self) -> bool {
-        self.project.protection().is_active() && self.exposed.is_none()
+    /// Whether a durable journal would keep everything the save holds, as far as the frame loop
+    /// knows: crash protection is running, no flush has failed or fallen short since the last
+    /// save, and the brush has placed every pen event the save holds as dabs. A stroke waiting
+    /// behind the one landing is raw pen samples ([`Brush::unplaced_for_save`]), which no journal
+    /// holds until they are placed; with crash protection paused, or a flush failed or short,
+    /// the journal can't be trusted to keep what a failure would leave.
+    fn journal_holds_it(&self) -> bool {
+        let guarded = self.project.protection().is_active() && self.exposed.is_none();
+        guarded && self.brush.unplaced_for_save() == 0
     }
 
     /// Asks the project at `now` for a flush of every edit and every dab journalled so far, so the
@@ -3752,7 +3780,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     fn flush_to_finish(&mut self, now: Instant) {
         let asked = self.project.request_flush(now);
         self.after_save = match self.heard(asked, "asking for a flush to close") {
-            Ok(()) if self.journal_guards() => AfterSave::Unseen(Unseen::Flushing),
+            Ok(()) if self.journal_holds_it() => AfterSave::Unseen(Unseen::Flushing),
             Ok(()) => AfterSave::Exit,
             Err(error) => {
                 saving::log(&format!("brushcraft: {error:#}"));
@@ -3765,12 +3793,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// go unseen: the recovery writer polled (the save's landing holds the frames' landing back,
     /// so nothing new lands meanwhile), and once every edit and dab placed is in a durable save
     /// point, the window asked to go ([`WindowRequest::Finish`]). Expected: milliseconds, one
-    /// flush's syncs. Anything else editing the project meanwhile, a store job say, is asked for
-    /// again, queued behind the flush in flight.
+    /// flush's syncs. Until then each pass asks for a flush again ([`Project::request_flush`]):
+    /// that starts nothing with nothing waiting, and queues at most one behind the flush in
+    /// flight, so whatever else edits the project meanwhile (a store job, say) is taken too.
     ///
-    /// If the recovery file stops guarding the work (protection paused, a flush failed or short),
-    /// the save goes on in the window instead, landing and then writing as any, and the window
-    /// waits for it.
+    /// If the journal stops holding everything the save does ([`Owner::journal_holds_it`]:
+    /// protection paused, a flush failed or short, a pen event not placed), the save goes on in
+    /// the window instead, landing and then writing as any, and the window waits for it.
     fn journal_step(&mut self, unseen: Unseen) -> SaveStep {
         if unseen == Unseen::Asked {
             return SaveStep::Idle;
@@ -3781,7 +3810,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.after_save = AfterSave::Exit;
             return SaveStep::Worked;
         }
-        if !self.journal_guards() {
+        if !self.journal_holds_it() {
             self.after_save = AfterSave::Exit;
             return SaveStep::Worked;
         }
@@ -3966,7 +3995,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// **A failure** (a landing that fails, dabs dropped, a save that fails, a full disk) keeps
     /// the recovery file, which holds the work: opening the project brings it back. Nobody is at a
     /// window to read it, so it is said through `notify`, as a desktop notification's summary and
-    /// body ([`finisher_notice`]), and is the run's error, as a close's is.
+    /// body ([`SaveFailure::notice`]), once the project has closed, so it says what the recovery
+    /// file kept; and it is the run's error, as a close's is.
     ///
     /// # Errors
     ///
@@ -3976,30 +4006,56 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let flushed = self.flush_brush();
         let whole = landed.is_ok() && flushed.is_ok();
         let saved = said_too(said_too(landed, flushed), self.last_save(whole));
-        if let Err(error) = &saved {
-            let (summary, body) = finisher_notice(self.saving.name(), error);
+        let failure = saved.as_ref().err().map(|error| self.failure_of(error));
+        let name = self.saving.name().to_owned();
+        let closed = self.close_project();
+        if let Some(failure) = failure {
+            // The close decides what the recovery file kept.
+            let uncovered = closed.as_ref().err().is_some_and(saving::says_uncovered);
+            let failure = if uncovered {
+                failure.exposed()
+            } else {
+                failure
+            };
+            let (summary, body) = failure.notice(&name);
             notify(&summary, &body);
         }
-        let closed = self.close_project();
         said_too(saved, closed)
     }
 
     /// The finisher's landing ([`Owner::finish_unseen`]): the pen's samples no longer taken, then
-    /// batch after batch of what the brush holds until it holds nothing or a batch lands nothing,
-    /// the project's recovery writer tended before each.
+    /// batch after batch of what the brush holds until it holds nothing, the project's recovery
+    /// writer tended before each and once after.
+    ///
+    /// An error doesn't stop it: what is left lands all the same, ticked as ever, so the recovery
+    /// file keeps up with it whatever the save then makes of the error. It stops early only once
+    /// [`FINISH_STALLS`] batches in a row have changed nothing, which leaves what is left to
+    /// [`Owner::flush_brush`].
     ///
     /// # Errors
     ///
-    /// As [`Owner::request_close`], [`Owner::close_step`] and [`Owner::tend_recovery`].
+    /// The first of [`Owner::request_close`], [`Owner::close_step`] and [`Owner::tend_recovery`]
+    /// that failed, those after it as its context.
     fn land_unseen(&mut self) -> Result<()> {
-        self.request_close()?;
+        let mut outcome = self.request_close();
+        let mut stalls = 0;
         loop {
-            self.tend_recovery(Instant::now())?;
-            if self.landing() == 0 || !self.close_step()? {
+            outcome = said_too(outcome, self.tend_recovery(Instant::now()));
+            let before = self.landing();
+            if before == 0 || stalls == FINISH_STALLS {
                 break;
             }
+            let landed = match self.close_step() {
+                Ok(landed) => landed,
+                Err(error) => {
+                    outcome = said_too(outcome, Err(error));
+                    false
+                }
+            };
+            let moved = landed || self.landing() != before;
+            stalls = if moved { 0 } else { stalls + 1 };
         }
-        self.tend_recovery(Instant::now())
+        said_too(outcome, self.tend_recovery(Instant::now()))
     }
 
     /// Has the brush apply what it still holds and end its stroke, as the project is about to
@@ -4264,21 +4320,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 }
 
-/// What the finisher tells the desktop when it couldn't save: a notification's summary and body.
+/// How many of the finisher's batches in a row may change nothing before it stops trying.
 ///
-/// For the project named `name`, failed for `error` ([`Owner::finish_unseen`]): in the user's
-/// words ([`SaveTrouble`]), the reason first in the body. The recovery file holds the work.
-fn finisher_notice(name: &str, error: &anyhow::Error) -> (String, String) {
-    let said = SaveTrouble::of(error).said();
-    let mut letters = said.chars();
-    let reason: String = letters
-        .next()
-        .map(|first| first.to_uppercase().chain(letters).collect())
-        .unwrap_or_default();
-    let summary = format!("BrushCraft couldn't save {name}");
-    let body = format!("{reason}. Your work is safe and comes back when you open it.");
-    (summary, body)
-}
+/// A batch of [`Owner::land_unseen`] can find nothing it may land yet (a stroke beginning, its cut
+/// still to be taken), which a tick between batches moves on.
+const FINISH_STALLS: u32 = 3;
 
 /// Whether `error`, of a tick or a poll, is the recovery file's alone, so a run can go on after it.
 ///

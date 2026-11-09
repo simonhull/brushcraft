@@ -2497,6 +2497,10 @@ impl Brush for Sculpting {
         true
     }
 
+    fn unplaced_for_save(&self) -> usize {
+        self.deferred_in_save().count() + self.held.len()
+    }
+
     fn begin_saving(&mut self, asked: Instant) {
         self.save_asked = Some(asked);
     }
