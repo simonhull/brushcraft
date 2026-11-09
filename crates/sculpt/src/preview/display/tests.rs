@@ -1073,7 +1073,7 @@ impl OpenStrokes for Two<'_> {
         op == self.later.op()
     }
 
-    fn ready(&mut self, op: OpId, _dabs: &[Dab], _tiles: &[TileKey], displays: &[TileKey]) -> bool {
+    fn ready(&mut self, op: OpId, _dabs: &[Dab], displays: &[TileKey]) -> bool {
         op != self.later.op() || displays.is_empty() || self.displays_ready
     }
 }

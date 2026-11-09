@@ -321,6 +321,23 @@ fn vertices_in(key: &TileKey, finest: Level, tile: &TileKey) -> Vec<(usize, u32,
     out
 }
 
+/// The finest tiles under display tile `key`, at `finest`, along its border: those holding its
+/// border vertices.
+pub(super) fn finest_on_border(key: &TileKey, finest: Level) -> Vec<TileKey> {
+    let quads = key.side() - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let span = (quads * step / finest.tile_quads().max(1)).max(1);
+    let (x0, y0) = (u32::from(key.tx()) * span, u32::from(key.ty()) * span);
+    let (x1, y1) = (x0 + span - 1, y0 + span - 1);
+    let grid = (y0..=y1).flat_map(|y| (x0..=x1).map(move |x| (x, y)));
+    let border = grid.filter(|&(x, y)| x == x0 || x == x1 || y == y0 || y == y1);
+    let tiles = border.filter_map(|(x, y)| {
+        let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        TileKey::displacement(key.face(), finest, x, y).ok()
+    });
+    tiles.collect()
+}
+
 /// The finest tiles under display tile `key`, at `finest`.
 pub(super) fn finest_under(key: &TileKey, finest: Level) -> Vec<TileKey> {
     let quads = key.side() - 1;
@@ -924,22 +941,24 @@ impl DisplayState {
     }
 
     /// The preview to hand the store: what is drawn, its normals and bound (module notes),
-    /// `held` as given, with `seams` in place of its own vertices there: each a vertex's index
-    /// and the position and normal a later stroke's preview holding it draws (module notes,
-    /// "Seams"). Its normals are made again first.
+    /// `held` as given, with `seams` in place of its own vertices there: each a vertex's index,
+    /// and the position and the normal another preview holding it draws, where it draws those
+    /// rather than its own (the parent module's "Seams"). Its normals are made again first.
     pub(super) fn publish(
         &mut self,
         held: bool,
         rounding: f64,
         moves_cap: f64,
-        seams: &[(usize, Vec3, Vec3)],
+        seams: &[(usize, Option<Vec3>, Option<Vec3>)],
     ) -> DisplayPreview {
         self.refresh_normals();
         let mut positions = self.drawn.clone();
         let mut normals = self.normals.clone();
         for &(v, position, normal) in seams {
-            if let (Some(p), Some(n)) = (positions.get_mut(v), normals.get_mut(v)) {
+            if let (Some(p), Some(position)) = (positions.get_mut(v), position) {
                 *p = position;
+            }
+            if let (Some(n), Some(normal)) = (normals.get_mut(v), normal) {
                 *n = normal;
             }
         }

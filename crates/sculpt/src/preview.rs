@@ -97,16 +97,19 @@
 //! Previews of one stroke meet bit for bit, each move a function of a vertex's bits. Previews of
 //! two strokes would not: a later stroke's holds the earlier one's work rounded as it will land,
 //! the earlier one's its moves unrounded, a difference of the stored encoding at the vertices
-//! they share, and in the rings their normals read. So they never meet:
+//! they share (and a later stroke's pending dabs, at a display preview still the earlier one's).
+//! So every preview holding a vertex draws it as one does ([`Preview::stitch`]): the newest
+//! stroke's, a finest preview's before a display one's of the same stroke, at every finest
+//! preview's every point (its ring and its base-vertex rings included, which the normals read)
+//! and every display preview's border vertices, at every level; display previews at one level
+//! draw that one's normal there too. Each preview stays its own stroke's otherwise, and nothing
+//! waits for it: no future is read but those a stroke's own previews read.
 //!
-//! - **Finest tiles:** a later stroke takes over every earlier stroke's preview beside one of its
-//!   own (a ring apart), and every earlier stroke's preview those lead to: each is made over its
-//!   pen-down surface and moved by its dabs, its own whether they move it or not. Its dabs are
-//!   shown only once the futures of the previews they take over are in, and a preview made later
-//!   beside one of a later stroke is taken over as it is made ([`Preview::close_seams`]).
-//! - **Display tiles:** taking over there would need much of an earlier stroke's futures, so at a
-//!   vertex display previews of different strokes share, each draws the newest stroke's position
-//!   and normal (its bound measures the vertices drawn so: the `display` module's "The bound").
+//! A preview drawing another's bits there differs from what lands by what that one does: a later
+//! stroke's finest preview by the stored encoding (that of the earlier strokes' work, which its
+//! pen-down holds rounded, and its own), within the finest previews' bound; a display preview's
+//! bound measures the vertices it draws (the `display` module's "The bound"). One whose vertex
+//! another no longer wins (the later stroke's preview gone) is made again.
 //!
 //! # Which tiles
 //!
@@ -138,7 +141,7 @@
 //!
 //! Once no dab is shown, no tile is previewed.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use brush::{Imprint, Smoothstep, draw_imprint_vertex, draw_move};
 use geom::{GatheredBlock, Level, TileKey, Vec3};
@@ -354,15 +357,39 @@ pub struct Preview {
     /// Per display tile previewed, its border vertices' places: where it meets the tiles around
     /// it ([`seams::border_places`]).
     border_places: BTreeMap<TileKey, Vec<(usize, Place)>>,
-    /// The finest tiles the call under way made or kept: where previews of different strokes may
-    /// have come to meet ([`Preview::close_seams`]).
+    /// The finest tiles the call under way made, kept or cleared: where previews of different
+    /// strokes may have come to meet or part ([`Preview::stitch`]).
     touched: Vec<TileKey>,
+    /// The display tiles the call under way handed over, or let go of: the same for them.
+    display_seeds: Vec<TileKey>,
+    /// Per finest tile a call may stitch, its block's places ([`seams::Shared`]); `None` for
+    /// a region that can't be gathered.
+    finest_places: BTreeMap<TileKey, Option<seams::Shared>>,
+    /// Per finest preview drawing a later stroke's bits at some vertices, their places.
+    finest_subs: BTreeMap<TileKey, BTreeSet<Place>>,
+    /// Per display preview, the vertices it draws as a later stroke's preview does.
+    display_subs: BTreeMap<TileKey, Vec<Seam>>,
 }
 
 /// A display preview being handed to the store ([`Preview::publish`]): whether it is held, its
 /// rounding's bound, the vertices it draws as a later stroke's (see "Seams" in the module notes),
 /// and its state.
-type Publishing<'a> = (bool, f64, &'a [(usize, Vec3, Vec3)], &'a mut DisplayState);
+type Publishing<'a> = (bool, f64, &'a [Seam], &'a mut DisplayState);
+
+/// A vertex a display preview draws as other previews do (see "Seams" in the module notes): its
+/// index, and the position and the normal it draws there, where those are another's.
+type Seam = (usize, Option<Vec3>, Option<Vec3>);
+
+/// The preview whose bits a place shows ([`Preview::choose`]).
+#[derive(Debug, Clone, Copy)]
+struct Chosen {
+    /// The stroke whose preview it is.
+    owner: Tag,
+    /// The preview: a finest tile's or a display tile's.
+    holder: TileKey,
+    /// What it draws there: its position, or for a display level's normals, its normal.
+    at: Vec3,
+}
 
 /// Which tiles a renderer holds or wants: those a [`Preview`] makes previews of.
 ///
@@ -416,19 +443,11 @@ fn base_of<S: OpenStrokes>(strokes: &S, op: Tag) -> Base {
     }
 }
 
-/// Whether every future stroke `op`'s previews read is installed ([`OpenStrokes::ready`]).
-///
-/// Near `dabs`, in the blocks of finest tiles `tiles` and under display tiles `displays`. Always
-/// for a stroke whose op is begun.
-fn ready<S: OpenStrokes>(
-    strokes: &mut S,
-    op: Tag,
-    dabs: &[Dab],
-    tiles: &[TileKey],
-    displays: &[TileKey],
-) -> bool {
+/// Whether every future stroke `op`'s previews read near `dabs` and under display tiles
+/// `displays` is installed ([`OpenStrokes::ready`]); always for a stroke whose op is begun.
+fn ready<S: OpenStrokes>(strokes: &mut S, op: Tag, dabs: &[Dab], displays: &[TileKey]) -> bool {
     match op {
-        Some(op) if strokes.reserved(op) => strokes.ready(op, dabs, tiles, displays),
+        Some(op) if strokes.reserved(op) => strokes.ready(op, dabs, displays),
         _ => true,
     }
 }
@@ -526,7 +545,7 @@ impl Preview {
         let mut stats = PreviewStats::default();
         let mut shown = self.show_ready(strokes, op, dabs, &imprints, drawn, &mut stats);
         let touched = std::mem::take(&mut self.touched);
-        let seamed = self.close_seams(strokes, touched, &mut stats);
+        let seamed = self.stitch(strokes, touched, &mut stats);
         shown = shown.and(seamed);
         let (mut store, _) = strokes.current();
         self.note_bytes(&mut store);
@@ -539,9 +558,8 @@ impl Preview {
     /// Shows `imprints`, the imprints of `dabs` of stroke `op`, if they may be shown now (see
     /// [`Preview::show_over`]).
     ///
-    /// For a later stroke, the futures its previews read are installed first, those of the earlier
-    /// strokes' previews it takes over where they meet its own included (see "Seams" in the module
-    /// notes): none of the dabs is shown until they all are.
+    /// For a later stroke, the futures its finest previews read are installed first, and none of
+    /// the dabs is shown until they are: its own previews' and nothing else.
     ///
     /// # Errors
     ///
@@ -556,20 +574,7 @@ impl Preview {
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         let later_shown = self.segments.back().is_some_and(|last| last.op > op);
-        if imprints.is_empty() || later_shown || !ready(strokes, op, dabs, &[], &[]) {
-            return Ok(());
-        }
-        // The earlier strokes' previews around the tiles the dabs reach: this stroke's once shown.
-        let around: Vec<TileKey> = {
-            let (store, index) = open(strokes, op)?;
-            let reached = imprints
-                .iter()
-                .flat_map(|dab| index.query_sphere(centre(dab), reach(dab)));
-            let reached: BTreeSet<TileKey> = reached.collect();
-            let around = self.older_around(&store, op, reached)?;
-            around.into_iter().collect()
-        };
-        if !ready(strokes, op, &[], &around, &[]) {
+        if imprints.is_empty() || later_shown || !ready(strokes, op, dabs, &[]) {
             return Ok(());
         }
         let base = base_of(strokes, op);
@@ -593,9 +598,8 @@ impl Preview {
         };
         drop_blocks(strokes, taken);
         if self.shown.len() > before {
-            let adopted = self.adopt(strokes, op, &around, stats);
             let displays = self.show_displays(strokes, op, imprints, drawn, stats);
-            shown = shown.and(adopted).and(displays);
+            shown = shown.and(displays);
         }
         shown
     }
@@ -608,144 +612,324 @@ impl Preview {
         }
     }
 
-    /// Whether previews of more than one stroke are shown: only then can two meet.
+    /// The stroke whose preview tile `key` shows: a finest tile's or a display tile's, if it has
+    /// one.
+    fn owner_of(&self, key: &TileKey) -> Option<Tag> {
+        if key.channel() == geom::Channel::DISPLAY {
+            self.displays.get(key).map(|state| state.op)
+        } else {
+            self.shown_by(key)
+        }
+    }
+
+    /// Whether previews of more than one stroke are shown, finest or display: only then can two
+    /// meet.
     fn mixed(&self) -> bool {
-        let mut owners = self
+        let finest = self
             .reached
             .values()
             .filter_map(|reached| match reached.showing {
                 Showing::Of(op) => Some(op),
                 Showing::Untouched => None,
             });
+        let display = self.displays.values().map(|state| state.op);
+        let mut owners = finest.chain(display);
         let first = owners.next();
         owners.any(|owner| Some(owner) != first)
     }
 
-    /// The tiles shown by strokes older than `op` that `seeds` lead to, a ring apart (each tile's
-    /// normal inputs) through tiles so shown: those `op`'s previews take over where they meet its
-    /// own (see "Seams" in the module notes).
+    /// The previews that may hold a vertex preview `key` holds, `key`'s included: for a finest
+    /// tile, the finest tiles of its ring and the display tiles above them; for a display tile,
+    /// the same around the finest tiles along its border, where it meets the tiles around it.
+    /// Only those previewed (a finest tile) or with a state (a display tile).
     ///
     /// # Errors
     ///
     /// As [`TileStore::normal_inputs`].
-    fn older_around(
-        &self,
-        store: &TileStore,
-        op: Tag,
-        seeds: impl IntoIterator<Item = TileKey>,
-    ) -> Result<BTreeSet<TileKey>, CacheError> {
-        let older = |key: &TileKey| self.shown_by(key).is_some_and(|by| by < op);
-        let mut work: Vec<TileKey> = seeds.into_iter().collect();
-        let mut seen: BTreeSet<TileKey> = work.iter().copied().collect();
+    fn around(&self, store: &TileStore, key: &TileKey) -> Result<BTreeSet<TileKey>, CacheError> {
+        let finest: Vec<TileKey> = if key.channel() == geom::Channel::DISPLAY {
+            let Some(level) = store.display_finest() else {
+                return Ok(BTreeSet::new());
+            };
+            display::finest_on_border(key, level)
+        } else {
+            vec![*key]
+        };
         let mut around = BTreeSet::new();
-        while let Some(key) = work.pop() {
-            if older(&key) {
-                around.insert(key);
-            }
-            for input in store.normal_inputs(&key)?.iter() {
-                if older(input) && seen.insert(*input) {
-                    work.push(*input);
+        around.insert(*key);
+        for tile in &finest {
+            for input in store.normal_inputs(tile)?.iter() {
+                if self.shown_by(input).is_some() {
+                    around.insert(*input);
                 }
+                let above = display_ancestors(input).filter(|up| self.displays.contains_key(up));
+                around.extend(above);
             }
         }
         Ok(around)
     }
 
-    /// Stroke `op` takes over the previews of `keys` that earlier strokes show: each made over its
-    /// pen-down surface and moved by its dabs shown, its own whether they move it or not.
-    ///
-    /// # Errors
-    ///
-    /// [`SculptError::Cache`] if the stroke's shapes can't be read, a tile can't be gathered, or
-    /// the store refuses a preview.
-    fn adopt<S: OpenStrokes>(
-        &mut self,
-        strokes: &mut S,
-        op: Tag,
-        keys: &[TileKey],
-        stats: &mut PreviewStats,
-    ) -> Result<(), SculptError> {
-        let older = keys
-            .iter()
-            .filter(|key| self.shown_by(key).is_some_and(|by| by < op));
-        let mut older: Vec<TileKey> = older.copied().collect();
-        if older.is_empty() {
-            return Ok(());
+    /// The places of the vertices preview `key` may share with others, each with its slot: a
+    /// finest tile's points along its border, on either side, and its base-vertex rings'
+    /// ([`seams::Shared`]), at the finest level; a display tile's border vertices, its own index,
+    /// scaled to the finest level.
+    fn held_places(&mut self, store: &TileStore, key: &TileKey) -> Vec<(usize, Place)> {
+        if key.channel() == geom::Channel::DISPLAY {
+            let Some(finest) = store.display_finest() else {
+                return Vec::new();
+            };
+            let shift = finest.get().saturating_sub(key.level().get());
+            let border = self
+                .border_places
+                .entry(*key)
+                .or_insert_with(|| seams::border_places(store, key));
+            let scaled = border
+                .iter()
+                .map(|&(v, (face, i, j))| (v, (face, i << shift, j << shift)));
+            return scaled.collect();
         }
-        older.sort_unstable();
-        let base = base_of(strokes, op);
-        let dabs = self.segment_dabs(op);
-        let mut taken = BTreeMap::new();
-        let kept = {
-            let (mut store, _) = open(strokes, op)?;
-            let mut moving = gather(&mut store, &older, base)?;
-            stats.gathered += moving.len();
-            store.par_map_mut(&mut moving, |tile| {
-                tile.move_by_every(&dabs);
-                if tile.fate == Fate::Untouched {
-                    tile.fate = Fate::Moved;
-                }
-            });
-            self.keep(&mut store, op, moving, stats, &mut taken)
-        };
-        drop_blocks(strokes, taken);
-        kept
+        let shared = self
+            .finest_places
+            .entry(*key)
+            .or_insert_with(|| seams::Shared::of(store, key));
+        shared
+            .as_ref()
+            .map_or_else(Vec::new, |shared| shared.slots.clone())
     }
 
-    /// Makes the previews of different strokes meet where `seeds`, finest tiles a call made or
-    /// kept, lie: a tile an earlier stroke shows beside one a later stroke shows is taken over by
-    /// the later one, with every earlier stroke's preview it leads to, once the later stroke's
-    /// futures for them are installed (see "Seams" in the module notes). Those that can't be yet
-    /// are tried again as the tiles around them change.
+    /// Makes the previews of different strokes meet bit for bit where `seeds`, the finest tiles
+    /// the call made, kept or cleared, and the display tiles it handed over lie (see "Seams" in
+    /// the module notes): at a vertex previews of different strokes hold, every one draws the
+    /// newest stroke's bits. A finest preview that drew a later stroke's bits at a vertex no later
+    /// stroke's preview holds any more is made again first.
     ///
     /// # Errors
     ///
-    /// [`SculptError::Cache`] if a tile's inputs can't be listed or a tile can't be gathered.
-    fn close_seams<S: OpenStrokes>(
+    /// [`SculptError::Cache`] if a tile's inputs can't be listed, a tile can't be gathered, or the
+    /// store refuses a preview.
+    fn stitch<S: OpenStrokes>(
         &mut self,
         strokes: &mut S,
         seeds: Vec<TileKey>,
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         let mut seeds = seeds;
-        while !seeds.is_empty() && self.mixed() {
-            // Per later stroke, the earlier strokes' previews it takes over.
-            let mut takers: BTreeMap<Tag, BTreeSet<TileKey>> = BTreeMap::new();
-            {
-                let (store, _) = strokes.current();
-                for key in &seeds {
-                    let Some(own) = self.shown_by(key) else {
+        seeds.append(&mut self.display_seeds);
+        if seeds.is_empty() || (!self.mixed() && self.finest_subs.is_empty()) {
+            self.display_subs.clear();
+            return Ok(());
+        }
+        // The previews holding a vertex a seed holds that meet another stroke's (or drew one's
+        // bits), and those holding a vertex they hold: where previews of one stroke alone meet,
+        // they meet bit for bit already.
+        let (affected, holders) = {
+            let (store, _) = strokes.current();
+            let mut near = BTreeSet::new();
+            for seed in &seeds {
+                near.extend(self.around(&store, seed)?);
+            }
+            let mut affected = BTreeSet::new();
+            let mut holders = BTreeSet::new();
+            for key in near {
+                let around = self.around(&store, &key)?;
+                let own = self.owner_of(&key);
+                let meets = around.iter().any(|other| self.owner_of(other) != own);
+                let drew =
+                    self.finest_subs.contains_key(&key) || self.display_subs.contains_key(&key);
+                if meets || drew {
+                    affected.insert(key);
+                    holders.extend(around);
+                }
+            }
+            (affected, holders)
+        };
+        // A finest preview drawing another's bits where that one doesn't win any more: made again.
+        let mut chosen = {
+            let (store, _) = strokes.current();
+            self.choose(&store, &holders)
+        };
+        let lost: BTreeSet<TileKey> = {
+            let (winners, _) = &chosen;
+            let lost = affected.iter().filter(|key| {
+                let previewed = self.owner_of(key).is_some();
+                previewed
+                    && self.finest_subs.get(key).is_some_and(|subs| {
+                        subs.iter().any(|place| {
+                            winners
+                                .get(place)
+                                .is_none_or(|winner| winner.holder == **key)
+                        })
+                    })
+            });
+            lost.copied().collect()
+        };
+        if !lost.is_empty() {
+            for key in &lost {
+                self.finest_subs.remove(key);
+            }
+            self.remake(strokes, &lost, stats)?;
+            let (store, _) = strokes.current();
+            chosen = self.choose(&store, &holders);
+        }
+        let (mut store, _) = strokes.current();
+        let (chosen, normals) = chosen;
+        let mut republish: Vec<TileKey> = Vec::new();
+        for key in &affected {
+            if self.owner_of(key).is_none() {
+                if key.channel() == geom::Channel::DISPLAY {
+                    self.display_subs.remove(key);
+                } else {
+                    self.finest_subs.remove(key);
+                }
+                continue;
+            }
+            let held = self.held_places(&store, key);
+            let other = |place: &Place| chosen.get(place).filter(|winner| winner.holder != *key);
+            if key.channel() == geom::Channel::DISPLAY {
+                let level = key.level();
+                let seams = held.into_iter().filter_map(|(v, place)| {
+                    let at = other(&place).map(|winner| winner.at);
+                    let normal = normals.get(&(level, place));
+                    let normal = normal.filter(|winner| winner.holder != *key);
+                    let normal = normal.map(|winner| winner.at);
+                    (at.is_some() || normal.is_some()).then_some((v, at, normal))
+                });
+                let seams: Vec<Seam> = seams.collect();
+                self.display_subs.insert(*key, seams);
+                republish.push(*key);
+            } else {
+                let taken = held
+                    .into_iter()
+                    .filter_map(|(slot, place)| Some((slot, place, other(&place)?.at)));
+                let taken: Vec<(usize, Place, Vec3)> = taken.collect();
+                self.substitute(&mut store, key, &taken, stats)?;
+            }
+        }
+        self.publish(&mut store, &republish, stats)?;
+        self.display_seeds.clear();
+        Ok(())
+    }
+
+    /// What each place a preview of `holders` holds shows (see "Seams" in the module notes): the
+    /// newest stroke's preview holding it, a finest one before a display one of the same stroke,
+    /// and the position it draws there, its own; and per display level and place, the newest
+    /// stroke's display preview holding it and its normal there.
+    fn choose(
+        &mut self,
+        store: &TileStore,
+        holders: &BTreeSet<TileKey>,
+    ) -> (HashMap<Place, Chosen>, HashMap<(Level, Place), Chosen>) {
+        let mut chosen: HashMap<Place, Chosen> = HashMap::new();
+        let mut normals: HashMap<(Level, Place), Chosen> = HashMap::new();
+        // The finest previews first: of one stroke, theirs win.
+        let (finest, display): (Vec<TileKey>, Vec<TileKey>) = holders
+            .iter()
+            .partition(|key| key.channel() != geom::Channel::DISPLAY);
+        let ordered = finest.into_iter().chain(display);
+        for key in ordered {
+            let Some(owner) = self.owner_of(&key) else {
+                continue;
+            };
+            let held = self.held_places(store, &key);
+            if key.channel() == geom::Channel::DISPLAY {
+                let Some(state) = self.displays.get_mut(&key) else {
+                    continue;
+                };
+                state.refresh_normals();
+                for (v, place) in held {
+                    let Some((at, normal)) = state.vertex(v) else {
                         continue;
                     };
-                    let ring = store.normal_inputs(key)?;
-                    let owners = ring.iter().filter_map(|input| self.shown_by(input));
-                    if let Some(newest) = owners.max().filter(|&newest| newest > own) {
-                        takers.entry(newest).or_default().insert(*key);
+                    let holder = key;
+                    let wins = |was: &Chosen| was.owner < owner;
+                    if chosen.get(&place).is_none_or(wins) {
+                        chosen.insert(place, Chosen { owner, holder, at });
                     }
-                    let older = ring
-                        .iter()
-                        .filter(|input| self.shown_by(input).is_some_and(|other| other < own));
-                    let older: Vec<TileKey> = older.copied().collect();
-                    takers.entry(own).or_default().extend(older);
+                    let level = key.level();
+                    if normals.get(&(level, place)).is_none_or(wins) {
+                        let drawn = Chosen {
+                            owner,
+                            holder,
+                            at: normal,
+                        };
+                        normals.insert((level, place), drawn);
+                    }
                 }
-                for (&op, keys) in &mut takers {
-                    *keys = self.older_around(&store, op, keys.iter().copied())?;
-                }
-            }
-            let mut next = Vec::new();
-            let newest_first = takers.into_iter().rev();
-            for (op, keys) in newest_first {
-                let older = keys
-                    .into_iter()
-                    .filter(|key| self.shown_by(key).is_some_and(|by| by < op));
-                let older: Vec<TileKey> = older.collect();
-                if older.is_empty() || !ready(strokes, op, &[], &older, &[]) {
+            } else {
+                let Some(block) = store.preview(&key) else {
                     continue;
+                };
+                for (slot, place) in held {
+                    let Some(at) = seams::point_at(block, slot) else {
+                        continue;
+                    };
+                    if chosen.get(&place).is_none_or(|was| was.owner < owner) {
+                        let holder = key;
+                        chosen.insert(place, Chosen { owner, holder, at });
+                    }
                 }
-                self.adopt(strokes, op, &older, stats)?;
-                next.extend(older);
             }
-            seeds = next;
+        }
+        (chosen, normals)
+    }
+
+    /// Finest preview `key` draws, at each of `newer` (a slot, its place, and the position the
+    /// preview chosen there draws: see "Seams" in the module notes), that preview's bits; handed
+    /// to the store if that changed it.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if the store refuses the preview.
+    fn substitute(
+        &mut self,
+        store: &mut TileStore,
+        key: &TileKey,
+        newer: &[(usize, Place, Vec3)],
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        if newer.is_empty() && !self.finest_subs.contains_key(key) {
+            return Ok(());
+        }
+        let places = self.finest_places.get(key).and_then(Option::as_ref);
+        let places = places.map(|shared| &shared.block);
+        let (Some(places), Some(block)) = (places, store.preview(key)) else {
+            return Ok(());
+        };
+        // Drawn so already, as a preview mostly is a call later: left as it is.
+        let differs = newer.iter().any(|&(slot, _, at)| {
+            seams::point_at(block, slot).map(Vec3::to_bits) != Some(at.to_bits())
+        });
+        let drawn_as: BTreeSet<Place> = newer.iter().map(|&(_, place, _)| place).collect();
+        if !differs {
+            if drawn_as.is_empty() {
+                self.finest_subs.remove(key);
+            } else {
+                self.finest_subs.insert(*key, drawn_as);
+            }
+            return Ok(());
+        }
+        let subs: HashMap<Place, Vec3> = newer.iter().map(|&(_, place, at)| (place, at)).collect();
+        let mut stitched = block.clone();
+        let matched = stitched.displace_along(places, |p, at| {
+            seams::place_of(at)
+                .and_then(|place| subs.get(&place))
+                .copied()
+                .unwrap_or(p)
+        });
+        let before = seams::points(block);
+        let after = seams::points(&stitched);
+        let same = before
+            .iter()
+            .zip(&after)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        if matched && !same {
+            store.set_preview(*key, stitched)?;
+            stats.tiles_set += 1;
+        }
+        if subs.is_empty() {
+            self.finest_subs.remove(key);
+        } else {
+            self.finest_subs.insert(*key, drawn_as);
         }
         Ok(())
     }
@@ -1042,6 +1226,10 @@ impl Preview {
         self.readers.clear();
         self.border_places.clear();
         self.touched.clear();
+        self.display_seeds.clear();
+        self.finest_places.clear();
+        self.finest_subs.clear();
+        self.display_subs.clear();
         store.take_pen_down_added();
         self.overlaps.clear();
         self.overlap_most = 0.0;
@@ -1056,24 +1244,48 @@ impl Preview {
     /// Lets go of the display previews of strokes `ops`, dropped with none of their dabs landed
     /// and their reserved ops given back: they showed those dabs. Their tiles show the store's
     /// surface again (the refresh makes them anew); the finest previews go as the dabs are landed
-    /// ([`Preview::land`]). Closes the call's preview epoch.
+    /// ([`Preview::land`]), which the caller does next, in the same epoch: the previews that drew
+    /// their bits at shared vertices draw their own again then (see "Seams" in the module notes),
+    /// so this leaves the epoch open.
     ///
     /// # Errors
     ///
-    /// [`SculptError::Cache`] if the epoch can't close.
+    /// [`SculptError::Cache`] if the tiles around one can't be listed.
     pub fn let_go(&mut self, store: &mut TileStore, ops: &[OpId]) -> Result<(), SculptError> {
         let dropped = self
             .displays
             .iter()
             .filter(|(_, state)| state.op.is_some_and(|op| ops.contains(&op)));
         let dropped: Vec<TileKey> = dropped.map(|(key, _)| *key).collect();
+        let mut listed = Ok(());
+        for key in &dropped {
+            // The previews it met: their seams with it are made again.
+            match self.around(store, key) {
+                Ok(around) => {
+                    let (display, finest): (Vec<TileKey>, Vec<TileKey>) = around
+                        .into_iter()
+                        .filter(|other| other != key)
+                        .partition(|other| other.channel() == geom::Channel::DISPLAY);
+                    self.display_seeds.extend(display);
+                    self.touched.extend(finest);
+                }
+                Err(error) => listed = Err(error),
+            }
+        }
         for key in &dropped {
             self.displays.remove(key);
+            self.display_subs.remove(key);
             store.clear_display_preview(key);
         }
         self.note_bytes(store);
-        store.close_preview_epoch()?;
-        Ok(())
+        Ok(listed?)
+    }
+
+    /// Whether a display preview holds a later stroke's dabs pending, to be made that stroke's
+    /// ([`Preview::take_over_displays`]).
+    #[must_use]
+    pub fn displays_pending(&self) -> bool {
+        self.displays.values().any(|state| state.later.is_some())
     }
 
     /// Makes the previews of `keys`, tiles a renderer waits for: held with no preview made
@@ -1134,7 +1346,7 @@ impl Preview {
             self.fruitless.extend(none);
         }
         let touched = std::mem::take(&mut self.touched);
-        let seamed = self.close_seams(strokes, touched, &mut stats);
+        let seamed = self.stitch(strokes, touched, &mut stats);
         let made = made.and(seamed);
         let (mut store, _) = strokes.current();
         self.note_bytes(&mut store);
@@ -1364,7 +1576,7 @@ impl Preview {
         }
         let (now, waiting): (Vec<TileKey>, Vec<TileKey>) = keys
             .iter()
-            .partition(|key| ready(strokes, op, &[], &[], &[**key]));
+            .partition(|key| ready(strokes, op, &[], &[**key]));
         let made = if now.is_empty() {
             Ok(())
         } else {
@@ -1434,10 +1646,10 @@ impl Preview {
         self.publish(store, &made, stats)
     }
 
-    /// Hands the display previews of `keys` to the store, each held as the store says now, with
-    /// those of earlier strokes that share a vertex with one of them: at a vertex display
-    /// previews of different strokes share, each draws the newest stroke's (see "Seams" in the
-    /// module notes).
+    /// Hands the display previews of `keys` to the store, each held as the store says now, and
+    /// drawing a later stroke's bits at the vertices it shares with that stroke's previews, as
+    /// the call's last seams left them (see "Seams" in the module notes; [`Preview::stitch`]
+    /// makes them again at the call's end).
     ///
     /// # Errors
     ///
@@ -1448,19 +1660,17 @@ impl Preview {
         keys: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        let mut keys: BTreeSet<TileKey> = keys
-            .iter()
-            .filter(|key| self.displays.contains_key(key))
-            .copied()
-            .collect();
-        let seams = self.display_seams(store, &mut keys);
+        let keys = keys.iter().filter(|key| self.displays.contains_key(key));
+        let keys: BTreeSet<TileKey> = keys.copied().collect();
+        self.display_seeds.extend(keys.iter().copied());
         let mut rounding: BTreeMap<TileKey, f64> = BTreeMap::new();
         for key in &keys {
             rounding.insert(*key, self.rounding(store, key)?);
         }
         let cap = self.moves_cap();
-        let none: Vec<(usize, Vec3, Vec3)> = Vec::new();
+        let none: Vec<Seam> = Vec::new();
         let mut taken = self.take_states(rounding.keys());
+        let seams = &self.display_subs;
         let mut publishing: Vec<Publishing<'_>> = taken
             .iter_mut()
             .filter_map(|state| {
@@ -1493,87 +1703,6 @@ impl Preview {
         Ok(())
     }
 
-    /// The seams of the display previews of `keys` with those of other strokes: per tile, each
-    /// vertex it shares with a newer stroke's display preview at its level, and the position and
-    /// normal that one draws there. The earlier strokes' display previews sharing a vertex with
-    /// one of `keys` are added to it, to take its vertices.
-    fn display_seams(
-        &mut self,
-        store: &TileStore,
-        keys: &mut BTreeSet<TileKey>,
-    ) -> BTreeMap<TileKey, Vec<(usize, Vec3, Vec3)>> {
-        let mut seams: BTreeMap<TileKey, Vec<(usize, Vec3, Vec3)>> = BTreeMap::new();
-        let mut owners = self.displays.values().map(|state| state.op);
-        let first = owners.next();
-        if !owners.any(|owner| Some(owner) != first) {
-            return seams;
-        }
-        // Every display preview's border vertices at the levels of `keys`, by their places.
-        let levels: BTreeSet<Level> = keys.iter().map(TileKey::level).collect();
-        let at_levels = self
-            .displays
-            .keys()
-            .filter(|key| levels.contains(&key.level()));
-        let at_levels: Vec<TileKey> = at_levels.copied().collect();
-        let mut holders: BTreeMap<(Level, Place), Vec<(TileKey, usize)>> = BTreeMap::new();
-        for key in &at_levels {
-            let border = self
-                .border_places
-                .entry(*key)
-                .or_insert_with(|| seams::border_places(store, key));
-            for &(v, place) in border.iter() {
-                holders
-                    .entry((key.level(), place))
-                    .or_default()
-                    .push((*key, v));
-            }
-        }
-        let op_of = |key: &TileKey| self.displays.get(key).map(|state| state.op);
-        // The earlier strokes' sharing a vertex with one of `keys` take its vertices too.
-        let mut sharing: Vec<TileKey> = Vec::new();
-        for key in keys.iter() {
-            let border = self.border_places.get(key).map_or(&[][..], Vec::as_slice);
-            for &(_, place) in border {
-                let held = holders
-                    .get(&(key.level(), place))
-                    .map_or(&[][..], Vec::as_slice);
-                let older = held.iter().filter(|(other, _)| op_of(other) < op_of(key));
-                sharing.extend(older.map(|&(other, _)| other));
-            }
-        }
-        keys.extend(sharing);
-        // Per vertex of `keys` a newer stroke's preview shares, that preview and its vertex.
-        let mut from: Vec<(TileKey, usize, TileKey, usize)> = Vec::new();
-        for key in keys.iter() {
-            let border = self.border_places.get(key).map_or(&[][..], Vec::as_slice);
-            for &(v, place) in border {
-                let held = holders.get(&(key.level(), place));
-                let newest = held
-                    .into_iter()
-                    .flatten()
-                    .max_by_key(|(other, _)| op_of(other));
-                if let Some(&(other, at)) = newest
-                    && op_of(&other) > op_of(key)
-                {
-                    from.push((*key, v, other, at));
-                }
-            }
-        }
-        let newest: BTreeSet<TileKey> = from.iter().map(|&(_, _, other, _)| other).collect();
-        for key in &newest {
-            if let Some(state) = self.displays.get_mut(key) {
-                state.refresh_normals();
-            }
-        }
-        for (key, v, other, at) in from {
-            let shared = self.displays.get(&other).and_then(|state| state.vertex(at));
-            if let Some((position, normal)) = shared {
-                seams.entry(key).or_default().push((v, position, normal));
-            }
-        }
-        seams
-    }
-
     /// Makes as their newest strokes' the display previews that hold a later stroke's dabs
     /// pending (see "Display tiles" in the module notes) and `drawn` draws, those whose futures are
     /// in now (at most a call's worth, [`OpenStrokes::ready`]): off a frame's path, a few at a
@@ -1603,12 +1732,21 @@ impl Preview {
         }
         let mut made = Ok(());
         let newest_first = by.into_iter().rev();
-        for (op, keys) in newest_first {
+        for (op, mut keys) in newest_first {
+            // Those over the stroke's finest previews first, where the two meet, the finest
+            // level first: what a call's futures can't all make waits the longest coarsest.
+            let shown = self
+                .reached
+                .iter()
+                .filter(|(_, reached)| reached.showing == Showing::Of(op));
+            let over: BTreeSet<TileKey> =
+                shown.flat_map(|(key, _)| display_ancestors(key)).collect();
+            keys.sort_by_key(|key| (!over.contains(key), std::cmp::Reverse(key.level())));
             let taken = self.make_displays_of(strokes, op, &keys, &mut stats);
             made = made.and(taken);
         }
         let touched = std::mem::take(&mut self.touched);
-        let seamed = self.close_seams(strokes, touched, &mut stats);
+        let seamed = self.stitch(strokes, touched, &mut stats);
         let made = made.and(seamed);
         let (mut store, _) = strokes.current();
         self.note_bytes(&mut store);
@@ -1881,7 +2019,7 @@ impl Preview {
             }
         };
         let touched = std::mem::take(&mut self.touched);
-        let seamed = self.close_seams(strokes, touched, &mut stats);
+        let seamed = self.stitch(strokes, touched, &mut stats);
         let made = made.and(seamed);
         let (mut store, _) = strokes.current();
         self.note_bytes(&mut store);
@@ -2014,7 +2152,7 @@ impl Preview {
             made = made.and(remade);
         }
         let touched = std::mem::take(&mut self.touched);
-        let seamed = self.close_seams(strokes, touched, &mut stats);
+        let seamed = self.stitch(strokes, touched, &mut stats);
         let made = made.and(seamed);
         let (mut store, _) = strokes.current();
         self.note_bytes(&mut store);
@@ -2112,6 +2250,7 @@ impl Preview {
         // Moved by no stroke's dabs shown: the store's tile shows.
         let (mut store, _) = strokes.current();
         for key in left {
+            self.touched.push(key);
             store.clear_preview(&key);
             if previewed.contains(&key) {
                 stats.tiles_cleared += 1;
@@ -2169,6 +2308,10 @@ impl Preview {
     ) -> Result<(), SculptError> {
         for tile in moving {
             self.touched.push(tile.key);
+            if !tile.previewed {
+                // Gathered afresh: it draws its own bits everywhere until stitched again.
+                self.finest_subs.remove(&tile.key);
+            }
             let prior = self.reached.get(&tile.key).copied();
             // An earlier stroke's preview showing it, which this stroke's dabs may take over.
             let earlier = prior.and_then(|prior| match prior.showing {

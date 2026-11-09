@@ -177,13 +177,13 @@
 //!   installed first ([`Open`], [`sculpt::OpenStrokes::ready`]): those about each dab's sphere and
 //!   in the rings there ([`needed`]), and for a display preview every tile the earlier strokes
 //!   change under it and around those ([`display_reads`]), at most [`FUTURES_TIME`] of them a call,
-//!   the rest in the calls after. A dab whose finest futures (and those of the earlier strokes'
-//!   finest previews its own take over, so previews of two strokes never meet) can't be had stays
-//!   unshown until they can be, or its op begins; a display preview whose futures aren't in yet
-//!   stays the earlier stroke's, the new dabs pending in its bound, and is made the later stroke's
-//!   off the pen's path ([`Brush::prepare`], [`Preview::take_over_displays`]). The previews end
-//!   with the last stroke; a later stroke dropped unlanded has its display previews let go
-//!   ([`Sculpting::let_go`]).
+//!   the rest in the calls after (one budget for a step, or a `prepare`). A dab whose own finest
+//!   futures can't be had stays unshown until they can be, or its op begins, and nothing else holds
+//!   it back: where its previews meet an earlier stroke's, both draw its bits (the previews'
+//!   "Seams"). A display preview whose futures aren't in yet stays the earlier stroke's, the new
+//!   dabs pending in its bound, and is made the later stroke's off the pen's path
+//!   ([`Brush::prepare`], [`Preview::take_over_displays`]). The previews end with the last stroke;
+//!   a later stroke dropped unlanded has its display previews let go ([`Sculpting::let_go`]).
 //! - **Landing in order:** the catch-up lands the oldest stroke only. As it ends, the next's op
 //!   begins ([`Project::begin_reserved_stroke`]), its futures its own pen-down shapes now, and its
 //!   first landing waits for its pen-down cut as any stroke's ([`Project::may_land`]). A close, a
@@ -1328,8 +1328,9 @@ struct Open<'a> {
     strokes: &'a mut [Pending],
     /// The session's stroke state, which the futures are made from.
     state: &'a sculpt::Stroke,
-    /// What the call may still spend installing futures ([`FUTURES_TIME`]).
-    installing: Installing,
+    /// What the brush's step (or its `prepare`) may still spend installing futures
+    /// ([`FUTURES_TIME`]): one for all the step's calls.
+    installing: &'a mut Installing,
 }
 
 impl OpenStrokes for Open<'_> {
@@ -1355,7 +1356,7 @@ impl OpenStrokes for Open<'_> {
             .any(|stroke| stroke.op.id() == op && matches!(stroke.op, StrokeOp::Reserved { .. }))
     }
 
-    fn ready(&mut self, op: OpId, dabs: &[Dab], tiles: &[TileKey], displays: &[TileKey]) -> bool {
+    fn ready(&mut self, op: OpId, dabs: &[Dab], displays: &[TileKey]) -> bool {
         let Some(at) = self.strokes.iter().position(|stroke| stroke.op.id() == op) else {
             return false;
         };
@@ -1380,26 +1381,21 @@ impl OpenStrokes for Open<'_> {
         let Ok(mut wanted) = needed(store, self.index, earlier, &reads) else {
             return false;
         };
-        // What the blocks of `tiles` read: each tile and its ring.
+        // The tiles the strokes before still change, as they land: a future of one landed is
+        // the tile itself, so none is installed.
         let changed = |key: &TileKey| {
             let mut kept = earlier
                 .iter()
                 .filter_map(|before| before.remaining.as_ref());
             kept.any(|remaining| remaining.reach.contains_key(key))
         };
-        for tile in tiles {
-            let Ok(ring) = store.normal_inputs(tile) else {
-                return false;
-            };
-            wanted.extend(ring.iter().filter(|input| changed(input)));
-        }
         if !displays.is_empty() {
             let under = stroke
                 .display_reads
                 .get_or_insert_with(|| display_reads(store, earlier));
             let read = displays.iter().filter_map(|display| under.get(display));
             for tiles_read in read {
-                wanted.extend(tiles_read);
+                wanted.extend(tiles_read.iter().filter(|key| changed(key)));
             }
         }
         let missing: Vec<TileKey> = wanted.difference(installed).copied().collect();
@@ -1740,6 +1736,10 @@ pub(crate) struct Sculpting {
     /// ends, its end letting them go ([`Sculpting::end_dropping_later`]); `Some` (empty or not)
     /// while it is to end so.
     dropping_later: Option<Vec<ReservedOp>>,
+    /// What the step under way (or `prepare`, or a landing step) may still spend installing a
+    /// later stroke's futures for its previews ([`FUTURES_TIME`]): one budget for all its calls,
+    /// set afresh as each begins.
+    installing: Installing,
     /// Test knob: how strokes over strokes still landing fail.
     #[cfg(test)]
     knob: Knob,
@@ -1788,6 +1788,7 @@ impl Sculpting {
             #[cfg(test)]
             waited_to_land: 0,
             dropping_later: None,
+            installing: Installing::new(),
             #[cfg(test)]
             knob: Knob::None,
         };
@@ -2507,7 +2508,7 @@ impl Sculpting {
                 index: &mut *index,
                 strokes: &mut self.strokes,
                 state: &self.state,
-                installing: Installing::new(),
+                installing: &mut self.installing,
             };
             let shown = preview.show_over(&mut open, op, &dabs, &wanted);
             let count = preview.shown() - before;
@@ -2765,7 +2766,7 @@ impl Sculpting {
                         index: &mut *scene.index,
                         strokes: &mut self.strokes,
                         state: &self.state,
-                        installing: Installing::new(),
+                        installing: &mut self.installing,
                     };
                     if let Err(error) = preview.note_applied_over(&mut open, op, &direct) {
                         self.fail("moving the previews by dabs applied at once", &error);
@@ -2862,7 +2863,7 @@ impl Sculpting {
             index: &mut *scene.index,
             strokes: &mut self.strokes,
             state: &self.state,
-            installing: Installing::new(),
+            installing: &mut self.installing,
         };
         let mut landed = preview.land_over(&mut open, count, &|key: &TileKey| drawn.draws(key));
         if rebase && landed.is_ok() {
@@ -3067,6 +3068,7 @@ impl Sculpting {
     ///
     /// The error kept, if dabs were dropped.
     fn landing_step(&mut self, context: BrushContext<'_>, lifting: bool) -> Result<bool> {
+        self.installing = Installing::new();
         let errors = self.errors_kept();
         let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
             // No scene ever: no stroke began, and what waits to begin can't.
@@ -3397,6 +3399,7 @@ impl Brush for Sculpting {
         pen: &PenFrame,
         budget: &BrushBudget,
     ) -> Result<BrushReport> {
+        self.installing = Installing::new();
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let Some(mut scene) = Scene::of(context) else {
@@ -3503,6 +3506,7 @@ impl Brush for Sculpting {
     }
 
     fn prepare(&mut self, context: BrushContext<'_>, deadline: Instant) -> Result<bool> {
+        self.installing = Installing::new();
         let Some(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
@@ -3516,7 +3520,7 @@ impl Brush for Sculpting {
                 index: &mut *scene.index,
                 strokes: &mut self.strokes,
                 state: &self.state,
-                installing: Installing::new(),
+                installing: &mut self.installing,
             };
             if let Err(error) = preview.make_waiting_over(&mut open, scene.waiting) {
                 self.fail("making the previews the renderer waits for", &error);
@@ -3525,7 +3529,7 @@ impl Brush for Sculpting {
         // The display previews a later stroke's futures weren't in for yet, made its own as they
         // come: a call's time of futures at a time.
         if let Some(preview) = &mut self.preview
-            && self.strokes.len() > 1
+            && preview.displays_pending()
         {
             let drawn = scene.drawn;
             let mut open = Open {
@@ -3533,7 +3537,7 @@ impl Brush for Sculpting {
                 index: &mut *scene.index,
                 strokes: &mut self.strokes,
                 state: &self.state,
-                installing: Installing::new(),
+                installing: &mut self.installing,
             };
             let wanted = |key: &TileKey| drawn.draws(key);
             if let Err(error) = preview.take_over_displays(&mut open, &wanted) {
@@ -3694,6 +3698,7 @@ impl Brush for Sculpting {
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
+        self.installing = Installing::new();
         let errors = self.errors_kept();
         self.landing = Landing::InFrames;
         self.save_asked = None;

@@ -128,7 +128,8 @@ impl Chain {
     /// display previews are made over.
     fn build_display(&mut self) {
         let store = self.project.store();
-        store.queue_display_rebuild(Level::new(LEVEL).expect("a level"));
+        let finest = store.display_finest().expect("a display layer");
+        store.queue_display_rebuild(finest);
         for _ in 0..10_000 {
             store
                 .run_jobs(Instant::now() + Duration::from_millis(50))
@@ -475,42 +476,46 @@ fn points(block: &geom::GatheredBlock) -> Vec<Vec3> {
 
 /// The vertices two previews in `store` hold and draw differently, bit for bit.
 ///
-/// Positions, and for display previews normals: a finest preview's every point, ring included,
-/// against every other's; a display preview's own vertices against the other display previews'
-/// at its level.
+/// Positions: a finest preview's every point, ring included, and a display preview's border
+/// vertices, every level's, against every other's at the same place (on the finest grid).
+/// Normals: a display preview's border vertices against the other display previews' at its level.
 fn cracks(store: &TileStore) -> Vec<String> {
     let mesh = store.mesh();
-    let mut seen: BTreeMap<(u8, [u32; 3]), [u32; 6]> = BTreeMap::new();
+    let finest = store.display_finest().expect("a display layer");
+    let mut positions: BTreeMap<[u32; 3], [u32; 3]> = BTreeMap::new();
+    let mut normals: BTreeMap<(u8, [u32; 3]), [u32; 3]> = BTreeMap::new();
     let mut cracks = Vec::new();
-    let mut note = |level: u8, place: Vec3, bits: [u32; 6], what: &TileKey| {
-        if place.x.is_nan() || bits.iter().take(3).all(|b| f32::from_bits(*b).is_nan()) {
-            return;
+    let bits = |v: Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+    // The place a gather of `Places` wrote as `place` at `level`, on the finest grid.
+    let on_finest = |place: Vec3, level: Level| -> Option<[u32; 3]> {
+        if place.x.is_nan() {
+            return None;
         }
-        let at = [place.x.to_bits(), place.y.to_bits(), place.z.to_bits()];
-        match seen.get(&(level, at)) {
-            Some(was) if *was != bits => cracks.push(format!("{what:?} at {place:?}")),
-            Some(_) => {}
-            None => {
-                seen.insert((level, at), bits);
-            }
-        }
-    };
-    let bits_of = |p: Vec3, n: Vec3| {
-        [
-            p.x.to_bits(),
-            p.y.to_bits(),
-            p.z.to_bits(),
-            n.x.to_bits(),
-            n.y.to_bits(),
-            n.z.to_bits(),
-        ]
+        let shift = finest.get() - level.get();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "small whole numbers, written exactly by `Places`"
+        )]
+        let whole = |c: f32| c as u32;
+        Some([
+            whole(place.x),
+            whole(place.y) << shift,
+            whole(place.z) << shift,
+        ])
     };
     for key in store.previewed() {
         let block = store.preview(key).expect("previewed");
         let places = geom::gather_block(mesh, &Places, geom::Region::of_tile(key)).expect("places");
         let pairs = points(&places).into_iter().zip(points(block));
         for (place, point) in pairs {
-            note(key.level().get(), place, bits_of(point, Vec3::ZERO), key);
+            let Some(at) = on_finest(place, key.level()) else {
+                continue;
+            };
+            let was = *positions.entry(at).or_insert_with(|| bits(point));
+            if was != bits(point) {
+                cracks.push(format!("{key:?} at {at:?}"));
+            }
         }
     }
     for key in store.display_previewed() {
@@ -518,12 +523,19 @@ fn cracks(store: &TileStore) -> Vec<String> {
         let places = geom::gather_block(mesh, &Places, geom::Region::of_tile(key)).expect("places");
         let side = key.side();
         let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
-        for (i, j) in grid {
+        let border = grid.filter(|&(i, j)| i == 0 || j == 0 || i + 1 == side || j + 1 == side);
+        for (i, j) in border {
             let v = usize::try_from(j * side + i).expect("a vertex");
             let place = places.get(i64::from(i), i64::from(j));
-            let bits = bits_of(preview.positions[v], preview.normals[v]);
-            // Display levels apart from the finest: offset past it.
-            note(100 + key.level().get(), place, bits, key);
+            let Some(at) = on_finest(place, key.level()) else {
+                continue;
+            };
+            let (position, normal) = (bits(preview.positions[v]), bits(preview.normals[v]));
+            let was = *positions.entry(at).or_insert(position);
+            let was_normal = *normals.entry((key.level().get(), at)).or_insert(normal);
+            if was != position || was_normal != normal {
+                cracks.push(format!("{key:?} at {at:?}"));
+            }
         }
     }
     cracks
@@ -951,4 +963,69 @@ fn samples_waiting_for_futures_are_placed_by_a_flush_as_waiting() {
     assert_eq!(chained.len(), 2, "both under way as the flush began");
     let (_, waited_tiles) = waited(epoch);
     assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+/// A finer level for
+/// `a_stroke_over_a_long_backlog_shows_its_first_frame_installing_only_its_own`: a face of 4 × 4
+/// tiles, so an earlier stroke changes many more tiles than a later one reads.
+const BACKLOG_LEVEL: u8 = 8;
+
+/// How many futures `a_stroke_over_a_long_backlog_shows_its_first_frame_installing_only_its_own`
+/// lets its brush install: far more than it does, so what is left counts them.
+const COUNTED: usize = 1 << 20;
+
+#[test]
+fn a_stroke_over_a_long_backlog_shows_its_first_frame_installing_only_its_own() {
+    // A long stroke still to land, then a short one over its start: the short one's dabs show in
+    // its first frame, and the futures it installs are a few of the tiles the long one changes,
+    // not its whole backlog.
+    let config =
+        StoreConfig::new(256 << 20, 1).with_display(Level::new(BACKLOG_LEVEL).expect("a level"));
+    let mut run = Chain::new(Instant::now(), Some(config));
+    run.build_display();
+    run.frame(&stroke(((110.0, 100.0), (210.0, 110.0)), 60));
+    run.brush.set_radius(4.0);
+    let short = stroke(((112.0, 100.0), (116.0, 100.5)), 3);
+    installs_left(Some(COUNTED));
+    let second = run.frame(&short);
+    let left = INSTALLS_LEFT.get();
+    installs_left(None);
+    let installed = COUNTED - left.expect("counted");
+    let cracks = Previews::of(run.project.store()).cracks;
+    assert!(
+        cracks.is_empty(),
+        "the previews meet bit for bit, but not at {} vertices: {:?}",
+        cracks.len(),
+        cracks.first()
+    );
+    assert_eq!(run.ops().len(), 2, "both under way");
+    let placed = run.rows().last().map_or(0, Vec::len);
+    assert!(placed > 0, "the short stroke placed dabs");
+    assert_eq!(
+        second.dabs_shown, placed,
+        "its first frame shows every dab it placed"
+    );
+    let backlog = run.brush.strokes.first().map_or(0, |long| {
+        long.remaining
+            .as_ref()
+            .map_or(0, |remaining| remaining.reach.len())
+    });
+    assert!(
+        installed < backlog,
+        "it installed {installed} futures of the {backlog} tiles the long stroke changes"
+    );
+    // Frames on, a call's futures at a time, the display previews become the short stroke's:
+    // meeting the finest previews and each other bit for bit all the while.
+    for frame in 0..20 {
+        run.frame(&[]);
+        let previews = Previews::of(run.project.store());
+        assert!(
+            previews.cracks.is_empty(),
+            "frame {frame}: the previews meet bit for bit, but not at {} vertices: {:?}",
+            previews.cracks.len(),
+            previews.cracks.first()
+        );
+    }
+    run.land_all();
+    run.close();
 }
