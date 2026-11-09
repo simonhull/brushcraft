@@ -4118,6 +4118,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Flushes every edit and dab journalled so far, and waits until that is in a durable save
     /// point ([`Project::flushed`]), for [`STOP_FLUSH_LIMIT`] at most: whether it got there.
     /// Crash protection paused or failing ends the wait at once: nothing more can be made durable.
+    ///
+    /// The limit is this wait's alone: [`Project::close`] after it waits for the flushes still in
+    /// flight, as long as a stalled disk holds them, and the opener shows its waiting bar
+    /// meanwhile.
     fn flush_to_stop(&mut self) -> bool {
         let began = Instant::now();
         loop {
@@ -4464,7 +4468,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 /// How long a finisher stopping for a takeover waits for its flush ([`Owner::flush_to_stop`]).
 ///
 /// A flush's syncs take milliseconds, so this bounds only a disk that stalls, the opener waiting
-/// meanwhile.
+/// meanwhile. It bounds the wait, not the stop: the close that follows ([`Project::close`])
+/// finishes the writer's flushes, and blocks as long as the disk stalls; the opener shows its
+/// waiting bar ("Finishing your last session") until the locks are free.
 const STOP_FLUSH_LIMIT: Duration = Duration::from_secs(3);
 
 /// How often a finisher stopping looks at its flush.
