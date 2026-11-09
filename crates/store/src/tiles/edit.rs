@@ -924,7 +924,10 @@ impl TileStore {
     ///
     /// Only as [`TileStore::may_resume`] says: so the strokes a restore found resume in op order,
     /// one after another (the last one's op ends as this one's begins), and none after a fresh
-    /// op. The stroke's edits must be the last before its own.
+    /// op. The stroke's edits must be the last before its own. The stroke resumed before it must
+    /// have ended first, its journal closed and its landing done: the caller checks that
+    /// ([`crate::Project::resume_stroke`]), this doesn't, and takes the op over whatever is
+    /// current.
     ///
     /// # Errors
     ///

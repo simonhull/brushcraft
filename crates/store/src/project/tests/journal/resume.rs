@@ -14,6 +14,7 @@ use crate::tiles::PenDownShape;
 use crate::{JournalUnusable, OpenStroke};
 
 mod chain;
+mod left_open;
 mod roll_over;
 
 /// The dab format the tests' app sets.

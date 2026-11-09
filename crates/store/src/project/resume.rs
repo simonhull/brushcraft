@@ -18,8 +18,10 @@
 //! closed stroke never hides another, earlier or later, whatever the order of their batches.
 //! For each open op the scan keeps its batches from the last one starting at or before its
 //! landed count (a batch's dabs start where the one before left off, or past the dabs that
-//! landed before it was written); every other op's batches between them are passed over. A
-//! batch that starts anywhere else is a gap or an overlap.
+//! landed before it was written); every other op's batches between them are passed over. Each
+//! batch is checked against the one of its op before it as the scan meets it: one that starts
+//! anywhere else (a gap or an overlap), or disagrees with it, breaks the op's run, and none of
+//! its batches is kept from then on.
 //!
 //! The strokes are offered in **op order**. If the file holds an edit of a later op of a
 //! stroke's site ([`ProjectFile::head`]), that stroke ended with dabs not landed and no closing
@@ -27,6 +29,19 @@
 //! stroke): landing its rows now would land them over that op's edits, so its journal is unusable
 //! ([`JournalUnusable::Ended`]). The head orders ops only within a site, so one of another site is
 //! never taken for later.
+//!
+//! # Chains
+//!
+//! The open strokes form **chains**: a stroke whose batches name a surface of its own (a save
+//! point, or unknown: its own cut was taken) starts one, and every stroke begun behind it names
+//! the one just before it ([`PenDown::After`]). Only the last chain can be live: a stroke begins
+//! its own cut only once every stroke before it has ended, so an open stroke before the last
+//! chain's start is one left open by an earlier session (unusable then, never closed in the
+//! file, or a crash before its closing batch) and has ended ([`JournalUnusable::Ended`]); it
+//! never makes a later stroke unusable. A stroke naming one that isn't open starts a chain too,
+//! on the surface that one left, if the file holds it (see below). A restored project closes
+//! every stroke it found open, usable or not, as it hands out a fresh op, so a later restore
+//! finds none of them.
 //!
 //! # The pen-down surface
 //!
@@ -45,11 +60,13 @@
 //!   before in op order (strokes begin behind the newest open one, and one let go takes every
 //!   stroke behind it with it), and the later one resumes only once it has been resumed, landed and
 //!   ended ([`OpenStroke::after`]): its surface is then the store's state. If it is closed in the
-//!   file, every dab of it is in the restored tiles, which are the later one's surface at once.
-//!   That one may have no batch in the file if every dab it placed had landed by the first cut
-//!   after its own: then its edits are, and the file's head is at or past its op. If the file holds
-//!   neither, its dabs aren't there (it was lost to the crash before its first batch was written,
-//!   its landing after the last cut), and the later one can't be landed.
+//!   file (its last batch that reads counts every dab landed, and no batch that doesn't read comes
+//!   after it), every dab of it is in the restored tiles, which are the later one's surface at
+//!   once. That one may have no batch in the file if every dab it placed had landed by the first
+//!   cut after its own: then its edits are, and the file's head is at or past its op; that is
+//!   trusted only with every batch read, as one that doesn't read may have been its. If the file
+//!   holds neither, its dabs aren't there (it was lost to the crash before its first batch was
+//!   written, its landing after the last cut), and the later one can't be landed.
 //!
 //! # What is exact
 //!
@@ -70,8 +87,9 @@
 //! with no journal, and the project opens. That is a batch that doesn't read where the stroke
 //! may need it, a gap or an overlap, batches of the stroke that disagree, rows of no format, a
 //! pen-down surface no save point of the file holds, or one that doesn't read, or a later op's
-//! edits over the stroke. **A stroke whose earlier stroke is unusable is unusable too**
-//! ([`JournalUnusable::EarlierUnusable`]): its surface is the one that stroke would leave.
+//! edits over the stroke. **A stroke whose earlier stroke in its chain is unusable is unusable
+//! too** ([`JournalUnusable::EarlierUnusable`]): its surface is the one that stroke would leave,
+//! and its own journal isn't read.
 //!
 //! A batch that doesn't read may be any op's: the last of every stroke open when it was written
 //! and with no batch after it, so those strokes are [`JournalUnusable::Damaged`]; a stroke one of
@@ -83,25 +101,28 @@
 //!
 //! The file may be hostile. Each batch read is bounded by its record ([`crate::journal`]), the
 //! scan keeps only the batches of the strokes open as it goes (a closing batch drops its
-//! stroke's), each from the last at or before its landed count, and the strokes' rows and
-//! pen-down shapes together may hold no more than the pools' share of the store's budget
+//! stroke's, a batch that breaks its op's run drops them all), each from the last at or before
+//! its landed count, and an entry per op it has met; all of that, and the strokes' rows and
+//! pen-down shapes together, may hold no more than the pools' share of the store's budget
 //! ([`TileStore::pools_budget`]): a stroke whose journal would go past what the strokes before
-//! it left is [`JournalUnusable::TooLarge`], and a file whose open batches would is one of no op,
-//! too large. A live stroke has no such cap (its backlog and its shapes are unbounded, the shapes
+//! it left is [`JournalUnusable::TooLarge`], and a file whose batches would make the scan keep
+//! more is one of no op, too large. The scan does a constant amount of work a batch, beside
+//! reading it, and each stroke's batches are read whole one at a time, each let go once its rows
+//! are copied. A live stroke has no such cap (its backlog and its shapes are unbounded, the shapes
 //! held beyond the budget if they must), so a stroke that big lands live and its journal can't be
 //! restored: the price of never letting a hostile file make a restore allocate without bound. A
 //! real stroke's rows and shapes are a few MB.
 //!
 //! The scan reads every batch's record once: the work grows with the file, as opening it does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use geom::{CorrectionTile, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
 use crate::file::{Loc, ProjectFile, ReadScratch};
-use crate::journal::{BatchHead, DAB_BYTES, DabBatch, PenDown};
+use crate::journal::{BatchHead, DAB_BYTES, PenDown};
 use crate::slot::CorrectionSlot;
 use crate::tiles::{PenDownShape, StoreId, TileStore};
 
@@ -194,20 +215,6 @@ impl OpenStroke {
         &self.shapes
     }
 
-    /// What the project keeps of the stroke until it is resumed, to close it in the file if it
-    /// never is ([`Unresumed`]).
-    pub(super) fn unresumed(&self) -> Unresumed {
-        let rows = u32::try_from(self.dabs.len()).unwrap_or(u32::MAX);
-        Unresumed {
-            op: self.op,
-            landed: self.landed,
-            placed: self.landed.saturating_add(rows),
-            pen_down: self.pen_down,
-            dab_format: self.dab_format,
-            generation: self.generation,
-        }
-    }
-
     /// Whether the stroke was found in `store` as it is now: its working file the same.
     pub(super) fn found_in(&self, store: &TileStore) -> bool {
         self.store == store.id() && self.generation == store.generation()
@@ -278,9 +285,10 @@ impl NotResumed {
     }
 }
 
-/// A stroke a restore found still landing, until it is resumed: if the project hands out
-/// another op first, the stroke has ended, and the project closes it in the file
-/// ([`TileStore::close_restored_journal`]).
+/// A stroke a restore found still landing, usable or not, until it is resumed.
+///
+/// If the project hands out a fresh op first, or lets the restored strokes go, the stroke has
+/// ended, and the project closes it in the file ([`TileStore::close_restored_journal`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Unresumed {
     /// The stroke's op.
@@ -296,6 +304,24 @@ pub(super) struct Unresumed {
     /// The store's working file it was found in ([`TileStore::generation`]): one moved onto
     /// since holds none of its batches, so nothing is closed there.
     pub(super) generation: u64,
+    /// Whether the restore offered it usable: it may resume, and is work a close keeps.
+    pub(super) usable: bool,
+}
+
+impl Unresumed {
+    /// The stroke made as `op` whose last batch that reads is `last`, found in the working file
+    /// of `generation`; not yet known usable.
+    const fn of(op: OpId, last: &BatchHead, generation: u64) -> Self {
+        Self {
+            op,
+            landed: last.landed,
+            placed: last.placed(),
+            pen_down: last.pen_down,
+            dab_format: last.dab_format,
+            generation,
+            usable: false,
+        }
+    }
 }
 
 /// Why a journal was found and not used: the restored tiles stand, as they would with no journal,
@@ -329,8 +355,8 @@ pub enum JournalUnusable {
     PenDownMissing,
     /// Batches of the stroke disagree: on its pen-down (one going back from a save point to
     /// the stroke before it, or naming two), on its rows' format, or a landed count goes back.
-    /// Or it names the stroke before it with dabs landed, or names another than the open stroke
-    /// found just before it, or a save point while that one is open.
+    /// Or it names the stroke before it with dabs landed, or names an open stroke other than
+    /// the one found just before it.
     #[error("the stroke's batches disagree")]
     Mismatch,
     /// The rows' format is 0: the app never set it, so no app can say it reads them.
@@ -342,11 +368,12 @@ pub enum JournalUnusable {
     /// trust (see the module notes).
     #[error("the stroke's journal is larger than the store's budget")]
     TooLarge,
-    /// A later op's edits stand over the stroke: its last batch leaves dabs not landed, but the
-    /// file holds edits of an op of its site begun after it, so the stroke ended without its
-    /// closing batch (a save in its middle moved its later edits to a new op, or an op began
-    /// with no stroke). Landing its rows now would land them over those edits.
-    #[error("a later op's edits stand over the stroke")]
+    /// The stroke ended without its closing batch: its last batch leaves dabs not landed, but
+    /// the file holds edits of an op of its site begun after it (a save in its middle moved its
+    /// later edits to a new op, or an op began with no stroke), or a later stroke began its own
+    /// surface (see the module notes, "Chains"). Landing its rows now would land them over what
+    /// came after.
+    #[error("a later op's work stands over the stroke")]
     Ended,
     /// The stroke began behind an open stroke whose journal is unusable: its surface is the one
     /// that stroke would leave once landed, which can't be had.
@@ -366,6 +393,10 @@ pub(super) struct Found {
     /// Each open stroke, in op order, usable or why not; a last batch of no op found that
     /// doesn't read, or open batches past the budget, last.
     pub(super) strokes: Vec<Result<OpenStroke, JournalUnusable>>,
+    /// Every op found open, usable or not, in op order, as its last batch that reads leaves it:
+    /// what the project closes in the file once a fresh op is handed out, so no stroke left open
+    /// is found again by a later restore.
+    pub(super) open: Vec<Unresumed>,
     /// The newest op any batch that reads names: ops handed out from now on must be past it, as
     /// they must be past the edits' (see [`crate::Project::restore`]).
     pub(super) newest_op: Option<OpId>,
@@ -376,31 +407,62 @@ pub(super) struct Found {
 ///
 /// None if it holds no batch, or every op's last batch has all its dabs landed (its closing
 /// batch, or every dab placed landed). A last batch with dabs not landed under edits of a later
-/// op is [`JournalUnusable::Ended`]. A later op is found from the file's head, which is the
-/// newest op only among one site's ([`OpId`]'s ordering puts a greater site after every op of a
-/// lesser, whenever it was made): so it is compared only when it is of the stroke's site. An op
-/// of another site says nothing either way, and the closing batch alone says whether the stroke
-/// ended. The head is the greatest op over every site, so a greater site's op hides a later op
-/// of the stroke's own: that can't happen while every edit comes from one site, as now. When
-/// edits of several sites are merged, the file must keep its head per site for this check; and
-/// a batch's [`PenDown::After`], which names an op of its own site before its own (the store
-/// reserves every op on its own site), would need an order across sites too.
+/// op is [`JournalUnusable::Ended`], and so is one before the last chain's start (see the module
+/// notes, "Chains"). A later op is found from the file's head, which is the newest op only among
+/// one site's ([`OpId`]'s ordering puts a greater site after every op of a lesser, whenever it
+/// was made): so it is compared only when it is of the stroke's site. An op of another site
+/// says nothing either way, and the closing batch alone says whether the stroke ended. The head
+/// is the greatest op over every site, so a greater site's op hides a later op of the stroke's
+/// own: that can't happen while every edit comes from one site, as now. When edits of several
+/// sites are merged, the file must keep its head per site for this check; and a batch's
+/// [`PenDown::After`], which names an op of its own site before its own (the store reserves
+/// every op on its own site), would need an order across sites too.
 pub(super) fn find(store: &TileStore) -> Found {
     let file = store.working();
     let scan = Scan::of(file, store.pools_budget());
     if scan.too_large {
         return Found {
             strokes: vec![Err(JournalUnusable::TooLarge)],
+            open: Vec::new(),
             newest_op: scan.newest,
         };
     }
+    let generation = store.generation();
+    let left_open = scan
+        .open
+        .iter()
+        .map(|(&op, opened)| Unresumed::of(op, &opened.last, generation));
+    let open: Vec<Unresumed> = left_open.collect();
+    let start = scan.chain_start();
     let mut room = store.pools_budget();
     let mut strokes = Vec::with_capacity(scan.open.len());
-    // The open stroke just before, and whether it is usable.
+    // The open stroke just before in the chain, and whether it is usable.
     let mut before: Option<(OpId, Result<(), JournalUnusable>)> = None;
-    for (&op, opened) in &scan.open {
-        let own = open_stroke(store, op, opened, scan.first_damaged, &mut room);
-        let found = chained(file, own, before.as_ref());
+    let found_open = scan.open.iter().enumerate();
+    for (at, (&op, opened)) in found_open {
+        if at < start {
+            // A later stroke began its own surface, so this one ended without its closing batch.
+            strokes.push(Err(JournalUnusable::Ended));
+            continue;
+        }
+        let found = match (&before, opened.last.pen_down) {
+            // Not read: its surface is the one the unusable stroke would leave.
+            (Some((earlier, Err(why))), _) => Err(JournalUnusable::EarlierUnusable {
+                earlier: *earlier,
+                why: Box::new(why.clone()),
+            }),
+            (Some((earlier, Ok(()))), PenDown::After(named)) if named == *earlier => {
+                open_stroke(store, op, opened, &scan, &mut room).map(|mut stroke| {
+                    stroke.after = Some(named);
+                    stroke
+                })
+            }
+            (Some(_), _) => Err(JournalUnusable::Mismatch),
+            (None, PenDown::After(named)) => scan
+                .earlier_closed(file, named)
+                .and_then(|()| open_stroke(store, op, opened, &scan, &mut room)),
+            (None, _) => open_stroke(store, op, opened, &scan, &mut room),
+        };
         before = Some((op, found.as_ref().map(|_| ()).map_err(Clone::clone)));
         strokes.push(found);
     }
@@ -409,61 +471,9 @@ pub(super) fn find(store: &TileStore) -> Found {
     }
     Found {
         strokes,
+        open,
         newest_op: scan.newest,
     }
-}
-
-/// `own`, a stroke found open, as the strokes before it say (see the module notes).
-///
-/// `before` is the open stroke found just before it and whether that is usable, `None` if it is
-/// the oldest.
-///
-/// # Errors
-///
-/// `own`'s error; else [`JournalUnusable::EarlierUnusable`] after an unusable one;
-/// [`JournalUnusable::Mismatch`] naming another than the open one before it, or a save point
-/// with one open before it; [`JournalUnusable::PenDownUnknown`] after a stroke the file holds
-/// nothing of ([`holds_work_of`]).
-fn chained(
-    file: &ProjectFile,
-    own: Result<OpenStroke, JournalUnusable>,
-    before: Option<&(OpId, Result<(), JournalUnusable>)>,
-) -> Result<OpenStroke, JournalUnusable> {
-    let mut stroke = own?;
-    match (before, stroke.pen_down) {
-        (Some((earlier, Err(why))), _) => Err(JournalUnusable::EarlierUnusable {
-            earlier: *earlier,
-            why: Box::new(why.clone()),
-        }),
-        (Some((earlier, Ok(()))), PenDown::After(named)) if named == *earlier => {
-            stroke.after = Some(named);
-            Ok(stroke)
-        }
-        (Some(_), _) => Err(JournalUnusable::Mismatch),
-        (None, PenDown::After(named)) if !holds_work_of(file, named) => {
-            Err(JournalUnusable::PenDownUnknown)
-        }
-        (None, _) => Ok(stroke),
-    }
-}
-
-/// Whether `file`'s state holds the work of the closed stroke made as `op`, which a stroke after
-/// it names.
-///
-/// That is a batch of it that reads (its closing one, as no batch of it is open), or, with none,
-/// edits of it or of a later op of its site (its head). A stroke is journalled from its
-/// first flush after its own cut, unless every dab it placed had landed by then: so one with no
-/// batch either landed every dab before a cut (its edits are in, and the head is at or past it)
-/// or was lost to the crash before its first batch (its landing came after the last cut, and
-/// the head is before it). Reads the fixed fields of the batches until it finds one.
-fn holds_work_of(file: &ProjectFile, op: OpId) -> bool {
-    let edited = file
-        .head()
-        .is_some_and(|head| head.site() == op.site() && head >= op);
-    edited
-        || file
-            .batch_locations()
-            .any(|loc| file.read_batch_head(loc).is_ok_and(|head| head.op == op))
 }
 
 /// A batch of an open stroke as the scan keeps it.
@@ -478,40 +488,134 @@ struct Kept {
 }
 
 /// One stroke the scan has found open so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Opened {
-    /// Its batches from the last at or before its landed count, in file order.
-    batches: Vec<Kept>,
+    /// Its batches from the last at or before its landed count, in file order; none once
+    /// `broken`.
+    batches: VecDeque<Kept>,
+    /// Its last batch that reads.
+    last: BatchHead,
     /// Whether a batch that doesn't read came after its last: that one may have been its last.
     damaged: bool,
+    /// Why its batches don't make one run, from the first batch that doesn't follow the one
+    /// before it (see [`follows`]); none of them is kept from then on.
+    broken: Option<JournalUnusable>,
 }
+
+impl Opened {
+    /// A stroke whose first batch the scan found is `first`.
+    fn new(first: Kept) -> Self {
+        Self {
+            batches: VecDeque::from([first]),
+            last: first.head,
+            damaged: false,
+            broken: None,
+        }
+    }
+
+    /// `next`, the stroke's next batch: kept if it follows the one before, from which the batches
+    /// before the last at or before its landed count go (the landed count only grows, so they
+    /// are never needed again); else the stroke is broken.
+    fn push(&mut self, next: Kept) {
+        self.last = next.head;
+        self.damaged = false;
+        if self.broken.is_some() {
+            return;
+        }
+        let followed = self
+            .batches
+            .back()
+            .map_or(Ok(()), |before| follows(&before.head, &next.head));
+        if let Err(why) = followed {
+            self.broken = Some(why);
+            self.batches.clear();
+            return;
+        }
+        self.batches.push_back(next);
+        // The batches start where the one before left off, so their first indices only grow.
+        while self
+            .batches
+            .get(1)
+            .is_some_and(|second| second.head.first <= next.head.landed)
+        {
+            self.batches.pop_front();
+        }
+    }
+}
+
+/// Whether `after`, a stroke's batch, follows `before`, its batch just before it in the file.
+///
+/// They must agree on the rows' format (see the module notes), the pen-down stays or goes from the
+/// stroke before ([`PenDown::After`]) to a save point (or unknown), never back or elsewhere, the
+/// landed count never goes back, and `after` starts at the later of the dabs `before` placed and
+/// its own landed count.
+///
+/// # Errors
+///
+/// [`JournalUnusable::Mismatch`] if they disagree; [`JournalUnusable::Gap`] if `after` starts
+/// elsewhere.
+fn follows(before: &BatchHead, after: &BatchHead) -> Result<(), JournalUnusable> {
+    let pen_down_holds = match (before.pen_down, after.pen_down) {
+        (was, now) if was == now => true,
+        (PenDown::After(_), PenDown::At(_) | PenDown::Base | PenDown::Unknown) => true,
+        _ => false,
+    };
+    let agree =
+        pen_down_holds && after.dab_format == before.dab_format && after.landed >= before.landed;
+    if !agree {
+        return Err(JournalUnusable::Mismatch);
+    }
+    let expected = before.placed().max(after.landed);
+    if after.first != expected {
+        return Err(JournalUnusable::Gap {
+            expected,
+            found: after.first,
+        });
+    }
+    Ok(())
+}
+
+/// The bytes the scan charges for each op it keeps, open or closed, beside its batches: the
+/// entry and a map node's share. An estimate; what matters is that it grows with the ops.
+const OP_BYTES: usize = size_of::<Opened>() + size_of::<OpId>() + 4 * size_of::<usize>();
 
 /// What a look over every batch of a file finds (see the module notes, "Finding them").
 #[derive(Debug, Default)]
 struct Scan {
     /// The ops whose last batch has dabs not landed, each with what the scan keeps of it.
     open: BTreeMap<OpId, Opened>,
+    /// The ops whose last batch that reads counts every dab landed, each with that batch's place.
+    closed: BTreeMap<OpId, usize>,
     /// The place of the first batch that doesn't read, if one doesn't.
     first_damaged: Option<usize>,
+    /// The place of the last batch that doesn't read, if one doesn't.
+    last_damaged_at: Option<usize>,
     /// Whether the file's last batch doesn't read.
     last_damaged: bool,
     /// The newest op of a batch that reads.
     newest: Option<OpId>,
-    /// Whether the batches kept would hold more than the room given: then none is kept.
+    /// Whether what the scan keeps would hold more than the room given: then none is kept.
     too_large: bool,
 }
 
 impl Scan {
-    /// Looks over every batch of `file`, in file order, reading their fixed fields alone; the
-    /// batches kept may hold `room` bytes at most.
+    /// Looks over every batch of `file`, in file order, reading their fixed fields alone, each
+    /// once and in constant work beside it; what it keeps may hold `room` bytes at most.
+    ///
+    /// A batch whose read fails is taken as damaged, the read error transient or not: it may
+    /// hide an op (one whose every batch is unread is never found), which is benign, as it
+    /// only ever makes strokes unusable, never lands one on a surface it doesn't hold: the
+    /// strokes it may have been the last of are [`JournalUnusable::Damaged`], and so is a later
+    /// stroke naming one the scan didn't find (see [`Scan::earlier_closed`]). A restore made
+    /// again reads it afresh.
     fn of(file: &ProjectFile, room: usize) -> Self {
-        let most = room / size_of::<Kept>();
         let mut scan = Self::default();
-        let mut kept = 0_usize;
+        let mut bytes = 0_usize;
         let batches = file.batch_locations().enumerate();
         for (index, loc) in batches {
             let Ok(head) = file.read_batch_head(loc) else {
                 scan.first_damaged.get_or_insert(index);
+                scan.last_damaged_at = Some(index);
                 scan.last_damaged = true;
                 for opened in scan.open.values_mut() {
                     opened.damaged = true;
@@ -520,40 +624,94 @@ impl Scan {
             };
             scan.last_damaged = false;
             scan.newest = scan.newest.max(Some(head.op));
-            if head.landed == head.placed() {
-                // Closed: every dab placed has landed, or the stroke ended.
-                if let Some(closed) = scan.open.remove(&head.op) {
-                    kept = kept.saturating_sub(closed.batches.len());
-                }
-                continue;
-            }
             if scan.too_large {
                 continue;
             }
-            let opened = scan.open.entry(head.op).or_default();
-            opened.damaged = false;
-            opened.batches.push(Kept { index, loc, head });
-            // The landed count only grows, so a batch before the last that starts at or before
-            // it is never needed again.
-            let from = opened
-                .batches
-                .iter()
-                .rposition(|batch| batch.head.first <= head.landed)
-                .unwrap_or(0);
-            opened.batches.drain(..from);
-            kept = kept.saturating_add(1).saturating_sub(from);
-            if kept > most {
+            let kept = Kept { index, loc, head };
+            if head.landed == head.placed() {
+                // Closed: every dab placed has landed, or the stroke ended.
+                if let Some(closed) = scan.open.remove(&head.op) {
+                    bytes = bytes.saturating_sub(closed.batches.len() * size_of::<Kept>());
+                } else {
+                    bytes = bytes.saturating_add(OP_BYTES);
+                }
+                scan.closed.insert(head.op, index);
+                continue;
+            }
+            if scan.closed.remove(&head.op).is_some() {
+                bytes = bytes.saturating_sub(OP_BYTES);
+            }
+            let (before, after) = if let Some(opened) = scan.open.get_mut(&head.op) {
+                let before = opened.batches.len();
+                opened.push(kept);
+                (before, opened.batches.len())
+            } else {
+                scan.open.insert(head.op, Opened::new(kept));
+                bytes = bytes.saturating_add(OP_BYTES);
+                (0, 1)
+            };
+            bytes = bytes
+                .saturating_sub(before * size_of::<Kept>())
+                .saturating_add(after * size_of::<Kept>());
+            if bytes > room {
                 scan.too_large = true;
                 scan.open.clear();
-                kept = 0;
+                scan.closed.clear();
             }
         }
         scan
     }
+
+    /// Where the last chain of open strokes starts, as a place among them in op order (see the
+    /// module notes, "Chains"): the last stroke whose batches name a surface of its own (a save
+    /// point, or unknown), or the stroke before it as one not open; 0 with none.
+    fn chain_start(&self) -> usize {
+        let starts =
+            self.open
+                .values()
+                .enumerate()
+                .filter(|(_, opened)| match opened.last.pen_down {
+                    PenDown::After(named) => !self.open.contains_key(&named),
+                    PenDown::Base | PenDown::At(_) | PenDown::Unknown => true,
+                });
+        starts.map(|(at, _)| at).next_back().unwrap_or(0)
+    }
+
+    /// Whether the stroke made as `named`, not open, which the oldest stroke of the chain names
+    /// as the stroke before it, left the restored tiles holding its work (see the module notes).
+    ///
+    /// Its last batch that reads must count every dab landed, with no batch that doesn't read
+    /// after it (that one may have been its last, with dabs not landed). With no batch of it, it
+    /// is journalled from its first flush after its own cut unless every dab it placed had landed
+    /// by then: so it either landed every dab before a cut (its edits are in `file`, whose head
+    /// is at or past it) or was lost to the crash before its first batch (its landing came after
+    /// the last cut, and the head is before it); that is told only with every batch read, as an
+    /// unread one may have been its.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalUnusable::Damaged`] if a batch that doesn't read may have been its last (or its
+    /// only); [`JournalUnusable::PenDownUnknown`] if the file holds no work of it.
+    fn earlier_closed(&self, file: &ProjectFile, named: OpId) -> Result<(), JournalUnusable> {
+        match self.closed.get(&named) {
+            Some(&at) if self.last_damaged_at.is_none_or(|damaged| damaged < at) => Ok(()),
+            Some(_) => Err(JournalUnusable::Damaged),
+            None if self.first_damaged.is_some() => Err(JournalUnusable::Damaged),
+            None => {
+                let edited = file
+                    .head()
+                    .is_some_and(|head| head.site() == named.site() && head >= named);
+                if edited {
+                    Ok(())
+                } else {
+                    Err(JournalUnusable::PenDownUnknown)
+                }
+            }
+        }
+    }
 }
 
-/// The open stroke of `op`, as the scan found it (`opened`, with `first_damaged` the place of
-/// the first batch that doesn't read), its rows and shapes taken from `room`.
+/// The open stroke of `op`, as `scan` found it (`opened`), its rows and shapes taken from `room`.
 ///
 /// # Errors
 ///
@@ -563,9 +721,12 @@ fn open_stroke(
     store: &TileStore,
     op: OpId,
     opened: &Opened,
-    first_damaged: Option<usize>,
+    scan: &Scan,
     room: &mut usize,
 ) -> Result<OpenStroke, JournalUnusable> {
+    if let Some(broken) = &opened.broken {
+        return Err(broken.clone());
+    }
     if opened.damaged {
         return Err(JournalUnusable::Damaged);
     }
@@ -576,13 +737,24 @@ fn open_stroke(
     if later_op {
         return Err(JournalUnusable::Ended);
     }
-    let (Some(first), Some(last)) = (opened.batches.first(), opened.batches.last()) else {
+    let (Some(first), Some(last)) = (opened.batches.front(), opened.batches.back()) else {
         return Err(JournalUnusable::Damaged);
     };
     let landed = last.head.landed;
-    // The batch holding the landed count's dab may be one that doesn't read.
-    if first.head.first > landed && first_damaged.is_some_and(|at| at < first.index) {
-        return Err(JournalUnusable::Damaged);
+    if first.head.first > landed {
+        // The batch holding the landed count's dab may be one that doesn't read.
+        if scan.first_damaged.is_some_and(|at| at < first.index) {
+            return Err(JournalUnusable::Damaged);
+        }
+        return Err(JournalUnusable::Gap {
+            expected: landed,
+            found: first.head.first,
+        });
+    }
+    // The batches agree on their format, and their pen-down is the last's (see `follows`).
+    let (pen_down, dab_format) = (last.head.pen_down, first.head.dab_format);
+    if dab_format == 0 {
+        return Err(JournalUnusable::UnsetFormat);
     }
     let rows_of = |head: &BatchHead| -> usize {
         let from = head.first.max(landed);
@@ -594,16 +766,6 @@ fn open_stroke(
     if row_bytes > *room {
         return Err(JournalUnusable::TooLarge);
     }
-    let read = opened
-        .batches
-        .iter()
-        .map(|kept| file.read_batch(kept.loc).or(Err(JournalUnusable::Damaged)));
-    let run: Result<Vec<DabBatch>, JournalUnusable> = read.collect();
-    let run = run?;
-    let (pen_down, dab_format) = check_run(&run, landed)?;
-    if dab_format == 0 {
-        return Err(JournalUnusable::UnsetFormat);
-    }
     let left = room.saturating_sub(row_bytes);
     let (shapes, shape_bytes) = match pen_down {
         PenDown::Base => pen_down_surface(store, None, left)?,
@@ -613,11 +775,18 @@ fn open_stroke(
         PenDown::After(_) if landed > 0 => return Err(JournalUnusable::Mismatch),
         PenDown::After(_) => (Vec::new(), 0),
     };
-    let rows = run.iter().flat_map(|batch| {
+    let mut dabs: Vec<[u8; DAB_BYTES]> = Vec::with_capacity(row_bytes / DAB_BYTES);
+    for kept in &opened.batches {
+        // Each batch is read whole and goes once its rows are copied.
+        let batch = file
+            .read_batch(kept.loc)
+            .or(Err(JournalUnusable::Damaged))?;
+        if batch.op() != op || batch.first() != kept.head.first {
+            return Err(JournalUnusable::Damaged);
+        }
         let before = usize::try_from(landed.saturating_sub(batch.first())).unwrap_or(usize::MAX);
-        batch.dabs().iter().skip(before).copied()
-    });
-    let dabs: Vec<[u8; DAB_BYTES]> = rows.collect();
+        dabs.extend(batch.dabs().iter().skip(before));
+    }
     *room = left.saturating_sub(shape_bytes);
     Ok(OpenStroke {
         op,
@@ -630,52 +799,6 @@ fn open_stroke(
         store: store.id(),
         generation: store.generation(),
     })
-}
-
-/// Checks `run`, the batches of one stroke in file order; returns the pen-down its last names
-/// and their format.
-///
-/// The last's landed count is `landed`. They must agree on the rows' format, their pen-down may
-/// go from the stroke before ([`PenDown::After`]) to a save point (or unknown) but never back or
-/// elsewhere, their landed counts never go back, and each starts where the one before leaves
-/// off.
-///
-/// # Errors
-///
-/// [`JournalUnusable::Mismatch`] if they disagree; [`JournalUnusable::Gap`] at the first batch
-/// that starts elsewhere, or for the first if it starts past `landed`.
-fn check_run(run: &[DabBatch], landed: u32) -> Result<(PenDown, u32), JournalUnusable> {
-    let (Some(first), Some(last)) = (run.first(), run.last()) else {
-        return Err(JournalUnusable::Damaged);
-    };
-    let pairs = run.iter().zip(run.iter().skip(1));
-    for (before, after) in pairs {
-        let pen_down_holds = match (before.pen_down(), after.pen_down()) {
-            (was, now) if was == now => true,
-            (PenDown::After(_), PenDown::At(_) | PenDown::Base | PenDown::Unknown) => true,
-            _ => false,
-        };
-        let agree = pen_down_holds
-            && after.dab_format() == before.dab_format()
-            && after.landed() >= before.landed();
-        if !agree {
-            return Err(JournalUnusable::Mismatch);
-        }
-        let expected = before.placed().max(after.landed());
-        if after.first() != expected {
-            return Err(JournalUnusable::Gap {
-                expected,
-                found: after.first(),
-            });
-        }
-    }
-    if first.first() > landed {
-        return Err(JournalUnusable::Gap {
-            expected: landed,
-            found: first.first(),
-        });
-    }
-    Ok((last.pen_down(), first.dab_format()))
 }
 
 /// A stroke's pen-down shapes: the corrections of each tile changed since `earlier`, as they were,

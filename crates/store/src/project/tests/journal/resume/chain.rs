@@ -10,11 +10,11 @@ use super::*;
 use crate::tiles::ReservedOp;
 
 /// A stroke begun behind the newest open one: its op reserved, its dabs journalled, none landed.
-struct Behind {
+pub(super) struct Behind {
     /// The op reserved for it.
-    reserved: ReservedOp,
+    pub(super) reserved: ReservedOp,
     /// The edit of each dab, by index.
-    edits: Vec<Edit>,
+    pub(super) edits: Vec<Edit>,
     /// The dabs placed so far.
     placed: u32,
 }
@@ -22,7 +22,7 @@ struct Behind {
 impl Behind {
     /// Begins a stroke behind the newest open one on `project`, with room for `count` dabs on
     /// the finest level, their edits from `seed`.
-    fn begin(project: &mut Project, count: u32, seed: u64) -> Self {
+    pub(super) fn begin(project: &mut Project, count: u32, seed: u64) -> Self {
         let edits = top_edits(&project.store().working().mesh(), count, seed);
         let reserved = project.begin_stroke_after().unwrap();
         Self {
@@ -33,12 +33,12 @@ impl Behind {
     }
 
     /// Its op.
-    fn op(&self) -> OpId {
+    pub(super) fn op(&self) -> OpId {
         self.reserved.op()
     }
 
     /// Places the next `count` dabs: journals them.
-    fn place(&mut self, project: &mut Project, count: u32) {
+    pub(super) fn place(&mut self, project: &mut Project, count: u32) {
         let next = self.placed + count;
         project
             .journal_placed_after(&self.reserved, &dabs(self.placed..next))
@@ -47,14 +47,14 @@ impl Behind {
     }
 
     /// Its edits, the token given up: the project it was reserved on has crashed.
-    fn crashed(self) -> Vec<Edit> {
+    pub(super) fn crashed(self) -> Vec<Edit> {
         self.reserved.abandon_with_store_gone();
         self.edits
     }
 }
 
 /// Every stroke `found` offers, each usable: their ops, in the order offered.
-fn usable(found: Vec<Result<OpenStroke, JournalUnusable>>) -> Vec<OpenStroke> {
+pub(super) fn usable(found: Vec<Result<OpenStroke, JournalUnusable>>) -> Vec<OpenStroke> {
     let usable = found
         .into_iter()
         .map(|stroke| stroke.expect("a stroke to land"));
@@ -63,7 +63,7 @@ fn usable(found: Vec<Result<OpenStroke, JournalUnusable>>) -> Vec<OpenStroke> {
 
 /// Resumes `open`, a stroke a restore found whose dabs are `edits`, waits until it may land, lands
 /// every dab not landed into `project` and `map`, and ends it.
-fn resume_and_land(
+pub(super) fn resume_and_land(
     project: &mut Project,
     open: OpenStroke,
     edits: &[Edit],
@@ -492,8 +492,11 @@ fn a_stroke_named_after_one_the_file_holds_nothing_of_is_unusable() {
     append_and_save(&dir, &after_none(stroke.op));
     assert_eq!(
         offered_ops(restore(&dir)),
-        vec![Ok(stroke.op), Err(JournalUnusable::Mismatch)],
-        "the open stroke before it isn't the one it names"
+        vec![
+            Err(JournalUnusable::Ended),
+            Err(JournalUnusable::PenDownUnknown)
+        ],
+        "a chain of its own, which ends the open one before it, on a surface no save point holds"
     );
 
     // With no stroke open before it: its surface is in no save point.
@@ -507,7 +510,7 @@ fn a_stroke_named_after_one_the_file_holds_nothing_of_is_unusable() {
 }
 
 /// The op of each stroke `restored` offers, or why it can't be landed. Closes it.
-fn offered_ops(mut restored: Project) -> Vec<Result<OpId, JournalUnusable>> {
+pub(super) fn offered_ops(mut restored: Project) -> Vec<Result<OpId, JournalUnusable>> {
     let offered = restored
         .take_open_strokes()
         .into_iter()
@@ -531,7 +534,7 @@ fn crash_ended(dir: &TestDir, map: &mut CorrectionMap, seed: u64) -> OpId {
 }
 
 /// Appends `extra` to the recovery file in `dir`, with a save point of their own.
-fn append_and_save(dir: &TestDir, extra: &[DabBatch]) {
+pub(super) fn append_and_save(dir: &TestDir, extra: &[DabBatch]) {
     let mut file = ProjectFile::open(&candidate(dir).path).unwrap();
     let framed: Vec<Vec<u8>> = extra
         .iter()

@@ -510,9 +510,10 @@ pub struct Project {
     /// [`Project::take_open_strokes`] takes them; empty for a project not restored, or with
     /// none.
     open_strokes: Vec<Result<OpenStroke, JournalUnusable>>,
-    /// The strokes [`Project::restore`] found still landing and usable, in op order, each until
-    /// it is resumed or a fresh op is handed out: then [`Project::begin_stroke`] (or
-    /// [`Project::begin_stroke_after`]) closes those left in the file.
+    /// The strokes [`Project::restore`] found still landing, usable or not, in op order, each
+    /// until it is resumed, or a fresh op is handed out or the restored strokes are let go: then
+    /// [`Project::begin_stroke`], [`Project::begin_stroke_after`] or
+    /// [`Project::let_go_of_restored_strokes`] closes those left in the file.
     unresumed: Vec<Unresumed>,
     /// Test hook: makes the next [`Project::resume_stroke`] fail at its last step, reopening the
     /// op, after its journal is seeded.
@@ -660,8 +661,16 @@ impl Project {
         let mut project = Self::restore_tiles(candidate, config)?;
         let found = resume::find(&project.store);
         project.store.skip_ops_past([found.newest_op])?;
-        let usable = found.strokes.iter().filter_map(|found| found.as_ref().ok());
-        project.unresumed = usable.map(OpenStroke::unresumed).collect();
+        let usable: Vec<OpId> = found
+            .strokes
+            .iter()
+            .filter_map(|found| found.as_ref().ok().map(OpenStroke::op))
+            .collect();
+        let marked = found.open.into_iter().map(|mut unresumed| {
+            unresumed.usable = usable.contains(&unresumed.op);
+            unresumed
+        });
+        project.unresumed = marked.collect();
         project.open_strokes = found.strokes;
         Ok(project)
     }
@@ -1125,7 +1134,7 @@ impl Project {
         let unresumed = self
             .unresumed
             .iter()
-            .any(|unresumed| unresumed.generation == generation);
+            .any(|unresumed| unresumed.usable && unresumed.generation == generation);
         self.store.has_unsaved_edits() || self.store.is_landing() || unresumed
     }
 
@@ -1385,12 +1394,27 @@ impl Project {
         self.take_open_strokes().into_iter().next()
     }
 
-    /// Closes in the file every stroke a restore found still landing and nobody resumed, as a
-    /// fresh op is handed out ([`Project::begin_stroke`], [`Project::begin_stroke_after`]):
-    /// their dabs not landed are dropped, and a second crash's restore never offers them again
-    /// over that op's edits. Strokes found in a working file the project has moved off since are
-    /// in none it writes, and are let go.
-    pub(super) fn close_unresumed(&mut self) {
+    /// Lets go of every stroke a restore found still landing and nobody has resumed: none of
+    /// them resumes from now on ([`Project::resume_stroke`] refuses them), and each is closed in
+    /// the file, its dabs not landed dropped, so a second crash's restore never offers it again.
+    /// Returns their ops, in op order.
+    ///
+    /// For an app that won't land them: a stroke resumed before them that dropped dabs, whose
+    /// surface they were placed on ([`Project::end_stroke_dropping_later`] lets them go itself),
+    /// or a choice not to finish them. A fresh op does as much ([`Project::begin_stroke`],
+    /// [`Project::begin_stroke_after`]).
+    pub fn let_go_of_restored_strokes(&mut self) -> Vec<OpId> {
+        self.close_unresumed()
+    }
+
+    /// Closes in the file every stroke a restore found still landing and nobody resumed, usable
+    /// or not, as a fresh op is handed out ([`Project::begin_stroke`],
+    /// [`Project::begin_stroke_after`]) or they are let go: their dabs not landed are dropped,
+    /// and a second crash's restore never offers them again over that op's edits, nor takes one
+    /// left open for a stroke before a later one's. Strokes found in a working file the project
+    /// has moved off since are in none it writes, and are let go. Returns the ops let go, in op
+    /// order.
+    pub(super) fn close_unresumed(&mut self) -> Vec<OpId> {
         let generation = self.store.generation();
         let found = std::mem::take(&mut self.unresumed);
         let here = found
@@ -1405,6 +1429,62 @@ impl Project {
                 unresumed.dab_format,
             );
         }
+        found.iter().map(|unresumed| unresumed.op).collect()
+    }
+
+    /// The open stroke ends, and every stroke behind it goes, none of their dabs ever landing:
+    /// the strokes reserved behind it ([`Project::begin_stroke_after`]) and those a restore found
+    /// and nobody has resumed. For a stroke that dropped dabs (a store error in its landing): the
+    /// strokes behind it were placed on the surface it was to leave, which it won't, so none of
+    /// them may be landed, live or after a crash. Returns the ops let go, in op order.
+    ///
+    /// Everything happens in this call, on the owner thread, with no tick between: the strokes
+    /// behind it are let go first, their journals closed, every dab of them counted landed, and
+    /// then the stroke ends, as [`Project::end_stroke`] (with `record`) or
+    /// [`Project::end_unrecorded_stroke`] (without) ends it, its journal closed counting its
+    /// dropped dabs landed. So no flush writes the stroke's closing batch while one behind it is
+    /// still open naming it ([`PenDown::After`](crate::PenDown::After)), which a restore would
+    /// then land on the surface the stroke left, dabs missing.
+    ///
+    /// The tokens of the strokes reserved behind it are no longer reserved: give each back with
+    /// [`Project::drop_stroke_after`], which lets nothing more go.
+    ///
+    /// # Errors
+    ///
+    /// Refused, with nothing let go and the stroke still open: [`ProjectError::NoStroke`] with no
+    /// stroke open; as [`Project::end_stroke`] for a `record` it refuses
+    /// ([`ProjectError::NotTheStroke`], [`ProjectError::AlreadyRecorded`]). Once the strokes
+    /// behind are let go, as [`Project::end_stroke`] once its record is kept.
+    ///
+    /// # Panics
+    ///
+    /// While a reserved op's pen-down shapes are read, as
+    /// [`TileStore::drop_reserved_op`](crate::tiles::TileStore::drop_reserved_op).
+    pub fn end_stroke_dropping_later(
+        &mut self,
+        record: Option<&StrokeRecord>,
+    ) -> Result<Vec<OpId>, ProjectError> {
+        let open = self.stroke.ok_or(ProjectError::NoStroke)?;
+        if let Some(record) = record {
+            let op = record.op();
+            if self.recorded == Some(op) {
+                return Err(ProjectError::AlreadyRecorded(op));
+            }
+            if op != open {
+                return Err(ProjectError::NotTheStroke {
+                    record: op,
+                    stroke: self.stroke,
+                });
+            }
+        }
+        let mut dropped = self.store.drop_every_reserved_op();
+        dropped.extend(self.close_unresumed());
+        dropped.sort_unstable();
+        match record {
+            Some(record) => self.end_stroke(record)?,
+            None => self.end_unrecorded_stroke()?,
+        }
+        Ok(dropped)
     }
 
     /// [`Project::end_stroke`] at `now`.

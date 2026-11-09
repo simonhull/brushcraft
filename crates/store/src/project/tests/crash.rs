@@ -1078,6 +1078,16 @@ fn chain_child() {
     wait_for_the_kill();
 }
 
+/// The op a fresh project's first stroke takes, as the chain child's first stroke took it.
+fn first_stroke_op() -> OpId {
+    let dir = TestDir::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let op = project.begin_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    project.close(false).unwrap();
+    op
+}
+
 /// The chain crash test's runs: kills at as many moments.
 const CHAIN_RUNS: u32 = 12;
 
@@ -1108,19 +1118,32 @@ fn a_kill_with_strokes_open_in_a_chain_restores_and_lands_every_dab_placed() {
             .unwrap();
         let mut project = Project::restore(&candidate, config(&dir)).unwrap();
         // Every stroke's dabs placed by the last save point, by its op: the ops are the strokes'
-        // in order, the first the first stroke's.
+        // in order, the first the one a fresh project's first stroke takes. A stroke's batches
+        // say how many it had placed. A stroke with none either landed every dab before the first
+        // cut after its own (a stroke places faster than it lands, so only once it had placed
+        // all of its dabs and ended: its edits are in, and the head is at or past it), or had
+        // its first cut after the last save point (none of its edits is in): a stroke never
+        // lands before its own cut, and a cut with any of its dabs not landed writes a batch.
         let batches: Vec<DabBatch> = project
             .store()
             .working()
             .batches()
             .map(Result::unwrap)
             .collect();
-        let first = batches.iter().map(DabBatch::op).min().unwrap();
+        let first = first_stroke_op();
         let mut placed: BTreeMap<u64, u32> = BTreeMap::new();
         for batch in &batches {
             let stroke = batch.op().seq() - first.seq();
             let most = placed.entry(stroke).or_default();
             *most = (*most).max(batch.placed());
+        }
+        let head = project.store().working().head();
+        let edited = head
+            .into_iter()
+            .flat_map(|head| first.seq()..=head.seq())
+            .map(|seq| seq - first.seq());
+        for stroke in edited {
+            placed.entry(stroke).or_insert(CHAIN_DABS);
         }
         let found = project.take_open_strokes();
         if found.len() >= 2 {

@@ -180,8 +180,16 @@ impl ProjectFile {
     /// greater. A stroke that has landed nothing has no tile record, so the head alone misses
     /// it; a restore brings it back all the same.
     ///
-    /// Every reader of a file's newest op takes it from here: the op generator, which must never
-    /// hand that stroke's op out again, and the recovery listing's last edit.
+    /// The op generator starts past it as a store opens the file, and the recovery listing's
+    /// last edit and a new session's ops ([`crate::Project::open`]) take it, all reading one
+    /// batch, never scanning the journal. It can understate the newest op the journal names: a
+    /// stroke begun behind one still landing has an op past it and no edit, and its last batch
+    /// may come before the other's. A restore moves the generator past every op its scan of the
+    /// batches meets, so it never hands such an op out again. The listing and a new session
+    /// don't need it: the listing's last edit only orders candidates, and a new session works
+    /// on a recovery file of its own, which never holds that stroke's batches; the op has no
+    /// record anywhere (it edited nothing), so another session handing it out makes no record
+    /// that meets one of it.
     pub(crate) fn last_op(&self) -> Option<crate::OpId> {
         self.head().max(self.landing_stroke())
     }

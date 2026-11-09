@@ -294,8 +294,9 @@ impl Project {
     /// [`ProjectError::NotResumable`] if a fresh op was handed out since the restore (begun,
     /// edited as or reserved, even one ended or let go since), a stroke is open (the one before
     /// it, still landing: end it first), the stroke before it ([`OpenStroke::after`]) hasn't been
-    /// resumed and ended, a stroke at or after it was resumed already, the project has moved onto
-    /// another recovery file (a save or a roll-over), or `stroke` isn't this project's; or for
+    /// resumed and ended, a stroke at or after it was resumed already, the restored strokes were
+    /// let go ([`Project::let_go_of_restored_strokes`]), the project has moved onto another
+    /// recovery file (a save or a roll-over), or `stroke` isn't this project's; or for
     /// [`ProjectError::Cache`] if a shape can't be installed (evaluating a tile's parents
     /// fails), which a call made again may get past.
     pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), NotResumed> {
@@ -303,7 +304,12 @@ impl Project {
         let earlier_ended = stroke.after().is_none_or(|earlier| {
             self.store.last_resumed_op() == Some(earlier) && !self.store.journal_open_for(earlier)
         });
+        let not_let_go = self
+            .unresumed
+            .iter()
+            .any(|unresumed| unresumed.op == op && unresumed.usable);
         let resumable = stroke.found_in(&self.store)
+            && not_let_go
             && self.stroke.is_none()
             && earlier_ended
             && self.store.may_resume(op).is_ok();
