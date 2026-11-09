@@ -1076,7 +1076,7 @@ mod tests {
     fn journalled_formats(mut project: Project) -> Vec<u32> {
         project.begin_stroke_and_wait().expect("begun");
         project
-            .journal(&[[0; store::DAB_BYTES]])
+            .journal_placed(&[[0; store::DAB_BYTES]])
             .expect("journalled");
         let recovery = project.recovery_path().expect("a recovery file").to_owned();
         project.close(true).expect("closed");
@@ -1546,7 +1546,7 @@ mod tests {
         let op = crashed.begin_stroke_and_wait().expect("begun");
         let journalled: Vec<[u8; store::DAB_BYTES]> =
             dabs.iter().map(|dab| bytemuck::cast(*dab)).collect();
-        crashed.journal(&journalled).expect("journalled");
+        crashed.journal_placed(&journalled).expect("journalled");
         land(&mut crashed, &mut index, dabs.get(..3).expect("dabs"));
         crashed.journal_landed(3).expect("counted");
         crashed

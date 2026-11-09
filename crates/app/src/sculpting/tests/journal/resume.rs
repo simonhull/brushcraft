@@ -481,7 +481,7 @@ fn crash_with_rows(rows: &[DabRow]) -> TestDir {
     let mut run = Journalling::new();
     run.project.set_dab_format(stroke::DAB_FORMAT);
     run.project.begin_stroke_and_wait().expect("begun");
-    run.project.journal(rows).expect("journalled");
+    run.project.journal_placed(rows).expect("journalled");
     run.cut();
     let Journalling { dir, project, .. } = run;
     // A crash: nothing closes the project.

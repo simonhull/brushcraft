@@ -746,7 +746,7 @@ fn journal_child() {
     let mut edits: Vec<crate::fixture::Edit> = Vec::new();
     for step in 0..JOURNAL_DABS / PLACE_EACH {
         let dabs: Vec<[u8; DAB_BYTES]> = (placed..placed + PLACE_EACH).map(dab_at).collect();
-        project.journal(&dabs).unwrap();
+        project.journal_placed(&dabs).unwrap();
         placed += PLACE_EACH;
         edits.extend(step_edits(&mesh, step));
         let target = landed_by(placed, landed);

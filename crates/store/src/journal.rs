@@ -182,8 +182,8 @@ pub enum JournalError {
 /// how many of its dabs had landed at the flush's cut, and where its pen-down surface is
 /// ([`DabBatch::pen_down`]).
 ///
-/// Made by [`DabBatch::new`], which holds it to what a reader of the record takes, so every batch
-/// the store writes reads back as the same batch.
+/// Made only by the store, which holds it to what a reader of the record takes, so every batch
+/// the store writes reads back as the same batch; the app reads them back, for tools and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DabBatch {
     /// The stroke's op.
@@ -212,7 +212,7 @@ impl DabBatch {
     /// [`JournalError::TooManyDabs`] past [`MAX_JOURNAL_DABS`]; [`JournalError::PastLastIndex`]
     /// if `first` plus the count is past `u32::MAX`; [`JournalError::LandedPastPlaced`] if
     /// `landed` is past that.
-    pub fn new(
+    pub(crate) fn new(
         op: OpId,
         first: u32,
         landed: u32,
@@ -241,7 +241,7 @@ impl DabBatch {
 
     /// The batch with its rows in dab format `dab_format` (see the module notes).
     #[must_use]
-    pub const fn with_dab_format(mut self, dab_format: u32) -> Self {
+    pub(crate) const fn with_dab_format(mut self, dab_format: u32) -> Self {
         self.dab_format = dab_format;
         self
     }

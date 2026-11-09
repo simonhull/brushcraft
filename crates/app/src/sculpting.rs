@@ -109,8 +109,8 @@
 //! recovery file (the dab journal spec, "The journal"): a crash then loses about a second of them,
 //! and never a landed part of the stroke.
 //!
-//! - **Placed:** each dab goes to [`Project::journal`] once, as it joins the stroke's queue, in
-//!   placement order (symmetry copies included), as its 84 bytes ([`DabRow`]): the queue's own
+//! - **Placed:** each dab goes to [`Project::journal_placed`] once, as it joins the stroke's queue,
+//!   in placement order (symmetry copies included), as its 84 bytes ([`DabRow`]): the queue's own
 //!   memory, cast in place, so the frame's path copies and allocates nothing for it. A dab shown
 //!   ahead is placed like any other: a big brush's stroke is journalled from its first dab, however
 //!   long it is shown before any lands.
@@ -741,8 +741,8 @@ struct Pending {
     heading: [Option<Dab>; 2],
 }
 
-/// A dab as the stroke's journal keeps it ([`Project::journal`]): its bytes, one opaque row of
-/// [`store::DAB_BYTES`].
+/// A dab as the stroke's journal keeps it ([`Project::journal_placed`]): its bytes, one opaque row
+/// of [`store::DAB_BYTES`].
 type DabRow = [u8; store::DAB_BYTES];
 
 // A dab is exactly one row, so casting dabs to rows ([`Pending::place`]) never meets a size it
@@ -775,16 +775,16 @@ impl Pending {
     }
 
     /// Queues `placed`, the dabs the sample at `times` placed, each with the tiles of `index` its
-    /// sphere touches, and journals them in `project` ([`Project::journal`]), in order, as their
-    /// bytes in the queue itself: the journal is given the queue's memory, cast to rows, so it
-    /// costs no copy and no allocation here. Returns how many joined the queue.
+    /// sphere touches, and journals them in `project` ([`Project::journal_placed`]), in order, as
+    /// their bytes in the queue itself: the journal is given the queue's memory, cast to rows,
+    /// so it costs no copy and no allocation here. Returns how many joined the queue.
     ///
     /// Making the queue contiguous moves its dabs only when its ring has wrapped, as
     /// [`apply_dabs`]'s batch makes it so anyway.
     ///
     /// # Errors
     ///
-    /// As [`Project::journal`]: none of them joins the queue then, and it is as it was.
+    /// As [`Project::journal_placed`]: none of them joins the queue then, and it is as it was.
     fn place(
         &mut self,
         placed: impl Iterator<Item = Dab>,
@@ -805,7 +805,7 @@ impl Pending {
         }
         let rows: &[DabRow] = bytemuck::cast_slice(new);
         let count = rows.len();
-        if let Err(error) = project.journal(rows) {
+        if let Err(error) = project.journal_placed(rows) {
             self.dabs.truncate(before);
             self.sources.truncate(before);
             self.heading = heading;

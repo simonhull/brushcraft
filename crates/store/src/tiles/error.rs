@@ -236,7 +236,7 @@ pub enum Invariant {
         /// Values the buffer held.
         got: usize,
     },
-    /// The open stroke's journal cut a dab batch that [`crate::DabBatch::new`] refused, though
+    /// The open stroke's journal cut a dab batch that the batch's constructor refused, though
     /// the journal holds its counts to what a batch takes.
     #[error("the journal cut a dab batch it can't make")]
     Journal(#[source] crate::JournalError),

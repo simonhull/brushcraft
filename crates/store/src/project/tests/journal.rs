@@ -79,7 +79,7 @@ impl Stroke {
     /// Places the next `count` dabs: journals them.
     fn place(&mut self, project: &mut Project, count: u32) {
         let next = self.placed + count;
-        project.journal(&dabs(self.placed..next)).unwrap();
+        project.journal_placed(&dabs(self.placed..next)).unwrap();
         self.placed = next;
     }
 
@@ -336,7 +336,10 @@ fn the_journal_goes_when_the_stroke_ends_or_is_discarded() {
     let written = vec![batch(op, 0..10, 0), batch(op, 10..10, 10)];
     assert_eq!(batches(&mut project), written, "its last count, then none");
     assert!(
-        matches!(project.journal(&dabs(10..11)), Err(ProjectError::NoStroke)),
+        matches!(
+            project.journal_placed(&dabs(10..11)),
+            Err(ProjectError::NoStroke)
+        ),
         "no stroke to journal for"
     );
     assert!(

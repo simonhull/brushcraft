@@ -125,8 +125,9 @@ impl OpenStroke {
     }
 
     /// The tiles the stroke had changed by the restored save point, in key order: those it
-    /// keeps pen-down shapes of once resumed. Every other tile is its own.
-    pub fn pen_down_keys(&self) -> impl Iterator<Item = &TileKey> {
+    /// keeps pen-down shapes of once resumed. Every other tile is its own. For tests.
+    #[cfg(test)]
+    pub(crate) fn pen_down_keys(&self) -> impl Iterator<Item = &TileKey> {
         self.shapes.iter().map(|shape| &shape.key)
     }
 

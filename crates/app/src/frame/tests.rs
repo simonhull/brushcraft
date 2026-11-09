@@ -6139,7 +6139,7 @@ fn left_landing(dir: &TestDir, format: u32) -> ProjectConfig {
     project.set_dab_format(format);
     project.begin_stroke_and_wait().expect("begun");
     let rows: Vec<[u8; store::DAB_BYTES]> = dabs.iter().map(|dab| bytemuck::cast(*dab)).collect();
-    project.journal(&rows).expect("journalled");
+    project.journal_placed(&rows).expect("journalled");
     // A flush, durable, then a crash: nothing closes the project.
     project
         .tick(Instant::now() + store::FLUSH_INTERVAL * 2)

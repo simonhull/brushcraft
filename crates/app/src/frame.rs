@@ -541,8 +541,8 @@ pub(crate) trait Brush {
     }
 
     /// Whether every dab the brush places is journalled in the recovery file
-    /// ([`Project::journal`]), so a crash keeps what hasn't landed, and the close bar's Save can
-    /// let the window go as soon as the journal is durable, the landing finishing unseen
+    /// ([`Project::journal_placed`]), so a crash keeps what hasn't landed, and the close bar's Save
+    /// can let the window go as soon as the journal is durable, the landing finishing unseen
     /// ([`Owner::finish_unseen_unless`]). A brush that doesn't keeps the window until the save is
     /// written. None does by default.
     fn journals(&self) -> bool {

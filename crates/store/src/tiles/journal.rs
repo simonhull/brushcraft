@@ -151,11 +151,6 @@ pub(crate) struct Carried {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum JournalCountError {
-    /// No journal of the stroke is open: no stroke began, or it has ended. [`crate::Project`]
-    /// never meets it: it answers [`crate::ProjectError::NoStroke`] first, and opens a journal
-    /// with every stroke it begins.
-    #[error("no journal of the stroke is open")]
-    NotOpen,
     /// The dabs would run past the last index a `u32` counts.
     #[error("the stroke's dabs would run past the last index")]
     PastLastIndex,
@@ -175,6 +170,23 @@ pub enum JournalCountError {
         /// The dabs journalled.
         placed: u32,
     },
+}
+
+/// Why the store refused a call on a stroke's journal ([`TileStore::journal`],
+/// [`TileStore::journal_landed`]). Nothing changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalRefused {
+    /// No journal of the stroke is open: no stroke began, or it has ended. [`crate::Project`]
+    /// answers [`crate::ProjectError::NoStroke`] for it.
+    NotOpen,
+    /// The open journal refused the count.
+    Count(JournalCountError),
+}
+
+impl From<JournalCountError> for JournalRefused {
+    fn from(refused: JournalCountError) -> Self {
+        Self::Count(refused)
+    }
 }
 
 /// What the working file's batches of one stroke hold, or will once a cut's are appended.
@@ -401,12 +413,12 @@ impl Journals {
     ///
     /// # Errors
     ///
-    /// [`JournalCountError::NotOpen`] if no journal of `op` is open.
-    fn open(&mut self, op: OpId) -> Result<&mut Journal, JournalCountError> {
+    /// [`JournalRefused::NotOpen`] if no journal of `op` is open.
+    fn open(&mut self, op: OpId) -> Result<&mut Journal, JournalRefused> {
         self.open
             .as_mut()
             .filter(|journal| journal.op == op)
-            .ok_or(JournalCountError::NotOpen)
+            .ok_or(JournalRefused::NotOpen)
     }
 
     /// Closes the open journal, if any, counting every dab landed: it waits for its last batch
@@ -538,15 +550,15 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`JournalCountError::NotOpen`] if no journal of `op` is open;
+    /// [`JournalRefused::NotOpen`] if no journal of `op` is open; [`JournalRefused::Count`] with
     /// [`JournalCountError::PastLastIndex`] if the stroke's dabs would run past the last index a
     /// `u32` counts. None is added then.
     pub(crate) fn journal(
         &mut self,
         op: OpId,
         placed: &[[u8; DAB_BYTES]],
-    ) -> Result<(), JournalCountError> {
-        self.journals.open(op)?.place(placed)
+    ) -> Result<(), JournalRefused> {
+        Ok(self.journals.open(op)?.place(placed)?)
     }
 
     /// `landed` of the dabs the stroke made as `op` placed have landed: passed with each landing,
@@ -556,15 +568,11 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`JournalCountError::NotOpen`] if no journal of `op` is open;
-    /// [`JournalCountError::LandedBack`] below the count it had;
+    /// [`JournalRefused::NotOpen`] if no journal of `op` is open; [`JournalRefused::Count`] with
+    /// [`JournalCountError::LandedBack`] below the count it had, or
     /// [`JournalCountError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
-    pub(crate) fn journal_landed(
-        &mut self,
-        op: OpId,
-        landed: u32,
-    ) -> Result<(), JournalCountError> {
-        self.journals.open(op)?.land(landed)
+    pub(crate) fn journal_landed(&mut self, op: OpId, landed: u32) -> Result<(), JournalRefused> {
+        Ok(self.journals.open(op)?.land(landed)?)
     }
 
     /// The open stroke ended: its journal counts every dab landed (those it dropped never land),

@@ -110,7 +110,9 @@ use crate::journal::{DAB_BYTES, PenDown};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::stroke_record::StrokeRecord;
-use crate::tiles::{CacheError, JournalCountError, PenDownPoint, Saved, StoreConfig, TileStore};
+use crate::tiles::{
+    CacheError, JournalCountError, JournalRefused, PenDownPoint, Saved, StoreConfig, TileStore,
+};
 
 mod discover;
 mod place;
@@ -250,7 +252,7 @@ pub enum ProjectError {
     /// stroke ended then, and its record is kept once. Nothing was recorded again.
     #[error("the stroke of op {0:?} has its record already")]
     AlreadyRecorded(OpId),
-    /// [`Project::journal`] or [`Project::journal_landed`] with no stroke open: there is no
+    /// [`Project::journal_placed`] or [`Project::journal_landed`] with no stroke open: there is no
     /// journal to add to. Nothing changed.
     #[error("no stroke is open to journal dabs for")]
     NoStroke,
@@ -301,6 +303,15 @@ impl From<KeptRecovery> for ProjectError {
             path: kept.path,
             source: kept.source,
         }
+    }
+}
+
+/// What the project answers for a call its store's journal refused: [`ProjectError::NoStroke`]
+/// for no journal open, [`ProjectError::Journal`] for a count refused.
+const fn journal_refused(refused: JournalRefused) -> ProjectError {
+    match refused {
+        JournalRefused::NotOpen => ProjectError::NoStroke,
+        JournalRefused::Count(count) => ProjectError::Journal(count),
     }
 }
 
@@ -1546,7 +1557,7 @@ impl Project {
         self.store.resume_op(op)
     }
 
-    /// The version of the layout of the rows the app journals ([`Project::journal`]): every
+    /// The version of the layout of the rows the app journals ([`Project::journal_placed`]): every
     /// stroke begun from now on takes it, every dab batch of the stroke carries it
     /// ([`crate::DabBatch::dab_format`]), and a restore reports it, so the app can refuse rows of
     /// a layout it doesn't read. The store never reads it. It is 0 until set, which means unset: a
@@ -1569,9 +1580,9 @@ impl Project {
     /// [`ProjectError::NoStroke`] if no stroke is open; [`ProjectError::Journal`] with
     /// [`JournalCountError::PastLastIndex`] if the stroke's dabs would run past the last index a
     /// `u32` counts. Nothing is kept then.
-    pub fn journal(&mut self, placed: &[[u8; DAB_BYTES]]) -> Result<(), ProjectError> {
+    pub fn journal_placed(&mut self, placed: &[[u8; DAB_BYTES]]) -> Result<(), ProjectError> {
         let op = self.stroke.ok_or(ProjectError::NoStroke)?;
-        Ok(self.store.journal(op, placed)?)
+        self.store.journal(op, placed).map_err(journal_refused)
     }
 
     /// How many of the open stroke's dabs have landed: the app passes it with each landing, the
@@ -1592,7 +1603,9 @@ impl Project {
     /// [`JournalCountError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
     pub fn journal_landed(&mut self, landed: u32) -> Result<(), ProjectError> {
         let op = self.stroke.ok_or(ProjectError::NoStroke)?;
-        Ok(self.store.journal_landed(op, landed)?)
+        self.store
+            .journal_landed(op, landed)
+            .map_err(journal_refused)
     }
 
     /// [`Project::end_stroke`] at `now`.
