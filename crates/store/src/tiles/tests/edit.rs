@@ -642,6 +642,9 @@ fn ops_reserved_in_order_are_ordered_after_the_current_op() {
     );
     assert!(ops[0] > current, "after the current op");
     assert_eq!(store.current_op(), Some(current), "which stays current");
+    for token in reserved {
+        store.drop_reserved_op(token);
+    }
 }
 
 /// A reserved op isn't current: edits go to the current op, and once it has ended they are
@@ -731,4 +734,93 @@ fn a_reserved_op_is_its_own_store_s_only() {
     let b_back = elsewhere.into_reserved();
     let b_op = store.begin_reserved_op(b_back).unwrap();
     assert_eq!(store.current_op(), Some(b_op));
+}
+
+/// Dropping a reserved op drops every op reserved after it, whose futures read its dabs; the ops
+/// before it stay. Their ops are given back, and their tokens are no longer reserved.
+#[test]
+fn dropping_a_reserved_op_drops_the_ops_reserved_after_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let a = store.begin_op().unwrap();
+    let b = store.reserve_op().unwrap();
+    let c = store.reserve_op().unwrap();
+    let d = store.reserve_op().unwrap();
+    let (c_op, d_op) = (c.op(), d.op());
+    assert_eq!(store.drop_reserved_op(c), vec![c_op, d_op], "C and D go");
+    assert!(
+        store.drop_reserved_op(d).is_empty(),
+        "D went with C: nothing more to drop"
+    );
+    store.end_op();
+    let b_op = store.begin_reserved_op(b).unwrap();
+    assert!(b_op > a, "B stayed, and begins");
+    store.end_op();
+    let next = store.begin_op().unwrap();
+    assert!(
+        next > d_op,
+        "nothing reserved is left; a new op is after them all"
+    );
+}
+
+/// Every op reserved goes at once on an error, a close or a takeover; their tokens are then
+/// given back to be let go.
+#[test]
+fn every_reserved_op_can_be_dropped_at_once() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    store.begin_op().unwrap();
+    let b = store.reserve_op().unwrap();
+    let c = store.reserve_op().unwrap();
+    assert_eq!(store.drop_every_reserved_op(), vec![b.op(), c.op()]);
+    assert!(store.drop_every_reserved_op().is_empty(), "none left");
+    let refused = store.begin_reserved_op(b).unwrap_err();
+    assert!(
+        matches!(refused.error(), CacheError::NotReserved(_)),
+        "{refused:?}"
+    );
+    let nothing: Vec<OpId> = Vec::new();
+    assert_eq!(store.drop_reserved_op(refused.into_reserved()), nothing);
+    assert_eq!(store.drop_reserved_op(c), nothing);
+    store.end_op();
+    store.begin_op().unwrap();
+}
+
+/// An op handed out since the store opened, begun and ended or reserved and dropped, refuses a
+/// resume though none is current: the resumed stroke's edits would come after newer ops'.
+#[test]
+fn no_op_resumes_once_one_was_handed_out() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut ended = new_store(&dir, "ended.bcp", &mesh, roomy());
+    let old = OpId::new(SITE, 0).unwrap();
+    let begun = ended.begin_op().unwrap();
+    ended.end_op();
+    let refused = ended.resume_op(old);
+    assert!(
+        matches!(refused, Err(CacheError::OpBegun(op)) if op == begun),
+        "{refused:?}"
+    );
+    let mut dropped = new_store(&dir, "dropped.bcp", &mesh, roomy());
+    let reserved = dropped.reserve_op().unwrap();
+    let op = reserved.op();
+    dropped.drop_reserved_op(reserved);
+    let behind = dropped.resume_op(old);
+    assert!(
+        matches!(behind, Err(CacheError::OpBegun(handed)) if handed == op),
+        "{behind:?}"
+    );
+}
+
+/// A reserved op let go without being begun or dropped is a bug, which a debug build reports.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "an op reserved and let go")]
+fn a_reserved_op_let_go_is_reported() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    drop(store.reserve_op().unwrap());
 }

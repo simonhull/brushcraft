@@ -30,8 +30,17 @@
 //! While an op's shapes are read, its set sits where the current stroke's is, and the current
 //! stroke's waits aside until the reading ends: so every read of this module (and the spatial
 //! index's [`SpatialIndex::raycast_pen_down`](crate::SpatialIndex::raycast_pen_down)) reads the
-//! op's, unchanged. A reading only reads: keeping a shape during one is a bug (a debug assertion
-//! says so), as it would go into the reserved op's set.
+//! op's, unchanged ([`TileStore::reading_op`] says whose). Readings nest, each giving back what
+//! it replaced as it ends, a panic unwinding through it included. While a reserved op's shapes
+//! are read, in a reading or one nested in it, the store only reads and takes that op's futures,
+//! which its reads find at once: an edit, a shape kept for the current stroke and an op begun
+//! are refused ([`Invariant::ReadingReserved`]), and an op ended or dropped, or the current
+//! stroke's shapes released, panics. Otherwise the reading would read, or put a shape into, a
+//! set other than the one it was asked for.
+//!
+//! A reading of a reserved op lists the tiles given futures since it last asked
+//! ([`TileStore::take_pen_down_added`]): the tiles to refit in the spatial index, so the op's
+//! raycasts find them.
 //!
 //! # The shape
 //!
@@ -90,7 +99,9 @@
 //! The reserved ops' sets are counted with the current stroke's, and bounded: the open strokes'
 //! pen-down data together may hold [`TileStore::open_strokes_share`], past which no op is
 //! reserved and no shape installed for one ([`CacheError::OpenStrokesFull`]); the caller waits
-//! for the strokes before to land, as before ops could be reserved.
+//! for the strokes before to land, as before ops could be reserved. The share is checked there
+//! only: a reading's caches (positions made, normals, previews' blocks, the brush's working set)
+//! grow with its reads, unchecked until the next reserve or install, so it is a soft bound.
 //! Lowering the limit unmaps nothing at once: the pools take no chunk while they hold more than
 //! it, and give chunks back as they next make room.
 //!
@@ -395,13 +406,16 @@ impl PenDown {
         }
     }
 
-    /// Lets go of the normals made of the shapes and of the previews' blocks, each gathered from
-    /// the shapes as they were: one more tile has a shape now, and those reading it are made
-    /// again from it at their next read.
-    fn forget_gathered(&mut self) {
-        self.normals.clear();
-        self.previews.clear();
-        self.preview_bytes = 0;
+    /// Lets go of the normals and the previews' blocks made of `tiles`' gathers, each from the
+    /// shapes as they were: a tile they read has a shape now, and they are made again from it at
+    /// their next read.
+    fn forget_gathered(&mut self, tiles: &[TileKey]) {
+        for tile in tiles {
+            self.normals.remove(tile);
+            if let Some(block) = self.previews.remove(tile) {
+                self.preview_bytes -= block_bytes(&block);
+            }
+        }
     }
 }
 
@@ -440,16 +454,14 @@ impl TileStore {
     /// # Errors
     ///
     /// As [`TileStore::evaluate_many`] and [`TileStore::evaluate`]; the shapes made before the
-    /// error are kept.
+    /// error are kept. [`CacheError::Internal`] with [`Invariant::ReadingReserved`] while a
+    /// reserved op's shapes are read ([`TileStore::read_pen_down_of`]): nothing is kept then.
     pub fn keep_pen_down(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
         debug_assert!(
             keys.iter().all(keeps_pen_down),
             "a pen-down shape of a tile a restore wouldn't read back"
         );
-        debug_assert!(
-            !self.reserved.is_reading(),
-            "a shape kept while a reserved op's are read would be that op's"
-        );
+        self.refuse_while_reading()?;
         let new: Vec<TileKey> = keys
             .iter()
             .filter(|key| !self.pen_down.shapes.contains_key(key))
@@ -499,6 +511,7 @@ impl TileStore {
         keys: &[TileKey],
         taken: impl IntoIterator<Item = TakenShape>,
     ) -> Result<(), CacheError> {
+        self.refuse_while_reading()?;
         let (store, edits) = (self.id(), self.edits());
         let fresh = taken
             .into_iter()
@@ -523,13 +536,16 @@ impl TileStore {
     ///
     /// [`CacheError::NotATile`] if `corrections` isn't of `key`'s side, or `key` isn't a tile a
     /// stroke keeps a shape of ([`keeps_pen_down`]); as
-    /// [`TileStore::evaluate`] for the tile's parents. Nothing is kept then.
+    /// [`TileStore::evaluate`] for the tile's parents; [`CacheError::Internal`] with
+    /// [`Invariant::ReadingReserved`] while a reserved op's shapes are read. Nothing is kept
+    /// then.
     pub(crate) fn install_pen_down(
         &mut self,
         key: TileKey,
         corrections: CorrectionTile,
         op: Option<OpId>,
     ) -> Result<(), CacheError> {
+        self.refuse_while_reading()?;
         check_installed(key, &corrections)?;
         if self.pen_down.shapes.contains_key(&key) {
             return Ok(());
@@ -1025,10 +1041,15 @@ impl TileStore {
     }
 
     /// Lets go of the current stroke's pen-down shapes, their bytes given back to the pools: the
-    /// stroke has ended. [`TileStore::begin_op`] and [`TileStore::end_op`] do it too. The shapes
+    /// stroke has ended. [`TileStore::begin_op`] does it too, and so does ending the op. The shapes
     /// of the ops reserved behind it stay.
+    ///
+    /// # Panics
+    ///
+    /// While a reserved op's shapes are read ([`TileStore::read_pen_down_of`]): the reading would
+    /// give back shapes that are gone.
     pub fn release_pen_down(&mut self) {
-        self.stop_reading_reserved();
+        self.assert_not_reading();
         if self.pen_down.held() + self.display_preview_bytes() == 0 {
             return;
         }

@@ -132,11 +132,12 @@ pub enum CacheError {
     #[error("the op ids of this site are used up")]
     OpsExhausted,
     /// A restored stroke's op can't be made current again
-    /// ([`Project::resume_stroke`](crate::Project::resume_stroke)), nor a reserved op begin
+    /// ([`Project::resume_stroke`](crate::Project::resume_stroke)): this one was handed out since
+    /// the store opened, begun, edited as or reserved, whether or not it has ended since. Or a
+    /// reserved op can't begin
     /// ([`TileStore::begin_reserved_op`](super::TileStore::begin_reserved_op)): this one is
-    /// current, begun or edited as since the store opened and not ended
-    /// ([`TileStore::end_op`](super::TileStore::end_op)).
-    #[error("op {0:?} is current: no other op can be made current")]
+    /// current, not ended.
+    #[error("op {0:?} was handed out: no other op can be made current")]
     OpBegun(crate::OpId),
     /// An op is reserved and not yet begun
     /// ([`TileStore::reserve_op`](super::TileStore::reserve_op)): this one, the oldest. No op may
@@ -224,6 +225,12 @@ pub enum Invariant {
     /// to make its positions from, where the store had just made sure of both.
     #[error("{0:?} has no pen-down shape to read")]
     NoPenDownShape(TileKey),
+    /// A write, or an op begun, was asked while this reserved op's pen-down shapes are read
+    /// ([`TileStore::read_pen_down_of`](super::TileStore::read_pen_down_of)): it would go to a
+    /// set of shapes other than the one asked for, or leave the reading reading one that is gone.
+    /// A bug of the caller's; nothing was done.
+    #[error("op {0:?}'s pen-down shapes are read: nothing is written or begun meanwhile")]
+    ReadingReserved(crate::OpId),
     /// A tile was named twice among the tasks of one round, which write one tile each.
     #[error("{0:?} is named twice in one round")]
     NamedTwice(TileKey),

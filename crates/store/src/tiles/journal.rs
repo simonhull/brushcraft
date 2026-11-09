@@ -800,6 +800,21 @@ impl TileStore {
         journal.written = written;
     }
 
+    /// Whether the open journal is `op`'s: its stroke hasn't ended.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only `TileStore::end_op` asks, which the project calls later"
+        )
+    )]
+    pub(super) fn journal_open_for(&self, op: OpId) -> bool {
+        self.journals
+            .open
+            .as_ref()
+            .is_some_and(|journal| journal.op == op)
+    }
+
     /// The op of the open stroke a roll-over carries into its fresh file, if one is open and the
     /// store's op is still its own (see [`TileStore::fill_roll_over`]).
     ///

@@ -179,6 +179,7 @@ impl TileStore {
             pen_down: super::pen_down::PenDown::default(),
             reserved: super::pen_down::Reserved::default(),
             pen_down_beyond: 0,
+            handed_out: None,
             strokes_waiting: Vec::new(),
             journals: super::journal::Journals::default(),
             floor: std::collections::BTreeMap::new(),

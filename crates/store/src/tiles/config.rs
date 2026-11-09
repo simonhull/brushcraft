@@ -397,10 +397,13 @@ pub(super) const MAX_BATCH: usize = 4096;
 ///
 /// One stroke's pen-down data has no cap (a stroke keeps every shape it needs, held beyond the
 /// budget where it must); the only bound on one stroke's is a restore's, which holds an open
-/// stroke's rows and shapes within the pools' share. Four of those is room for several strokes
-/// landing at once. Provisional: the share is to be measured on live and scripted strokes over
-/// strokes still landing, and set here from that.
-pub(super) const OPEN_STROKES_SHARE: usize = 4;
+/// stroke's rows and shapes within the pools' share. The open strokes together get one such
+/// share: so they may withhold the whole of the pools' share between them, the pools then at
+/// their minimum and the rest reported as beyond the budget
+/// ([`TileStore::pen_down_beyond_budget`](super::TileStore::pen_down_beyond_budget)), before
+/// the next stroke waits for those before it to land. Provisional: the share is to be measured
+/// on live and scripted strokes over strokes still landing, and set here from that.
+pub(super) const OPEN_STROKES_SHARE: usize = 1;
 
 /// The share of the budget's free evaluated slots a batch's targets take: one in this many.
 ///

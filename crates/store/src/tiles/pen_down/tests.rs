@@ -11,6 +11,7 @@ use crate::fixture::{TOP, level, mesh, meta_for, roomy};
 use crate::index::SpatialIndex;
 use crate::pool::Budget;
 use crate::test_dir::TestDir;
+use crate::tiles::ReservedOp;
 use crate::{ProjectFile, Ray};
 
 /// A store over `mesh` in `dir`, with roomy pools.
@@ -753,6 +754,7 @@ fn two_ops_keep_their_shapes_side_by_side_each_read_back_bit_for_bit() {
         bits(store.pen_down_normals(key).expect("normals")),
         bits(&normals_at_pen_down)
     );
+    store.drop_reserved_op(b);
 }
 
 #[test]
@@ -783,6 +785,8 @@ fn a_tile_a_reserved_op_has_no_shape_of_reads_as_stored() {
         bits(&stored),
         "read as the store has it now, not at the current op's pen-down"
     );
+    drop(reading);
+    store.drop_reserved_op(b);
 }
 
 #[test]
@@ -854,8 +858,8 @@ fn open_strokes_past_their_share_are_refused_until_one_ends() {
     let plain = store_over(&fresh, &mesh);
     assert_eq!(
         plain.open_strokes_share(),
-        4 * plain.pools_budget(),
-        "four times what a restore may hold of one stroke, for now"
+        crate::tiles::config::OPEN_STROKES_SHARE * plain.pools_budget(),
+        "what a restore may hold of one stroke, so many times"
     );
     drop(plain);
     let dir = TestDir::new();
@@ -943,4 +947,191 @@ fn a_reserved_op_s_raycast_hits_its_future_where_the_index_keeps_its_box() {
             "ray {k}: where the surface will be"
         );
     }
+    store.drop_reserved_op(b);
+}
+
+/// A store whose current op pushed out around a seam, a second store pushed further, and an op
+/// reserved on the first with the futures of the tiles pushed: the setting of the reading tests.
+fn reserved_with_futures(dir: &TestDir) -> (TileStore, TileStore, ReservedOp, Vec<TileKey>) {
+    let mesh = mesh();
+    let centre = (126, 100);
+    let reached = tiles_pushed(centre, 3);
+    let (mut store, mut ahead) = landed_and_future(dir, &mesh, (centre, 3), (0.05, 0.2));
+    let b = store.reserve_op().expect("reserved");
+    let a = store.current_op();
+    for &tile in &reached {
+        let future = ahead.correction(tile).expect("corrections").to_tile();
+        store
+            .install_pen_down_of(&b, tile, future, a)
+            .expect("installed");
+    }
+    (store, ahead, b, reached)
+}
+
+#[test]
+fn a_panic_through_a_reading_gives_the_current_op_s_shapes_back() {
+    let dir = TestDir::new();
+    let (mut store, _, b, reached) = reserved_with_futures(&dir);
+    let key = reached[0];
+    let own = store.pen_down_positions(key).expect("reads").to_vec();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let reading = store.read_pen_down_of(&b).expect("reserved here");
+        assert_eq!(reading.reading_op(), Some(b.op()));
+        panic!("a brush fails while it reads");
+    }));
+    assert!(unwound.is_err(), "it panicked");
+    assert_eq!(store.reading_op(), None, "the reading ended");
+    assert_eq!(
+        bits(store.pen_down_positions(key).expect("reads")),
+        bits(&own),
+        "the current op's shapes are read again"
+    );
+    store.drop_reserved_op(b);
+}
+
+#[test]
+fn readings_nest_each_giving_back_what_it_replaced() {
+    let dir = TestDir::new();
+    let (mut store, mut ahead, b, reached) = reserved_with_futures(&dir);
+    let key = reached[0];
+    let own = store.pen_down_positions(key).expect("reads").to_vec();
+    let future = ahead.evaluate(key).expect("evaluates").to_vec();
+    let c = store.reserve_op().expect("reserved");
+    {
+        let mut of_b = store.read_pen_down_of(&b).expect("reserved here");
+        {
+            let mut current = of_b.read_pen_down();
+            assert_eq!(current.reading_op(), None);
+            assert_eq!(
+                bits(current.pen_down_positions(key).expect("reads")),
+                bits(&own),
+                "the current op's, inside B's reading"
+            );
+        }
+        {
+            let of_c = of_b.read_pen_down_of(&c).expect("reserved here");
+            assert_eq!(of_c.reading_op(), Some(c.op()));
+            assert!(of_c.pen_down_shape(&key).is_none(), "C has no shapes");
+        }
+        {
+            let again = of_b.read_pen_down_of(&b).expect("reserved here");
+            assert_eq!(again.reading_op(), Some(b.op()), "the same reading");
+        }
+        assert_eq!(of_b.reading_op(), Some(b.op()), "B's again");
+        assert_eq!(
+            bits(of_b.pen_down_positions(key).expect("reads")),
+            bits(&future)
+        );
+    }
+    assert_eq!(store.reading_op(), None);
+    assert_eq!(
+        bits(store.pen_down_positions(key).expect("reads")),
+        bits(&own)
+    );
+    store.drop_reserved_op(b);
+    store.drop_reserved_op(c);
+}
+
+#[test]
+fn a_future_installed_through_a_reading_of_its_op_is_read_at_once() {
+    let dir = TestDir::new();
+    let (mut store, mut ahead, b, _) = reserved_with_futures(&dir);
+    let far = tile_at(10, 200).0;
+    let corrections = ahead.correction(far).expect("corrections").to_tile();
+    let a = store.current_op();
+    {
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        let added = reading.take_pen_down_added();
+        reading
+            .install_pen_down_of(&b, far, corrections, a)
+            .expect("installed");
+        assert_eq!(reading.reading_op(), Some(b.op()), "still B's reading");
+        assert!(reading.pen_down_shape(&far).is_some(), "read at once");
+        assert_eq!(
+            reading.take_pen_down_added(),
+            vec![far],
+            "the tile to refit, after those before ({})",
+            added.len()
+        );
+    }
+    assert!(store.pen_down_shape(&far).is_none(), "not the current op's");
+    store.drop_reserved_op(b);
+}
+
+#[test]
+fn a_write_through_a_reading_of_a_reserved_op_is_refused() {
+    let dir = TestDir::new();
+    let (mut store, mut ahead, b, reached) = reserved_with_futures(&dir);
+    let far = tile_at(10, 200).0;
+    let corrections = ahead.correction(far).expect("corrections").to_tile();
+    let refused = |got: &Result<(), CacheError>| {
+        matches!(
+            got,
+            Err(CacheError::Internal(Invariant::ReadingReserved(op))) if *op == b.op()
+        )
+    };
+    {
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        let kept = reading.keep_pen_down(&[far]);
+        assert!(refused(&kept), "keep_pen_down: {kept:?}");
+        let taken = reading.keep_pen_down_taken(&[far], []);
+        assert!(refused(&taken), "keep_pen_down_taken: {taken:?}");
+        let installed = reading.install_pen_down(far, corrections, None);
+        assert!(refused(&installed), "install_pen_down: {installed:?}");
+        let edit = reading.set_correction(far.face(), far.level(), 3, 3, Vec3::ZERO);
+        assert!(refused(&edit), "an edit: {edit:?}");
+        let begun = reading.begin_op().map(drop);
+        assert!(refused(&begun), "begin_op: {begun:?}");
+        assert_eq!(reading.pen_down_tiles(), reached.len(), "B's untouched");
+    }
+    assert_eq!(store.pen_down_tiles(), reached.len(), "A's untouched");
+    store.drop_reserved_op(b);
+}
+
+#[test]
+#[should_panic(expected = "a reserved op's pen-down shapes are read")]
+fn releasing_the_current_op_s_shapes_through_a_reading_is_refused() {
+    let dir = TestDir::new();
+    let (mut store, _, b, _) = reserved_with_futures(&dir);
+    let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+    reading.release_pen_down();
+}
+
+#[test]
+fn installing_a_future_remakes_only_the_normals_that_read_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let centre = (126, 100);
+    let (left, right) = (tile_at(120, 100).0, tile_at(130, 100).0);
+    let far = tile_at(10, 200).0;
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, 3), (0.05, 0.2));
+    let b = store.reserve_op().expect("reserved");
+    let a = store.current_op();
+    let mut future = |tile: TileKey| ahead.correction(tile).expect("corrections").to_tile();
+    for tile in [left, far] {
+        store
+            .install_pen_down_of(&b, tile, future(tile), a)
+            .expect("installed");
+    }
+    {
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        reading.pen_down_normals(left).expect("normals");
+        reading.pen_down_normals(far).expect("normals");
+        assert!(reading.pen_down.normals.contains_key(&left));
+        assert!(reading.pen_down.normals.contains_key(&far));
+    }
+    store
+        .install_pen_down_of(&b, right, future(right), a)
+        .expect("installed");
+    let reading = store.read_pen_down_of(&b).expect("reserved here");
+    assert!(
+        !reading.pen_down.normals.contains_key(&left),
+        "the left tile's normals read the right one: made again"
+    );
+    assert!(
+        reading.pen_down.normals.contains_key(&far),
+        "the far tile's don't: kept"
+    );
+    drop(reading);
+    store.drop_reserved_op(b);
 }

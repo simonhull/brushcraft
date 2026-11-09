@@ -475,6 +475,10 @@ pub struct TileStore {
     /// The bytes of the open strokes' pen-down data the pools' minimum leaves no room for in the
     /// budget ([`TileStore::pen_down_beyond_budget`]).
     pen_down_beyond: usize,
+    /// The last op handed out since the store opened (begun, edited as, reserved or resumed),
+    /// whether it has ended or been let go since: a restored stroke resumes only while there is
+    /// none ([`TileStore::op_handed_out`]).
+    handed_out: Option<OpId>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in

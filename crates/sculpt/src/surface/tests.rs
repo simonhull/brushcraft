@@ -918,6 +918,7 @@ fn a_reserved_op_s_surface_reads_its_futures_and_the_store_elsewhere() {
         before,
         "and the current op's again after"
     );
+    project.store().drop_reserved_op(b);
 }
 
 mod hard_stroke;

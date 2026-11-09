@@ -343,6 +343,40 @@ fn a_stroke_resumes_only_where_it_was_found_and_before_another_op() {
     second.close(false).unwrap();
 }
 
+/// An op handed out since the restore refuses the stroke found, though none is current again:
+/// one begun and ended, or one reserved and let go.
+#[test]
+fn a_stroke_resumes_before_any_op_is_handed_out_even_one_ended_or_dropped() {
+    let mut map = CorrectionMap::new();
+    let ended = TestDir::new();
+    crash_landing(new_project(&ended), &mut map, 49);
+    let mut restored = restore(&ended);
+    let found = restored.take_open_stroke().unwrap().unwrap();
+    let op = found.op();
+    restored.store().begin_op().unwrap();
+    restored.store().end_op();
+    assert_eq!(restored.store().current_op(), None, "no op is current");
+    let not = restored.resume_stroke(found).unwrap_err();
+    assert!(
+        matches!(not.error(), ProjectError::NotResumable(named) if *named == op),
+        "an op began and ended since the restore: {not:?}"
+    );
+    restored.close(true).unwrap();
+
+    let dropped = TestDir::new();
+    crash_landing(new_project(&dropped), &mut map, 49);
+    let mut again = restore(&dropped);
+    let lost = again.take_open_stroke().unwrap().unwrap();
+    let reserved = again.store().reserve_op().unwrap();
+    again.store().drop_reserved_op(reserved);
+    let behind = again.resume_stroke(lost).unwrap_err();
+    assert!(
+        matches!(behind.error(), ProjectError::NotResumable(_)),
+        "an op was reserved since the restore: {behind:?}"
+    );
+    again.close(true).unwrap();
+}
+
 /// Crashes a project with stroke `stroke` of 20 dabs begun with `seed`, as `act` leaves it, with
 /// `map` the dabs landed, then asserts a restore finds no stroke to land, and its tiles.
 fn assert_no_open_stroke(

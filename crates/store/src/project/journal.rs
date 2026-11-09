@@ -139,13 +139,14 @@ impl Project {
     /// # Errors
     ///
     /// [`NotResumed`], with `stroke` given back and the project as it was, for
-    /// [`ProjectError::NotResumable`] if another op began since the restore (or an edit was
-    /// made), the project has moved onto another recovery file (a save or a roll-over), or
-    /// `stroke` isn't this project's; or for [`ProjectError::Cache`] if a shape can't be installed
-    /// (evaluating a tile's parents fails), which a call made again may get past.
+    /// [`ProjectError::NotResumable`] if another op was handed out since the restore (begun,
+    /// edited as or reserved, even one ended or let go since), the project has moved onto another
+    /// recovery file (a save or a roll-over), or `stroke` isn't this project's; or for
+    /// [`ProjectError::Cache`] if a shape can't be installed (evaluating a tile's parents
+    /// fails), which a call made again may get past.
     pub fn resume_stroke(&mut self, stroke: OpenStroke) -> Result<(), NotResumed> {
         let op = stroke.op();
-        if !stroke.found_in(&self.store) || self.store.current_op().is_some() {
+        if !stroke.found_in(&self.store) || self.store.op_handed_out().is_some() {
             return Err(NotResumed::new(stroke, ProjectError::NotResumable(op)));
         }
         // The test hook's shape, found by its index before the loop, so the loop carries no index.
