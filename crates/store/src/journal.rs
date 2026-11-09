@@ -411,6 +411,53 @@ impl BatchHead {
     }
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// [`DabBatch::decode_head`] never panics or overflows, whatever the payload's bytes and
+    /// length up to the fixed fields and two more, and what it accepts passes every check
+    /// [`DabBatch::decode`] makes of the fixed fields: a payload shorter than them is refused,
+    /// and an accepted head's version is this build's, its reserved bytes clear, its count within
+    /// [`MAX_JOURNAL_DABS`], its dabs' indices within a `u32`, and its landed count within them,
+    /// so [`DabBatch::new`] takes the head as is.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn decode_head_is_in_range_and_refuses_what_decode_refuses() {
+        let bytes: [u8; FIXED + 2] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let Some(payload) = bytes.get(..len) else {
+            return;
+        };
+        let decoded = DabBatch::decode_head(payload);
+        if len < FIXED {
+            assert_eq!(
+                decoded,
+                Err(JournalError::Short),
+                "short of the fixed fields"
+            );
+            return;
+        }
+        let Ok(head) = decoded else {
+            return;
+        };
+        let count = usize::try_from(head.count).unwrap_or(usize::MAX);
+        assert!(count <= MAX_JOURNAL_DABS, "the count within the limit");
+        let placed = head.first.checked_add(head.count);
+        assert!(placed.is_some(), "the indices within a u32");
+        assert!(
+            placed.is_some_and(|placed| head.landed <= placed),
+            "landed within the dabs"
+        );
+        assert_eq!(
+            payload.get(..4),
+            Some([VERSION, 0, 0, 0].as_slice()),
+            "this build's version, the reserved bytes clear"
+        );
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
