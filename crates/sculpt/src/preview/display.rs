@@ -328,7 +328,8 @@ impl Term {
 /// strength) / 32767` (grown by doubling to hold its largest value), the tangential planes,
 /// at least 8 times the normal one's and doubled up to it, less than 16 times; a vertex is within
 /// the three final steps' length.
-pub(super) fn rounding_bound(scales: [f32; 3], strength: f64) -> f64 {
+#[must_use]
+pub fn rounding_bound(scales: [f32; 3], strength: f64) -> f64 {
     const STEPS: f64 = 32_767.0;
     let grown = |scale: f32| {
         let scale = f64::from(scale);

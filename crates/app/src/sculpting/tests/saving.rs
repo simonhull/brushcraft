@@ -1250,3 +1250,96 @@ fn a_stroke_begun_over_the_landing_keeps_the_window_until_it_is_saved() {
     assert_eq!(records_on_disk(&dir), 2, "both strokes");
     assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
 }
+
+/// [`slow_owner`] whose strokes never begin over one still landing: each waits for it, as past
+/// the open strokes' share ([`Begin::Waits`]).
+fn waiting_owner(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
+    let mut owner = slow_owner(dir);
+    owner.brush_mut().knob = Knob::WaitsOverLanding;
+    owner
+}
+
+/// A stroke waiting for the one before it when Ctrl+S comes was drawn before it: it's in the save.
+#[test]
+fn a_stroke_waiting_behind_another_at_ctrl_s_is_in_the_save() {
+    let dir = TestDir::new();
+    let mut owner = waiting_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    assert_eq!(
+        owner.brush().deferred_in_save().count(),
+        owner.brush().deferred.len(),
+        "all of it in the save"
+    );
+    owner.request_save(Instant::now());
+    finish_save(&mut owner);
+    assert!(!owner.project().has_unsaved_edits());
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 2, "both strokes");
+}
+
+/// A stroke waiting behind the landing is pen samples, not journalled dabs, so no journal holds it:
+/// Save waits in the window until both strokes are saved, and never lets the window go first.
+#[test]
+fn a_stroke_waiting_behind_the_landing_keeps_the_window_until_it_is_saved() {
+    let dir = TestDir::new();
+    let mut owner = waiting_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
+    run(&mut owner, 1);
+    assert!(
+        !owner.brush().deferred.is_empty(),
+        "the second waits, whole"
+    );
+    assert!(owner.brush().unplaced_for_save() > 0, "unplaced samples");
+    let now = Instant::now();
+    assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, now), "Save");
+    let began = Instant::now();
+    let mut asked = None;
+    while asked.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        run(&mut owner, 1);
+        asked = owner.take_request();
+        assert!(began.elapsed() < Duration::from_secs(60), "it ends");
+    }
+    assert_eq!(asked, Some(WindowRequest::Exit), "saved in the window");
+    assert_eq!(owner.landing(), 0, "both landed first");
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 2, "both strokes");
+    assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
+}
+
+/// A stroke half landed, the pen still on it, a second waiting behind it and a sample held over,
+/// abandoned: nothing is held, and nothing lands.
+#[test]
+fn abandoning_forgets_a_waiting_stroke_and_what_is_held() {
+    let dir = TestDir::new();
+    let mut owner = waiting_owner(&dir);
+    run(&mut owner, 10_000);
+    let mut open = stroke(ACROSS, 12);
+    open.pop();
+    queue(&mut owner, open);
+    run(&mut owner, 1);
+    let second = stroke(((150.0, 80.0), (170.0, 120.0)), 6);
+    queue(&mut owner, second.clone());
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    owner.brush_mut().held.push(second.first().copied());
+    let before = positions(owner.project());
+    owner.brush_mut().abandon();
+    assert_eq!(owner.landing(), 0, "nothing is held");
+    assert!(!owner.brush().stroking(), "no stroke is open");
+    owner.expose();
+    run(&mut owner, 10_000);
+    assert_eq!(positions(owner.project()), before, "no tile changed");
+    owner.discard().expect("discarded");
+}

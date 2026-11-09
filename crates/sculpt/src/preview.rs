@@ -93,6 +93,7 @@ mod dabs;
 mod display;
 
 use dabs::DabIndex;
+pub use display::rounding_bound;
 use display::{DisplayState, StrokeDabs};
 
 /// The most previews [`Preview::make_waiting`] makes a call: what a renderer asks for at once can
@@ -462,7 +463,7 @@ impl Preview {
         for tile in display::finest_under(key, finest) {
             if let Some(&strength) = self.strengths.get(&tile) {
                 let scales = store.correction(tile)?.scales();
-                most = most.max(display::rounding_bound(scales, strength));
+                most = most.max(rounding_bound(scales, strength));
             }
         }
         Ok(most)

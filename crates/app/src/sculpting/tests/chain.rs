@@ -73,6 +73,24 @@ impl Chain {
         self.brush.step(context, &pen, &budget).expect("a step")
     }
 
+    /// A step that lands one dab of the oldest stroke, however dear: every pen quiet for long and
+    /// the catch-up starved, so a step that must make progress takes one.
+    fn land_one(&mut self) -> BrushReport {
+        let long_ago = Instant::now()
+            .checked_sub(RESTING_QUIET * 2)
+            .expect("after the epoch");
+        self.brush.landed_at = long_ago;
+        self.brush.unframed = false;
+        for stroke in &mut self.brush.strokes {
+            stroke.placed_at = long_ago;
+            stroke.last.received = long_ago;
+        }
+        let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush
+            .step(context, &PenFrame::default(), &BrushBudget::unlimited())
+            .expect("a step")
+    }
+
     /// Lands every dab the brush holds, every stroke after another, as a flush does.
     fn land_all(&mut self) {
         let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
@@ -209,17 +227,18 @@ const MOST_OPEN: usize = 256;
 
 #[test]
 fn past_the_open_strokes_share_the_next_down_waits_as_before() {
-    // A budget of small pools, which the pen-down data of a few dozen strokes fill: each
-    // stroke's futures are the tiles under it.
-    let tight = |budget: usize| {
+    // Small pools, in which one stroke's dabs land, and which the pen-down data of a few dozen
+    // strokes fill: each stroke's futures are the tiles under it.
+    let config = |budget: usize| {
         StoreConfig::new(budget, 1)
             .with_chunk_bytes(64 << 10)
             .with_kept_predictions(0)
             .with_stroke_tiles(8)
             .with_display(Level::new(LEVEL).expect("a level"))
     };
-    let minimum = tight(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
-    let mut run = Chain::new(Instant::now(), Some(tight(minimum + (1 << 20))));
+    let minimum = config(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
+    // 8 MiB over the least: a dab over the whole sphere pins its 24 tiles, about 8 MB.
+    let mut run = Chain::new(Instant::now(), Some(config(minimum + (8 << 20))));
     run.brush.set_radius(40.0);
     let strokes = [stroke(ACROSS, 6), crossing(), over_both()];
     let mut began = 0;
@@ -244,12 +263,8 @@ fn past_the_open_strokes_share_the_next_down_waits_as_before() {
         "the open strokes hold about their share: {held} of {share}"
     );
     assert_eq!(run.brush.error(), None);
-    // The pools at their least, these strokes' dabs pin more than they hold: they aren't landed
-    // here, but let go with the project.
-    run.brush.abandon();
-    let Chain { dir, project, .. } = run;
-    project.close(false).expect("closed");
-    drop(dir);
+    run.land_all();
+    run.close();
 }
 
 /// The batches of the stroke made as `op` in the recovery file at `path`, in the order written.
@@ -293,4 +308,94 @@ fn a_later_strokes_batches_name_the_stroke_before_then_its_own_cut() {
         "then at its own cut: {pen_downs:?}"
     );
     drop(dir);
+}
+
+/// The dabs `strokes` place, and the tiles once all have landed, drawn as `draw` draws them on a
+/// [`Chain`] of sample times counted from `epoch`, which ends with every stroke under way.
+fn drawn(epoch: Instant, draw: impl FnOnce(&mut Chain)) -> Drawn {
+    let mut run = Chain::new(epoch, None);
+    draw(&mut run);
+    let rows = run.rows();
+    run.land_all();
+    (rows, run.close())
+}
+
+/// [`stroke()`] along [`ACROSS`] and [`crossing`] drawn one after the other, each once the one
+/// before has landed: the oracle.
+fn waited(epoch: Instant) -> Drawn {
+    let mut run = Chain::new(epoch, None);
+    let mut rows = Vec::new();
+    for samples in [stroke(ACROSS, 12), crossing()] {
+        run.frame(&samples);
+        rows.extend(run.rows());
+        run.land_all();
+    }
+    (rows, run.close())
+}
+
+#[test]
+fn a_stroke_over_one_landing_between_its_frames_places_the_dabs_of_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        run.cut();
+        for _ in 0..3 {
+            assert_eq!(run.land_one().dabs_applied, 1, "the first lands a dab");
+        }
+        let (early, late) = second.split_at(4);
+        run.frame(early);
+        for _ in 0..3 {
+            assert_eq!(run.land_one().dabs_applied, 1, "more of the first lands");
+        }
+        run.frame(late);
+        assert_eq!(run.ops().len(), 2, "both under way");
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+#[test]
+fn a_stroke_whose_futures_cant_be_had_waits_its_samples_and_places_them_as_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let (early, late) = second.split_at(3);
+        run.frame(early);
+        run.brush.knob = Knob::FuturesFail;
+        run.frame(late);
+        assert_eq!(
+            run.brush.deferred.len(),
+            late.len(),
+            "the rest of its samples wait, whole"
+        );
+        assert!(run.brush.error().is_none(), "nothing dropped");
+        // The first lands in frames; the second's op begins, and its samples are placed on its
+        // own pen-down surface.
+        run.cut();
+        let mut steps = 0;
+        while run.ops().len() > 1 {
+            run.land_one();
+            steps += 1;
+            assert!(steps < 10_000, "the first lands");
+        }
+        assert!(
+            run.brush.deferred.is_empty(),
+            "its samples placed as its op began"
+        );
+        run.brush.knob = Knob::None;
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
 }

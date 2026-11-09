@@ -53,6 +53,6 @@ pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
 pub use footprint::radius_covering;
 pub use future::{FutureError, Futures, PenDownTiles, StrokeEdits};
-pub use preview::{Drawn, DrawsAll, Preview, PreviewStats, WAITING_A_CALL};
+pub use preview::{Drawn, DrawsAll, Preview, PreviewStats, WAITING_A_CALL, rounding_bound};
 pub use state::Stroke;
 pub use surface::StoreSurface;
