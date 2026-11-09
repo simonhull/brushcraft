@@ -35,7 +35,7 @@ pub(crate) use self::blocks::TileBlocks;
 use self::blocks::{BlockCache, SharedBlocks, WideRay, Written};
 pub use crate::tile_bounds::{Aabb, NormalCone, TileBounds};
 pub use crate::tiles::WaveBounds;
-use crate::tiles::{CacheError, Evaluation, PenDownShape, TileStore};
+use crate::tiles::{CacheError, Evaluation, TileStore};
 
 /// Tiles [`SpatialIndex::build`] evaluates together before it reads their bounds.
 ///
@@ -234,7 +234,9 @@ impl SpatialIndex {
     /// While a stroke keeps a tile's pen-down shape ([`TileStore::pen_down_shape`]), the tree's
     /// box of the tile holds the shape too, so the stroke's raycasts and queries of its pen-down
     /// surface find the tile there however far its dabs moved it; the store records the tile's
-    /// own bounds. The box shrinks back at the tile's first refit after the stroke.
+    /// own bounds. The box shrinks back at the tile's first refit after the stroke. So too for
+    /// the shapes of the ops reserved behind the stroke ([`TileStore::install_pen_down_of`]):
+    /// refit a tile once one is given its future, so that op's raycasts find it there.
     ///
     /// # Errors
     ///
@@ -605,11 +607,12 @@ fn intersect_tile(ray: &Ray, positions: &[Vec3], side: u32) -> Option<f32> {
 /// The nearest triangle `ray` crosses of a grid of `side` vertices a side with `positions`,
 /// row-major, the hit named for tile `key` (see [`TriangleHit`]); `None` if it misses every one.
 ///
-/// Tile `key`'s `bounds` as the tree keeps them: grown to hold its pen-down shape too while the
-/// current stroke keeps one ([`TileStore::pen_down_shape`]), so a raycast or query of the pen-down
-/// surface finds the tile there. The store records `bounds` as they are.
+/// Tile `key`'s `bounds` as the tree keeps them: grown to hold its pen-down shapes too while an
+/// open stroke keeps one (the current stroke's, [`TileStore::pen_down_shape`], and those of the
+/// ops reserved behind it, [`TileStore::install_pen_down_of`]), so a raycast or query of each
+/// op's pen-down surface finds the tile there. The store records `bounds` as they are.
 fn over_pen_down(store: &TileStore, key: &TileKey, bounds: TileBounds) -> TileBounds {
-    let shape = store.pen_down_shape(key).and_then(PenDownShape::bounds);
+    let shape = store.open_pen_down_bounds(key);
     match shape {
         Some(shape) => TileBounds {
             aabb: bounds.aabb.union(shape),

@@ -14,6 +14,12 @@
 //! ([`crate::Preview`]): what it places is the same however fast the finest work goes. With no
 //! stroke under way, it is the store's surface.
 //!
+//! A stroke begun while the one before still lands has its op reserved
+//! ([`TileStore::reserve_op`]), and its surface ([`StoreSurface::of_reserved`]) reads that op's
+//! pen-down shapes instead: the futures of the tiles the strokes before it still change, every
+//! other tile as the store has it now ([`TileStore::read_pen_down_of`]). So it reads the surface
+//! those strokes will leave, through every method below unchanged.
+//!
 //! # Raycasts
 //!
 //! [`Surface::raycast`] is picking's raycast over the pen-down surface,
@@ -109,7 +115,9 @@ use std::collections::BTreeSet;
 
 use brush::{Imprint, Smoothstep, draw_imprint_vertex};
 use geom::{Channel, LayerId, Region, TileKey, Topology, Vec3};
-use store::{CacheError, Evaluation, SpatialIndex, TileStore, TriangleHit};
+use store::{
+    CacheError, Evaluation, PenDownReading, ReservedOp, SpatialIndex, TileStore, TriangleHit,
+};
 use stroke::{DVec3, Hit, Ray, Surface};
 
 use self::region::{Ball, Source, Vertex, Walked, distance_squared, walk};
@@ -126,8 +134,9 @@ mod region;
 /// applying the dabs.
 #[derive(Debug)]
 pub struct StoreSurface<'a> {
-    /// The store the tiles are read through.
-    store: &'a mut TileStore,
+    /// The store the tiles are read through, its pen-down reads going to the stroke's op's
+    /// shapes.
+    store: PenDownReading<'a>,
     /// The index raycasts walk.
     index: &'a SpatialIndex,
     /// The first error a method hit, kept for the owner.
@@ -135,14 +144,36 @@ pub struct StoreSurface<'a> {
 }
 
 impl<'a> StoreSurface<'a> {
-    /// The surface of `store` at `index`'s level.
+    /// The surface of `store` at `index`'s level, at the current stroke's pen-down surface.
     #[must_use]
     pub fn new(store: &'a mut TileStore, index: &'a SpatialIndex) -> Self {
         Self {
-            store,
+            store: store.read_pen_down(),
             index,
             error: None,
         }
+    }
+
+    /// The surface of `store` at `index`'s level for the stroke `reserved` was reserved for, at
+    /// its pen-down surface: its futures installed in the store
+    /// ([`TileStore::install_pen_down_of`]), every other tile as the store has it now. Its
+    /// futures' tiles are to be refitted in `index` first ([`SpatialIndex::refit`]), so raycasts
+    /// find them where they will be.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] with [`CacheError::NotReserved`] if `reserved` isn't reserved on
+    /// `store`.
+    pub fn of_reserved(
+        store: &'a mut TileStore,
+        index: &'a SpatialIndex,
+        reserved: &ReservedOp,
+    ) -> Result<Self, SculptError> {
+        Ok(Self {
+            store: store.read_pen_down_of(reserved)?,
+            index,
+            error: None,
+        })
     }
 
     /// The error a method hit, if one did: since then every method has answered `None` or
@@ -274,7 +305,7 @@ impl<'a> StoreSurface<'a> {
         let Some(narrow) = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()) else {
             return Ok(None);
         };
-        let Some(triangle) = self.index.raycast_pen_down(self.store, &narrow)? else {
+        let Some(triangle) = self.index.raycast_pen_down(&mut self.store, &narrow)? else {
             return Ok(None);
         };
         self.hit_on_triangle(ray, triangle).map(Some)
@@ -356,7 +387,7 @@ impl<'a> StoreSurface<'a> {
         };
         walk(
             &mut Reader {
-                store: self.store,
+                store: &mut self.store,
                 index: self.index,
             },
             start,

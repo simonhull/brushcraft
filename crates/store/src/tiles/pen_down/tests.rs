@@ -649,3 +649,298 @@ fn positions_made_on_workers_are_kept_as_the_brush_s_and_go_with_its_tiles() {
     assert_eq!(store.pen_down.brush.len(), rest.len());
     drop(pins);
 }
+
+/// A second store over `mesh` in `dir`, in file `name`, with roomy pools: where the tests make a
+/// tile's future, the corrections an earlier stroke will leave.
+fn other_store(dir: &TestDir, mesh: &Arc<BaseMesh>, name: &str) -> TileStore {
+    let file =
+        ProjectFile::create(&dir.path(name), meta_for(mesh), Arc::clone(mesh)).expect("a file");
+    TileStore::open(file, roomy()).expect("a store")
+}
+
+/// The store [`store_over`] makes and a second one, each pushed out around `centre`.
+///
+/// Both are pushed within `reach`: by `landed` the first, as its current op's stroke, which keeps
+/// the pen-down shapes of the tiles it pushes; by `future` the second, whose tiles the tests give
+/// a reserved op as its futures.
+fn landed_and_future(
+    dir: &TestDir,
+    mesh: &Arc<BaseMesh>,
+    (centre, reach): ((u32, u32), u32),
+    (landed, future): (f32, f32),
+) -> (TileStore, TileStore) {
+    let mut store = store_over(dir, mesh);
+    let mut ahead = other_store(dir, mesh, "future.bcp");
+    store.begin_op().expect("an op");
+    store
+        .keep_pen_down(&tiles_pushed(centre, reach))
+        .expect("kept");
+    push_out(&mut store, centre, reach, landed);
+    ahead.begin_op().expect("an op");
+    push_out(&mut ahead, centre, reach, future);
+    (store, ahead)
+}
+
+#[test]
+fn two_ops_keep_their_shapes_side_by_side_each_read_back_bit_for_bit() {
+    let mesh = mesh();
+    let centre = (126, 100);
+    let reached = tiles_pushed(centre, 3);
+    let (key, _, _) = tile_at(centre.0, centre.1);
+    let untouched = TestDir::new();
+    let mut before = store_over(&untouched, &mesh);
+    let at_pen_down = before.evaluate(key).expect("evaluates").to_vec();
+    let normals_at_pen_down = before.normals(key).expect("normals").to_vec();
+    let dir = TestDir::new();
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, 3), (0.05, 0.2));
+    let a = store.current_op().expect("an op");
+    let b = store.reserve_op().expect("reserved");
+    assert!(b.op() > a, "a reserved op comes after the current one");
+    assert_eq!(store.current_op(), Some(a), "and isn't current");
+    // The tile's own future first, its normals read and kept made of it: they read its
+    // neighbours as stored, until their futures come.
+    let own = ahead.correction(key).expect("corrections").to_tile();
+    store
+        .install_pen_down_of(&b, key, own, Some(a))
+        .expect("installed");
+    drop(
+        store
+            .read_pen_down_of(&b)
+            .expect("reserved here")
+            .pen_down_normals(key)
+            .expect("normals")
+            .to_vec(),
+    );
+    for &tile in &reached {
+        let future = ahead.correction(tile).expect("corrections").to_tile();
+        store
+            .install_pen_down_of(&b, tile, future, Some(a))
+            .expect("installed");
+    }
+    let future = ahead.evaluate(key).expect("evaluates").to_vec();
+    let future_normals = ahead.normals(key).expect("normals").to_vec();
+
+    assert_eq!(
+        store.pen_down_tiles(),
+        reached.len(),
+        "the current op's own"
+    );
+    assert_eq!(
+        bits(store.pen_down_positions(key).expect("reads")),
+        bits(&at_pen_down),
+        "the current op reads its own pen-down shape"
+    );
+    {
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        assert_eq!(reading.pen_down_tiles(), reached.len(), "the reserved op's");
+        assert_eq!(
+            bits(reading.pen_down_positions(key).expect("reads")),
+            bits(&future),
+            "the reserved op reads its future"
+        );
+        assert_eq!(
+            bits(reading.pen_down_normals(key).expect("normals")),
+            bits(&future_normals),
+            "and its normals, every tile they read at its future"
+        );
+    }
+    assert_eq!(
+        bits(store.pen_down_positions(key).expect("reads")),
+        bits(&at_pen_down),
+        "the current op's again once the reading ends"
+    );
+    assert_eq!(
+        bits(store.pen_down_normals(key).expect("normals")),
+        bits(&normals_at_pen_down)
+    );
+}
+
+#[test]
+fn a_tile_a_reserved_op_has_no_shape_of_reads_as_stored() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let centre = (126, 100);
+    let reached = tiles_pushed(centre, 6);
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, 6), (0.05, 0.2));
+    let (key, other) = (reached[0], reached[1]);
+    let stored = store.evaluate(other).expect("evaluates").to_vec();
+    let at_pen_down = store.pen_down_positions(other).expect("reads").to_vec();
+    assert_ne!(
+        bits(&stored),
+        bits(&at_pen_down),
+        "the current op changed it"
+    );
+    let b = store.reserve_op().expect("reserved");
+    let future = ahead.correction(key).expect("corrections").to_tile();
+    let a = store.current_op();
+    store
+        .install_pen_down_of(&b, key, future, a)
+        .expect("installed");
+    let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+    assert!(reading.pen_down_shape(&other).is_none(), "no shape of it");
+    assert_eq!(
+        bits(reading.pen_down_positions(other).expect("reads")),
+        bits(&stored),
+        "read as the store has it now, not at the current op's pen-down"
+    );
+}
+
+#[test]
+fn releasing_one_op_s_shapes_leaves_the_other_s() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let centre = (126, 100);
+    let reached = tiles_pushed(centre, 6);
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, 6), (0.05, 0.2));
+    let opened = store.budget.limit();
+    let key = reached[0];
+    let future = ahead.evaluate(key).expect("evaluates").to_vec();
+    let b = store.reserve_op().expect("reserved");
+    let corrections = ahead.correction(key).expect("corrections").to_tile();
+    let a = store.current_op();
+    store
+        .install_pen_down_of(&b, key, corrections, a)
+        .expect("installed");
+    drop(store.pin(&reached).expect("pinned"));
+    let both = store.pen_down_bytes();
+    assert!(
+        both >= (reached.len() + 1) * 26_886,
+        "both ops' shapes counted: {both} bytes"
+    );
+    assert_eq!(store.budget.limit(), opened - both, "both withheld");
+
+    store.end_op();
+    assert_eq!(store.current_op(), None, "the current op ended");
+    assert_eq!(store.pen_down_tiles(), 0, "its shapes went");
+    let left = store.pen_down_bytes();
+    assert!(
+        (26_886..both).contains(&left),
+        "the reserved op's stay: {left}"
+    );
+    {
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        assert_eq!(
+            bits(reading.pen_down_positions(key).expect("reads")),
+            bits(&future),
+            "the reserved op's shape, untouched"
+        );
+    }
+    store.drop_reserved_op(b);
+    assert_eq!(store.pen_down_bytes(), 0, "every shape gone");
+    assert_eq!(store.budget.limit(), opened, "given back");
+
+    // The other way round: a reserved op's shapes go, the current op's stay.
+    store.begin_op().expect("the next stroke");
+    store.keep_pen_down(&reached).expect("kept");
+    let kept = store.pen_down_bytes();
+    let c = store.reserve_op().expect("reserved");
+    let c_future = ahead.correction(key).expect("corrections").to_tile();
+    store
+        .install_pen_down_of(&c, key, c_future, None)
+        .expect("installed");
+    store.drop_reserved_op(c);
+    assert_eq!(
+        store.pen_down_tiles(),
+        reached.len(),
+        "the current op's stay"
+    );
+    assert_eq!(store.pen_down_bytes(), kept);
+}
+
+#[test]
+fn open_strokes_past_their_share_are_refused_until_one_ends() {
+    let mesh = mesh();
+    let fresh = TestDir::new();
+    let plain = store_over(&fresh, &mesh);
+    assert_eq!(
+        plain.open_strokes_share(),
+        4 * plain.pools_budget(),
+        "four times what a restore may hold of one stroke, for now"
+    );
+    drop(plain);
+    let dir = TestDir::new();
+    let centre = (126, 100);
+    let reached = tiles_pushed(centre, 6);
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, 6), (0.05, 0.2));
+    let shape = PenDownShape::bytes_of(reached[0].side()) + ENTRY_BYTES;
+    let held = store.pen_down_bytes();
+    store.hooks.open_strokes_share = Some(held + shape);
+    let b = store.reserve_op().expect("room for another stroke");
+    let mut future = |tile: TileKey| ahead.correction(tile).expect("corrections").to_tile();
+    store
+        .install_pen_down_of(&b, reached[0], future(reached[0]), None)
+        .expect("one shape fits");
+    let refused = store.install_pen_down_of(&b, reached[1], future(reached[1]), None);
+    assert!(
+        matches!(
+            refused,
+            Err(CacheError::OpenStrokesFull { held: h, share: s })
+                if h == held + shape && s == held + shape
+        ),
+        "{refused:?}"
+    );
+    let reading = store.read_pen_down_of(&b).expect("reserved here");
+    assert_eq!(
+        reading.pen_down_tiles(),
+        1,
+        "nothing kept of the refused one"
+    );
+    drop(reading);
+    let next = store.reserve_op();
+    assert!(
+        matches!(next, Err(CacheError::OpenStrokesFull { .. })),
+        "no room for a third: {next:?}"
+    );
+    store.drop_reserved_op(b);
+    let again = store.reserve_op().expect("room again once one has gone");
+    store.drop_reserved_op(again);
+}
+
+#[test]
+fn a_reserved_op_s_raycast_hits_its_future_where_the_index_keeps_its_box() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let top = Level::new(TOP).expect("a level");
+    let centre = (128, 128);
+    let reach = 20;
+    let reached = tiles_pushed(centre, reach);
+    let (mut store, mut ahead) = landed_and_future(&dir, &mesh, (centre, reach), (-0.3, 0.3));
+    let mut index = SpatialIndex::build(&mut store, top, |_, _| {}).expect("an index");
+    let ahead_index = SpatialIndex::build(&mut ahead, top, |_, _| {}).expect("an index");
+    let b = store.reserve_op().expect("reserved");
+    let a = store.current_op();
+    for &tile in &reached {
+        let future = ahead.correction(tile).expect("corrections").to_tile();
+        store
+            .install_pen_down_of(&b, tile, future, a)
+            .expect("installed");
+    }
+    index.refit(&mut store, &reached).expect("refitted");
+    let (key, li, lj) = tile_at(centre.0, centre.1);
+    let at = usize::try_from(lj * key.side() + li).expect("an index");
+    let target = *ahead
+        .evaluate(key)
+        .expect("evaluates")
+        .get(at)
+        .expect("a vertex");
+    let origin = target * 3.0;
+    for k in 0..64_u16 {
+        let angle = f32::from(k) * 0.4;
+        let aim = target + Vec3::new(angle.cos(), angle.sin(), 0.5 * angle.cos()) * 0.05;
+        let ray = Ray::new(origin, aim - origin).expect("a ray");
+        let expected = ahead_index
+            .raycast_triangle(&mut ahead, &ray)
+            .expect("casts");
+        let mut reading = store.read_pen_down_of(&b).expect("reserved here");
+        let fast = index.raycast_pen_down(&mut reading, &ray).expect("casts");
+        let slow = index
+            .raycast_pen_down_exhaustive(&mut reading, &ray)
+            .expect("casts");
+        assert_eq!(fast, slow, "ray {k}: the oracle agrees");
+        assert_eq!(
+            fast.map(|hit| (hit.key, hit.i, hit.j, hit.second, hit.t.to_bits())),
+            expected.map(|hit| (hit.key, hit.i, hit.j, hit.second, hit.t.to_bits())),
+            "ray {k}: where the surface will be"
+        );
+    }
+}

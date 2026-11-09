@@ -132,10 +132,35 @@ pub enum CacheError {
     #[error("the op ids of this site are used up")]
     OpsExhausted,
     /// A restored stroke's op can't be made current again
-    /// ([`Project::resume_stroke`](crate::Project::resume_stroke)): this one is, begun or edited as
-    /// since the store opened.
-    #[error("op {0:?} is current: no op can be resumed")]
+    /// ([`Project::resume_stroke`](crate::Project::resume_stroke)), nor a reserved op begin
+    /// ([`TileStore::begin_reserved_op`](super::TileStore::begin_reserved_op)): this one is
+    /// current, begun or edited as since the store opened and not ended
+    /// ([`TileStore::end_op`](super::TileStore::end_op)).
+    #[error("op {0:?} is current: no other op can be made current")]
     OpBegun(crate::OpId),
+    /// An op is reserved and not yet begun
+    /// ([`TileStore::reserve_op`](super::TileStore::reserve_op)): this one, the oldest. No op may
+    /// begin before it (a new one, a resumed one, or a reserved one after it), and with no op
+    /// current no edit may be made, which would begin one: the edits made as an op would come
+    /// before those of an op older than it. Nothing was written.
+    #[error("op {0:?} is reserved: it begins first")]
+    OpReserved(crate::OpId),
+    /// The reserved op given isn't reserved on this store: reserved on another, begun, or
+    /// dropped ([`TileStore::drop_reserved_op`](super::TileStore::drop_reserved_op)).
+    #[error("op {0:?} isn't reserved on this store")]
+    NotReserved(crate::OpId),
+    /// The open strokes' pen-down data has reached its share of the budget
+    /// ([`TileStore::open_strokes_share`](super::TileStore::open_strokes_share)): no op is
+    /// reserved, or no shape installed for a reserved op, past it. The caller waits for the
+    /// strokes before to land, as a stroke begun while another lands did before ops could be
+    /// reserved. Nothing was kept.
+    #[error("the open strokes hold {held} bytes of pen-down data, their share is {share}")]
+    OpenStrokesFull {
+        /// The bytes the open strokes' pen-down data holds now, without what was refused.
+        held: usize,
+        /// Their share ([`TileStore::open_strokes_share`](super::TileStore::open_strokes_share)).
+        share: usize,
+    },
     /// A pin request can't be held within the budget, even with every unpinned slot freed.
     /// Nothing was evicted or pinned.
     #[error("pinning {tiles} tiles needs {needed} bytes of pool chunks; the budget is {budget}")]

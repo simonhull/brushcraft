@@ -58,7 +58,10 @@
 //!
 //! The store issues the ops edits carry; callers never pass one in. [`TileStore::begin_op`]
 //! starts a new op, and every edit from then on is part of it, so one stroke keeps one op
-//! across all of its dabs, and ops only grow. Within the store, ops order nothing: every write
+//! across all of its dabs, and ops only grow. A stroke begun while the one before still lands
+//! reserves its op ahead ([`TileStore::reserve_op`]): ordered after the current op, but taking
+//! no edit until that op has ended and it begins ([`TileStore::begin_reserved_op`]), so edits
+//! stay in op order, one op at a time. Within the store, ops order nothing: every write
 //! a correction slot takes is stamped from a counter (see [`crate::stamp`]), and the stamps
 //! decide which slots a recovery flush may mark clean and which records its save point names.
 //! A flush in the middle of a stroke so cuts cleanly between two dabs of one op.
@@ -161,14 +164,16 @@ mod strokes;
 mod upkeep;
 
 pub use config::{Evaluation, StoreConfig};
-pub use edit::TileEdit;
+pub use edit::{NotBegun, ReservedOp, TileEdit};
 pub use error::{CacheError, Invariant};
 pub use frames::{ParentSlots, Predictor};
 pub use journal::JournalCountError;
 pub(crate) use journal::{CutId, JournalRefused, PenDownPoint};
 pub(crate) use layers::{Saved, Snapshot};
 pub(crate) use pen_down::keeps_pen_down;
-pub use pen_down::{MadePenDown, PenDownMaker, PenDownShape, PenDownTaker, TakenShape};
+pub use pen_down::{
+    MadePenDown, PenDownMaker, PenDownReading, PenDownShape, PenDownTaker, TakenShape,
+};
 pub use pins::PinGuard;
 pub use preview::DisplayPreview;
 pub use read::WaveBounds;
@@ -461,8 +466,15 @@ pub struct TileStore {
     /// The previews: finest tiles a renderer shows ahead of their evaluation, never saved (see
     /// the `preview` module).
     previews: preview::Previews,
-    /// The pen-down shapes of the tiles the current stroke changed (see the `pen_down` module).
+    /// The pen-down shapes of the tiles the current stroke changed (see the `pen_down` module);
+    /// while a reserved op's shapes are read ([`TileStore::read_pen_down_of`]), that op's.
     pen_down: pen_down::PenDown,
+    /// The ops reserved and not yet begun, each with its pen-down shapes (see "Ops reserved
+    /// ahead" in the `pen_down` module).
+    reserved: pen_down::Reserved,
+    /// The bytes of the open strokes' pen-down data the pools' minimum leaves no room for in the
+    /// budget ([`TileStore::pen_down_beyond_budget`]).
+    pen_down_beyond: usize,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in

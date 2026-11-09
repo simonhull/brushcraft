@@ -590,6 +590,67 @@ impl TileEdit<'_> {
     }
 }
 
+/// An op reserved for a stroke begun while the one before it still lands
+/// ([`TileStore::reserve_op`]): ordered after it, but not current, so no edit is made as it.
+///
+/// It is the only way to name a reserved op to the store, and it can't be copied: it is given
+/// back to begin the op ([`TileStore::begin_reserved_op`]) or let it go
+/// ([`TileStore::drop_reserved_op`]), so an op is begun at most once, and an op begun is never
+/// read or given shapes as a reserved one. Edits never take an op, reserved or not: they are made
+/// as the current op (see [`TileStore::begin_op`]).
+#[derive(Debug)]
+#[must_use = "an op reserved and let go stays reserved, and holds every later op back"]
+pub struct ReservedOp {
+    /// The op.
+    op: OpId,
+    /// The store it was reserved on.
+    store: super::StoreId,
+}
+
+impl ReservedOp {
+    /// The op reserved: the one the stroke's edits, journal and record carry.
+    #[must_use]
+    pub const fn op(&self) -> OpId {
+        self.op
+    }
+
+    /// The store it was reserved on.
+    pub(super) const fn store(&self) -> super::StoreId {
+        self.store
+    }
+}
+
+/// A reserved op that couldn't begin ([`TileStore::begin_reserved_op`]): the op, given back, and
+/// why.
+#[derive(Debug, thiserror::Error)]
+#[error("reserved op {:?} can't begin", reserved.op)]
+pub struct NotBegun {
+    /// The op, still reserved (or never this store's).
+    reserved: ReservedOp,
+    /// Why it couldn't begin.
+    #[source]
+    error: CacheError,
+}
+
+impl NotBegun {
+    /// Why the op couldn't begin.
+    #[must_use]
+    pub const fn error(&self) -> &CacheError {
+        &self.error
+    }
+
+    /// The op, still reserved.
+    #[must_use]
+    pub const fn reserved(&self) -> &ReservedOp {
+        &self.reserved
+    }
+
+    /// The op back, to begin later or drop.
+    pub fn into_reserved(self) -> ReservedOp {
+        self.reserved
+    }
+}
+
 impl TileStore {
     /// Starts a new op, the site's next sequence number, and returns it: every edit from now
     /// on, [`TileStore::set_correction`] and [`TileStore::edit_tile`] alike, is part of it,
@@ -610,12 +671,116 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::OpsExhausted`] past the site's last sequence number; the current op is
-    /// kept then.
+    /// [`CacheError::OpsExhausted`] past the site's last sequence number;
+    /// [`CacheError::OpReserved`] while an op is reserved ([`TileStore::reserve_op`]), which begins
+    /// next ([`TileStore::begin_reserved_op`]). The current op is kept then.
     pub fn begin_op(&mut self) -> Result<OpId, CacheError> {
+        if let Some(reserved) = self.reserved.oldest() {
+            return Err(CacheError::OpReserved(reserved));
+        }
         let op = self.start_op()?;
         self.release_pen_down();
         Ok(op)
+    }
+
+    /// Reserves the site's next op for a stroke begun while the current op's still lands, and
+    /// returns it: ordered after the current op and every op reserved before it, but not current.
+    /// No edit is made as it until it begins ([`TileStore::begin_reserved_op`]), once the ops
+    /// before it have ended; meanwhile it may be given pen-down shapes of its own, the futures of
+    /// the tiles the strokes before it still change ([`TileStore::install_pen_down_of`]), and its
+    /// reads go to them ([`TileStore::read_pen_down_of`]).
+    ///
+    /// While an op is reserved, no other op may begin before it: a new one
+    /// ([`TileStore::begin_op`]), a resumed one, or a reserved one after it; and once the current
+    /// op has ended ([`TileStore::end_op`]) no edit may be made, which would begin one. So edits
+    /// keep to op order, one op at a time.
+    ///
+    /// Give the op back to the store: begin it, or drop it ([`TileStore::drop_reserved_op`]). One
+    /// let go otherwise stays reserved, and holds every later op back.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::OpenStrokesFull`] if the open strokes' pen-down data holds its share of the
+    /// budget already ([`TileStore::open_strokes_share`]): the stroke waits for those before to
+    /// land, and begins its op then ([`TileStore::begin_op`]). [`CacheError::OpsExhausted`] past
+    /// the site's last sequence number. Nothing is reserved then.
+    pub fn reserve_op(&mut self) -> Result<ReservedOp, CacheError> {
+        let (held, share) = (self.pen_down_bytes(), self.open_strokes_share());
+        if held >= share {
+            return Err(CacheError::OpenStrokesFull { held, share });
+        }
+        let op = self.next_op.ok_or(CacheError::OpsExhausted)?;
+        self.next_op = op.next();
+        self.reserved.insert(op);
+        Ok(ReservedOp {
+            op,
+            store: self.id(),
+        })
+    }
+
+    /// Makes `reserved`, the oldest op reserved, the current op: every edit from now on is made
+    /// as it, as after [`TileStore::begin_op`]. Its pen-down shapes, the futures installed for it,
+    /// become the current stroke's (any left of the op before are let go), and its stroke keeps
+    /// them as any stroke does from now on.
+    ///
+    /// Only once the op before has ended ([`TileStore::end_op`]), or with no op current: so ops
+    /// edit one at a time, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`NotBegun`], with `reserved` given back and the store unchanged, for
+    /// [`CacheError::NotReserved`] if it isn't reserved on this store,
+    /// [`CacheError::OpReserved`] if an older op is reserved (it begins first), or
+    /// [`CacheError::OpBegun`] if an op is current.
+    pub fn begin_reserved_op(&mut self, reserved: ReservedOp) -> Result<OpId, NotBegun> {
+        self.stop_reading_reserved();
+        let op = reserved.op;
+        let refused = if reserved.store != self.id() || !self.reserved.holds(op) {
+            Some(CacheError::NotReserved(op))
+        } else if let Some(oldest) = self.reserved.oldest().filter(|&oldest| oldest != op) {
+            Some(CacheError::OpReserved(oldest))
+        } else {
+            self.op.map(CacheError::OpBegun)
+        };
+        if let Some(error) = refused {
+            return Err(NotBegun { reserved, error });
+        }
+        let Some(shapes) = self.reserved.take(op) else {
+            let error = CacheError::NotReserved(op);
+            return Err(NotBegun { reserved, error });
+        };
+        self.pen_down = shapes;
+        self.withhold_pen_down(0);
+        self.op = Some(op);
+        Ok(op)
+    }
+
+    /// Lets reserved op `reserved` go: its pen-down shapes go, their bytes given back to the
+    /// pools, and it never begins (its id isn't handed out again: ops only grow). For a stroke
+    /// that ends before its op begins, as when a stroke before it fails to land its dabs. Nothing
+    /// for an op not reserved on this store.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the reserved op is what lets it go: the caller can't name it again"
+    )]
+    pub fn drop_reserved_op(&mut self, reserved: ReservedOp) {
+        self.stop_reading_reserved();
+        if reserved.store != self.id() {
+            return;
+        }
+        if self.reserved.take(reserved.op).is_some() {
+            self.withhold_pen_down(0);
+        }
+    }
+
+    /// Ends the current op: its stroke has ended, its pen-down shapes go
+    /// ([`TileStore::release_pen_down`]), and no edit is made as it again. The next edit begins a
+    /// new op as after a rebase, unless an op is reserved: then that op begins next
+    /// ([`TileStore::begin_reserved_op`]), and edits wait for it. Nothing more with no op
+    /// current.
+    pub fn end_op(&mut self) {
+        self.op = None;
+        self.release_pen_down();
     }
 
     /// Makes `op`, a stroke's op the working file holds edits of, the op edits are made as again,
@@ -633,11 +798,14 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::OpBegun`] if an op is current, the one begun or edited as since the store
-    /// opened; [`CacheError::OpsExhausted`] if `op` is its site's last. The store is unchanged
-    /// then.
+    /// opened; [`CacheError::OpReserved`] while an op is reserved ([`TileStore::reserve_op`]);
+    /// [`CacheError::OpsExhausted`] if `op` is its site's last. The store is unchanged then.
     pub(crate) fn resume_op(&mut self, op: OpId) -> Result<(), CacheError> {
         if let Some(current) = self.op {
             return Err(CacheError::OpBegun(current));
+        }
+        if let Some(reserved) = self.reserved.oldest() {
+            return Err(CacheError::OpReserved(reserved));
         }
         self.skip_ops_past([Some(op)])?;
         self.op = Some(op);
@@ -721,11 +889,15 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// As [`TileStore::begin_op`].
+    /// As [`TileStore::begin_op`]: with no op current, [`CacheError::OpReserved`] while an op is
+    /// reserved, whose edits come first.
     pub(super) fn edit_op(&mut self) -> Result<OpId, CacheError> {
         match self.op {
             Some(op) => Ok(op),
-            None => self.start_op(),
+            None => match self.reserved.oldest() {
+                Some(reserved) => Err(CacheError::OpReserved(reserved)),
+                None => self.start_op(),
+            },
         }
     }
 

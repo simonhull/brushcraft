@@ -615,3 +615,120 @@ fn a_correction_too_large_to_store_is_the_caller_s_error() {
     drop(guard);
     assert!(store.unsaved.is_empty(), "nothing was written");
 }
+
+/// The ops of the edits on `store`'s feed since the last call, each once.
+fn ops_edited(store: &mut TileStore) -> BTreeSet<OpId> {
+    let drained = store.feed.drain(store.save_consumer);
+    drained.into_iter().map(|(_, op)| op).collect()
+}
+
+/// Ops reserved one after another come in that order, each after the op current as they are
+/// reserved, which stays current.
+#[test]
+fn ops_reserved_in_order_are_ordered_after_the_current_op() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let first = store.reserve_op().unwrap();
+    assert_eq!(store.current_op(), None, "reserving begins nothing");
+    store.drop_reserved_op(first);
+    let current = store.begin_op().unwrap();
+    let reserved: Vec<ReservedOp> = (0..3).map(|_| store.reserve_op().unwrap()).collect();
+    let ops: Vec<OpId> = reserved.iter().map(ReservedOp::op).collect();
+    assert!(ops.is_sorted(), "{ops:?}");
+    assert!(
+        ops.windows(2).all(|pair| pair[0] != pair[1]),
+        "each its own: {ops:?}"
+    );
+    assert!(ops[0] > current, "after the current op");
+    assert_eq!(store.current_op(), Some(current), "which stays current");
+}
+
+/// A reserved op isn't current: edits go to the current op, and once it has ended they are
+/// refused, as is a new op, until the oldest reserved op begins, which only it may and only
+/// then.
+#[test]
+fn a_reserved_op_takes_no_edit_until_it_begins_after_the_current_op_ends() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let key = tiles(&mesh, TOP, TOP)[0];
+    let region = Region::of_tile(&key);
+    let (column, row) = (region.x0() + 5, region.y0() + 5);
+    let set = |on: &mut TileStore, height: f32| {
+        let lift = Vec3::new(0.0, 0.0, height);
+        on.set_correction(key.face(), key.level(), column, row, lift)
+    };
+    let a = store.begin_op().unwrap();
+    let b = store.reserve_op().unwrap();
+    let c = store.reserve_op().unwrap();
+    set(&mut store, 0.01).unwrap();
+    assert_eq!(ops_edited(&mut store), BTreeSet::from([a]), "edits are A's");
+
+    let early = store.begin_reserved_op(b).unwrap_err();
+    assert!(
+        matches!(early.error(), CacheError::OpBegun(op) if *op == a),
+        "A hasn't ended: {early:?}"
+    );
+    let b_back = early.into_reserved();
+    store.end_op();
+    let edit = set(&mut store, 0.02);
+    assert!(
+        matches!(edit, Err(CacheError::OpReserved(op)) if op == b_back.op()),
+        "no op is current, and a new one would pass B: {edit:?}"
+    );
+    let fresh = store.begin_op();
+    assert!(
+        matches!(fresh, Err(CacheError::OpReserved(op)) if op == b_back.op()),
+        "nor may a new op begin: {fresh:?}"
+    );
+    let resumed = store.resume_op(a);
+    assert!(
+        matches!(resumed, Err(CacheError::OpReserved(op)) if op == b_back.op()),
+        "nor an op resume: {resumed:?}"
+    );
+    let out_of_turn = store.begin_reserved_op(c).unwrap_err();
+    assert!(
+        matches!(out_of_turn.error(), CacheError::OpReserved(op) if *op == b_back.op()),
+        "B before C: {out_of_turn:?}"
+    );
+    let c_back = out_of_turn.into_reserved();
+    assert!(ops_edited(&mut store).is_empty(), "nothing was edited");
+
+    let b_op = store.begin_reserved_op(b_back).unwrap();
+    assert_eq!(store.current_op(), Some(b_op), "B is current");
+    set(&mut store, 0.03).unwrap();
+    assert_eq!(
+        ops_edited(&mut store),
+        BTreeSet::from([b_op]),
+        "edits are B's"
+    );
+    store.end_op();
+    let c_op = store.begin_reserved_op(c_back).unwrap();
+    assert!(c_op > b_op);
+    set(&mut store, 0.04).unwrap();
+    assert_eq!(ops_edited(&mut store), BTreeSet::from([c_op]), "then C's");
+    store.end_op();
+    let next = store.begin_op().unwrap();
+    assert!(next > c_op, "a new op once none is reserved, after them");
+}
+
+/// A reserved op is refused by a store it wasn't reserved on, given back, and begins on its own.
+#[test]
+fn a_reserved_op_is_its_own_store_s_only() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut other = new_store(&dir, "other.bcp", &mesh, roomy());
+    let b = store.reserve_op().unwrap();
+    let elsewhere = other.begin_reserved_op(b).unwrap_err();
+    assert!(
+        matches!(elsewhere.error(), CacheError::NotReserved(_)),
+        "{elsewhere:?}"
+    );
+    let read = other.read_pen_down_of(elsewhere.reserved());
+    assert!(matches!(read, Err(CacheError::NotReserved(_))), "{read:?}");
+    let b_back = elsewhere.into_reserved();
+    let b_op = store.begin_reserved_op(b_back).unwrap();
+    assert_eq!(store.current_op(), Some(b_op));
+}

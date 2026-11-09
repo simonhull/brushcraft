@@ -389,6 +389,19 @@ pub(super) const ROUND: usize = 64;
 /// the cone, and few enough that listing the cone stays cheap next to building it.
 pub(super) const MAX_BATCH: usize = 4096;
 
+/// The open strokes' pen-down data's share of the budget, in pools' shares.
+///
+/// The current stroke's pen-down data and that of the ops reserved behind it may hold this many
+/// times the pools' share ([`TileStore::pools_budget`](super::TileStore::pools_budget))
+/// together ([`TileStore::open_strokes_share`](super::TileStore::open_strokes_share)).
+///
+/// One stroke's pen-down data has no cap (a stroke keeps every shape it needs, held beyond the
+/// budget where it must); the only bound on one stroke's is a restore's, which holds an open
+/// stroke's rows and shapes within the pools' share. Four of those is room for several strokes
+/// landing at once. Provisional: the share is to be measured on live and scripted strokes over
+/// strokes still landing, and set here from that.
+pub(super) const OPEN_STROKES_SHARE: usize = 4;
+
 /// The share of the budget's free evaluated slots a batch's targets take: one in this many.
 ///
 /// A batch's cone pins its targets and the level under them (about a quarter as many, plus a

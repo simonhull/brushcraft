@@ -76,6 +76,10 @@ pub(super) struct TestHooks {
     /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
     /// fallback, which no valid mesh reaches.
     pub(super) without_tile_borders: bool,
+    /// The open strokes' share of the budget, in place of
+    /// [`TileStore::open_strokes_share`](super::TileStore::open_strokes_share)'s, if a test sets
+    /// one: for tests of what is refused past it, without filling a real budget's worth.
+    pub(super) open_strokes_share: Option<usize>,
 }
 
 /// One slice [`TileStore::run_jobs`](super::TileStore::run_jobs) ran, as the tests see it.

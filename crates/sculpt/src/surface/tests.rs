@@ -833,4 +833,91 @@ fn a_dab_on_a_slab_thinner_than_it_takes_the_normal_of_its_own_face() {
     }
 }
 
+/// Where each of `rays` hits `surface`, and its area normal there; the surface finished.
+fn readings(mut surface: StoreSurface<'_>, rays: &[Ray]) -> Vec<Option<(Hit, Option<DVec3>)>> {
+    let read: Vec<Option<(Hit, Option<DVec3>)>> = rays
+        .iter()
+        .map(|ray| {
+            let hit = surface.raycast(ray)?;
+            let normal = surface.area_normal(hit.position, hit.normal, 0.1, 0.5);
+            Some((hit, normal))
+        })
+        .collect();
+    surface.finish().unwrap();
+    read
+}
+
+#[test]
+fn a_reserved_op_s_surface_reads_its_futures_and_the_store_elsewhere() {
+    let dir = TestDir::new();
+    let (mut project, mut index) = cube(&dir, level(), fixed(2));
+    let ahead_dir = TestDir::new();
+    let (mut ahead, mut ahead_index) = cube(&ahead_dir, level(), fixed(2));
+    let down = Ray::new(DVec3::new(0.01, 0.02, 3.0), -DVec3::Z).unwrap();
+    let top = {
+        let mut surface = StoreSurface::new(project.store(), &index);
+        let hit = surface.raycast(&down).unwrap();
+        surface.finish().unwrap();
+        hit.position
+    };
+    let rays: Vec<Ray> = (0..40)
+        .map(|k| {
+            let angle = f64::from(k) * 0.7;
+            let around = DVec3::new(angle.cos(), angle.sin(), 0.0) * (0.005 * f64::from(k % 20));
+            Ray::new(top + around + DVec3::new(0.0, 0.0, 2.0), -DVec3::Z).unwrap()
+        })
+        .collect();
+    let before = readings(StoreSurface::new(project.store(), &index), &rays);
+
+    // Stroke A lands a dab at the top and stays open; the future is the same cube after a
+    // stronger dab there.
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke_and_wait().unwrap();
+    let landed = dab(top.to_f32(), 0.2, 0.05, 0.5, 0);
+    apply_dabs(project.store(), &mut index, &mut state, &[landed]).unwrap();
+    let mut ahead_state = Stroke::new(ahead.store());
+    ahead.begin_stroke_and_wait().unwrap();
+    let stronger = dab(top.to_f32(), 0.2, 0.1, 0.5, 0);
+    apply_dabs(
+        ahead.store(),
+        &mut ahead_index,
+        &mut ahead_state,
+        &[stronger],
+    )
+    .unwrap();
+    ahead.end_unrecorded_stroke().unwrap();
+
+    // Stroke B, reserved, is given the future of every tile the store holds otherwise.
+    let store = project.store();
+    let keys = tiles(store.mesh(), level());
+    let b = store.reserve_op().unwrap();
+    let a = store.current_op();
+    let mut differing = Vec::new();
+    for key in keys {
+        let future = ahead.store().correction(key).unwrap().to_tile();
+        if store.correction(key).unwrap().to_tile() != future {
+            store.install_pen_down_of(&b, key, future, a).unwrap();
+            differing.push(key);
+        }
+    }
+    assert!(!differing.is_empty(), "the stronger dab moved the top");
+    index.refit(store, &differing).unwrap();
+
+    let current = readings(StoreSurface::new(store, &index), &rays);
+    assert_eq!(current, before, "the current op reads its pen-down surface");
+    let expected = readings(StoreSurface::new(ahead.store(), &ahead_index), &rays);
+    let reserved = StoreSurface::of_reserved(project.store(), &index, &b).unwrap();
+    let future = readings(reserved, &rays);
+    assert_eq!(
+        future, expected,
+        "the reserved op reads the future, bit for bit"
+    );
+    assert_ne!(future, before, "which isn't the surface at A's pen-down");
+    assert_eq!(
+        readings(StoreSurface::new(project.store(), &index), &rays),
+        before,
+        "and the current op's again after"
+    );
+}
+
 mod hard_stroke;
