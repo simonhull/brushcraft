@@ -27,13 +27,15 @@
 //! - how many of the stroke's dabs had landed at the flush's cut, a `u32`;
 //! - the dabs' count, a `u32`, at most [`MAX_JOURNAL_DABS`];
 //! - the stroke's pen-down save point ([`PenDown`]): a `u8` tag, `0` for [`PenDown::Base`], `1` for
-//!   [`PenDown::At`] and `2` for [`PenDown::Unknown`], then a `u64`, the save point's offset for
-//!   `At` and `0` otherwise;
+//!   [`PenDown::At`], `2` for [`PenDown::Unknown`] and `3` for [`PenDown::After`], then a `u64`,
+//!   the save point's offset for `At`, the op of the stroke before as `OpId::to_bits` packs it for
+//!   `After`, and `0` otherwise;
 //! - a zstd frame of the dabs transposed into [`DAB_BYTES`] byte planes (byte `j` of dab `i` at `j
 //!   × count + i`): `DAB_BYTES × count` bytes once decompressed, exactly.
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a count past
-//! its limit, a pen-down tag it doesn't know or an offset beside a tag that takes none, anything
+//! its limit, a pen-down tag it doesn't know or an offset beside a tag that takes none, an
+//! [`PenDown::After`] naming a reserved site's op, or an op not before the batch's own, anything
 //! but exactly one zstd frame after the fixed fields (a skippable frame, or
 //! bytes after the frame), a frame that doesn't decompress to the stated size, a batch whose dabs
 //! run past the last `u32` index, and a landed count past the dabs placed: the first index plus
@@ -65,6 +67,19 @@
 //! named, never found from the order of ops, because the save point just before a stroke's op may
 //! have been cut midway through the stroke before it. A batch whose pen-down is
 //! [`PenDown::Unknown`] can't be restored: the tiles restore alone.
+//!
+//! # A stroke begun while the one before it lands
+//!
+//! A stroke may begin while the stroke before it still lands: its op is reserved, ordered after
+//! that stroke's, and its dabs are placed on the surface that stroke will leave and journalled at
+//! once, though it writes nothing until that stroke's op has ended and its own pen-down cut is
+//! taken (`crate::Project::begin_stroke_after`). Until that cut is durable, no save point holds
+//! its surface, so its batches name the stroke before instead ([`PenDown::After`]): its surface is
+//! what that stroke's dabs, every one of them, leave. Once its cut is durable, its later batches
+//! name that save point ([`PenDown::At`]). A stroke's batches go from `After` to a save point,
+//! never back; a stroke with an `After` lands nothing before its own cut, so every batch counting
+//! a dab of it landed names a save point. The stroke before is always of the same site and an
+//! earlier op, and the reader refuses any other.
 
 use thiserror::Error;
 
@@ -106,9 +121,16 @@ pub enum PenDown {
     /// the recovery file's own start (a save, or a roll-over, in the middle of the stroke). The
     /// stroke's journal can't be restored.
     Unknown,
+    /// The stroke began while the stroke made as this op still landed, and its own pen-down cut
+    /// isn't durable yet: its pen-down surface is the one that stroke leaves once every dab of it
+    /// has landed (see the module notes). Always an op of the batch's site, before the batch's
+    /// own.
+    After(OpId),
 }
 
 impl PenDown {
+    /// The payload's tag of [`PenDown::After`].
+    const AFTER: u8 = 3;
     /// The payload's tag of [`PenDown::At`].
     const AT: u8 = 1;
     /// The payload's tag of [`PenDown::Base`].
@@ -117,22 +139,39 @@ impl PenDown {
     const UNKNOWN: u8 = 2;
 
     /// The payload's tag and offset (see the module notes).
-    const fn to_parts(self) -> (u8, u64) {
+    fn to_parts(self) -> (u8, u64) {
         match self {
             Self::Base => (Self::BASE, 0),
             Self::At(offset) => (Self::AT, offset),
             Self::Unknown => (Self::UNKNOWN, 0),
+            Self::After(op) => (Self::AFTER, op.to_bits()),
         }
     }
 
     /// The pen-down a payload's `tag` and `offset` state; `None` for a tag this build doesn't
-    /// know, or an offset beside a tag that takes none.
+    /// know, an offset beside a tag that takes none, or an [`PenDown::After`] of a reserved
+    /// site's op.
     const fn from_parts(tag: u8, offset: u64) -> Option<Self> {
         match (tag, offset) {
             (Self::BASE, 0) => Some(Self::Base),
             (Self::AT, offset) => Some(Self::At(offset)),
             (Self::UNKNOWN, 0) => Some(Self::Unknown),
+            (Self::AFTER, bits) => match OpId::from_bits(bits) {
+                Some(op) => Some(Self::After(op)),
+                None => None,
+            },
             _ => None,
+        }
+    }
+
+    /// Whether a batch of the stroke made as `op` may name this pen-down: any but an
+    /// [`PenDown::After`] of an op that isn't of `op`'s site and before it (see the module
+    /// notes). Ops are ordered only within a site, so one of another site is never taken for
+    /// the stroke before.
+    const fn fits(self, op: OpId) -> bool {
+        match self {
+            Self::After(before) => before.site() == op.site() && before.seq() < op.seq(),
+            Self::Base | Self::At(_) | Self::Unknown => true,
         }
     }
 }
@@ -167,10 +206,14 @@ pub enum JournalError {
     /// The op is of the reserved site, which has none.
     #[error("the dab batch's op is of the reserved site")]
     ReservedSite,
-    /// The pen-down's tag isn't one this build knows, or an offset stands beside a tag that
-    /// takes none.
+    /// The pen-down's tag isn't one this build knows, an offset stands beside a tag that takes
+    /// none, or a [`PenDown::After`] names an op of the reserved site.
     #[error("the dab batch's pen-down save point isn't one this build reads")]
     PenDown,
+    /// A [`PenDown::After`] names an op that isn't of the batch's site and before its op: no
+    /// stroke the batch's began after.
+    #[error("the dab batch's pen-down names no stroke before its own")]
+    AfterNotBefore,
     /// The frame doesn't decompress to exactly the stated dabs.
     #[error("the dab batch's frame doesn't hold its dabs")]
     Frame,
@@ -211,7 +254,8 @@ impl DabBatch {
     ///
     /// [`JournalError::TooManyDabs`] past [`MAX_JOURNAL_DABS`]; [`JournalError::PastLastIndex`]
     /// if `first` plus the count is past `u32::MAX`; [`JournalError::LandedPastPlaced`] if
-    /// `landed` is past that.
+    /// `landed` is past that; [`JournalError::AfterNotBefore`] if `pen_down` is a
+    /// [`PenDown::After`] of an op not of `op`'s site and before it.
     pub(crate) fn new(
         op: OpId,
         first: u32,
@@ -228,6 +272,9 @@ impl DabBatch {
             .ok_or(JournalError::PastLastIndex)?;
         if landed > placed {
             return Err(JournalError::LandedPastPlaced { landed, placed });
+        }
+        if !pen_down.fits(op) {
+            return Err(JournalError::AfterNotBefore);
         }
         Ok(Self {
             op,
@@ -325,8 +372,8 @@ impl DabBatch {
     /// The [`JournalError`] of the first thing refused (see the module notes):
     /// [`JournalError::Short`], [`JournalError::Version`], [`JournalError::Reserved`],
     /// [`JournalError::ReservedSite`], [`JournalError::TooManyDabs`], [`JournalError::PenDown`],
-    /// [`JournalError::Frame`], [`JournalError::PastLastIndex`] or
-    /// [`JournalError::LandedPastPlaced`].
+    /// [`JournalError::AfterNotBefore`], [`JournalError::Frame`], [`JournalError::PastLastIndex`]
+    /// or [`JournalError::LandedPastPlaced`].
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, JournalError> {
         let head = Self::decode_head(payload)?;
         let count = usize::try_from(head.count).unwrap_or(usize::MAX);
@@ -369,6 +416,9 @@ impl DabBatch {
         let tag = fields.u8().ok_or(JournalError::Short)?;
         let offset = fields.u64().ok_or(JournalError::Short)?;
         let pen_down = PenDown::from_parts(tag, offset).ok_or(JournalError::PenDown)?;
+        if !pen_down.fits(op) {
+            return Err(JournalError::AfterNotBefore);
+        }
         let placed = first
             .checked_add(stated)
             .ok_or(JournalError::PastLastIndex)?;
@@ -419,8 +469,9 @@ mod proofs {
     /// length up to the fixed fields and two more, and what it accepts passes every check
     /// [`DabBatch::decode`] makes of the fixed fields: a payload shorter than them is refused,
     /// and an accepted head's version is this build's, its reserved bytes clear, its count within
-    /// [`MAX_JOURNAL_DABS`], its dabs' indices within a `u32`, and its landed count within them,
-    /// so [`DabBatch::new`] takes the head as is.
+    /// [`MAX_JOURNAL_DABS`], its dabs' indices within a `u32`, its landed count within them, and
+    /// the stroke its pen-down may follow of its site and before it, so [`DabBatch::new`] takes
+    /// the head as is.
     #[kani::proof]
     #[kani::unwind(3)]
     fn decode_head_is_in_range_and_refuses_what_decode_refuses() {
@@ -450,6 +501,12 @@ mod proofs {
             placed.is_some_and(|placed| head.landed <= placed),
             "landed within the dabs"
         );
+        if let PenDown::After(before) = head.pen_down {
+            assert!(
+                before.site() == head.op.site() && before.seq() < head.op.seq(),
+                "after an op of its site before its own"
+            );
+        }
         // Byte by byte: a slice comparison lowers to a `memcmp` loop the proof would unwind.
         assert_eq!(payload.first(), Some(&VERSION), "this build's version");
         assert!(
@@ -594,7 +651,7 @@ mod tests {
             JournalError::PastLastIndex,
         );
         refused(&|p| p.truncate(FIXED - 1), JournalError::Short);
-        refused(&|p| p[28] = 3, JournalError::PenDown);
+        refused(&|p| p[28] = 4, JournalError::PenDown);
         refused(&|p| p[28] = u8::MAX, JournalError::PenDown);
         // The tests' batch is at an offset, which neither of the others takes.
         refused(&|p| p[28] = 0, JournalError::PenDown);
@@ -651,13 +708,86 @@ mod tests {
     }
 
     #[test]
+    fn a_pen_down_after_the_stroke_before_round_trips() {
+        let op = OpId::new(1, 9).unwrap();
+        for before in [OpId::new(1, 0).unwrap(), OpId::new(1, 8).unwrap()] {
+            let pen_down = PenDown::After(before);
+            let batch = DabBatch::new(op, 2, 0, pen_down, vec![[5; DAB_BYTES]; 2]).unwrap();
+            let payload = batch.encode().unwrap();
+            assert_eq!(payload[28], 3, "{pen_down:?}'s tag");
+            assert_eq!(
+                payload[29..37],
+                before.to_bits().to_le_bytes(),
+                "{pen_down:?}'s op"
+            );
+            assert_eq!(DabBatch::decode(&payload), Ok(batch), "{pen_down:?}");
+        }
+    }
+
+    #[test]
+    fn a_pen_down_after_names_an_op_before_the_batch_s_own() {
+        let op = OpId::new(1, 9).unwrap();
+        let not_before = [
+            OpId::new(1, 9).unwrap(),
+            OpId::new(1, 10).unwrap(),
+            OpId::new(0, 3).unwrap(),
+            OpId::new(2, 3).unwrap(),
+        ];
+        for after in not_before {
+            assert_eq!(
+                DabBatch::new(op, 0, 0, PenDown::After(after), Vec::new()),
+                Err(JournalError::AfterNotBefore),
+                "made, after {after:?}"
+            );
+            let before = OpId::new(1, 8).unwrap();
+            let mut payload = DabBatch::new(op, 0, 0, PenDown::After(before), Vec::new())
+                .unwrap()
+                .encode()
+                .unwrap();
+            payload[29..37].copy_from_slice(&after.to_bits().to_le_bytes());
+            assert_eq!(
+                DabBatch::decode(&payload),
+                Err(JournalError::AfterNotBefore),
+                "read, after {after:?}"
+            );
+        }
+        let mut payload = DabBatch::new(
+            op,
+            0,
+            0,
+            PenDown::After(OpId::new(1, 1).unwrap()),
+            Vec::new(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        payload[29..37].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            DabBatch::decode(&payload),
+            Err(JournalError::PenDown),
+            "after an op of the reserved site"
+        );
+    }
+
+    #[test]
     fn a_pen_down_reads_only_as_written() {
         assert_eq!(PenDown::from_parts(0, 0), Some(PenDown::Base), "base");
         assert_eq!(PenDown::from_parts(1, 9), Some(PenDown::At(9)), "at");
         assert_eq!(PenDown::from_parts(2, 0), Some(PenDown::Unknown), "unknown");
         assert_eq!(PenDown::from_parts(0, 9), None, "base with an offset");
         assert_eq!(PenDown::from_parts(2, 1), None, "unknown with an offset");
-        assert_eq!(PenDown::from_parts(3, 0), None, "another tag");
+        let before = OpId::new(0, 0).unwrap();
+        assert_eq!(
+            PenDown::from_parts(3, before.to_bits()),
+            Some(PenDown::After(before)),
+            "after"
+        );
+        assert_eq!(
+            PenDown::from_parts(3, u64::MAX),
+            None,
+            "after the reserved site"
+        );
+        assert_eq!(PenDown::from_parts(4, 0), None, "another tag");
     }
 
     #[test]

@@ -118,7 +118,7 @@ impl OpenStroke {
     }
 
     /// The save point holding the stroke's pen-down surface: [`PenDown::Base`] or
-    /// [`PenDown::At`], never [`PenDown::Unknown`].
+    /// [`PenDown::At`], never [`PenDown::Unknown`] or [`PenDown::After`].
     #[must_use]
     pub const fn pen_down(&self) -> PenDown {
         self.pen_down
@@ -258,7 +258,9 @@ pub enum JournalUnusable {
         found: u32,
     },
     /// The batches name no save point holding the stroke's pen-down surface: the flush that was
-    /// to was abandoned, or the stroke began before the recovery file did.
+    /// to was abandoned, or the stroke began before the recovery file did; or they name only the
+    /// stroke before it, which it began behind while that one landed ([`PenDown::After`]), and a
+    /// restore doesn't land that one first.
     #[error("no save point holds the surface the stroke began on")]
     PenDownUnknown,
     /// The save point the batches name isn't one of the recovery file's.
@@ -336,7 +338,9 @@ fn open_stroke(
     let earlier_point = match pen_down {
         PenDown::Base => None,
         PenDown::At(offset) => Some(offset),
-        PenDown::Unknown => return Err(JournalUnusable::PenDownUnknown),
+        // A stroke begun while the one before it landed, whose own cut never became durable:
+        // its surface is what that stroke leaves, which this restore doesn't land first.
+        PenDown::Unknown | PenDown::After(_) => return Err(JournalUnusable::PenDownUnknown),
     };
     let rows = run.iter().flat_map(|batch| {
         let before = usize::try_from(landed.saturating_sub(batch.first())).unwrap_or(usize::MAX);

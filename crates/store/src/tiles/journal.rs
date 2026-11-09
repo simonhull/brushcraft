@@ -1,7 +1,18 @@
-//! The open stroke's dab journal on the store (see [`crate::journal`]).
+//! The open strokes' dab journals on the store (see [`crate::journal`]).
 //!
-//! It holds the dabs the stroke placed and hasn't landed, how many have landed, what the working
+//! Each holds the dabs its stroke placed and hasn't landed, how many have landed, what the working
 //! file holds of them so far, and where the surface the stroke began on is.
+//!
+//! # Side by side
+//!
+//! One stroke writes at a time: the stroke of the store's current op, the **writing** stroke.
+//! Strokes begun while it still lands have their ops reserved behind it
+//! ([`TileStore::reserve_op`]), and their journals open at once, in op order after its
+//! ([`TileStore::begin_journal_after`]), so their dabs reach the working file within a second as
+//! any stroke's do. A reserved stroke lands nothing, so its landed count stays 0 until its op
+//! begins; only the writing stroke's count moves ([`TileStore::journal_landed`]). Every flush cuts
+//! every journal at once, so each cut pairs the store's tiles with the writing stroke's count, and
+//! with none landed of the strokes after it.
 //!
 //! # Through a flush
 //!
@@ -49,6 +60,16 @@
 //! until then), so every batch names a settled save point. Flushes run one at a time, so the
 //! pen-down flush is durable or abandoned before the next one cuts.
 //!
+//! A stroke begun behind the writing one is the exception: until its own pen-down cut settles,
+//! its surface is the one the stroke before it leaves, which its batches name
+//! ([`PenDown::After`]), so they are cut from the first flush on. Its own cut is taken as its op
+//! begins, once the op before has ended, as any stroke's is ([`TileStore::journal_op_began`]);
+//! once that cut settles its later batches name its save point, never `After` again. It lands
+//! nothing before that cut either, and the flush after the cut starts only once the cut has
+//! settled, so a batch counting any of its dabs landed always names its own save point. Its
+//! pen-down becomes unknown only as any stroke's does (its cut abandoned, or a save or a roll-over
+//! it isn't carried through); no flush abandoned makes an `After` unknown, as it waits on none.
+//!
 //! # When the stroke ends
 //!
 //! The stroke's end ([`TileStore::end_journal`]) closes its journal, counting every dab landed:
@@ -57,6 +78,8 @@
 //! the flushes that write its last count, so the file never ends a stroke on a batch whose count is
 //! behind its tiles; then it goes. The next stroke's journal is a new one meanwhile
 //! ([`TileStore::begin_journal`]), and a flush writes the ended strokes' batches before its own.
+//! A reserved stroke let go before its op began ([`TileStore::drop_reserved_ops_from`]) ends the
+//! same way: none of its dabs ever lands, and its last batch says so.
 //!
 //! # A restored stroke
 //!
@@ -68,10 +91,12 @@
 //!
 //! # Onto a fresh working file
 //!
-//! A save's rebase takes none of the batches with it ([`TileStore::rebase_journal`]): the open
+//! A save's rebase takes none of the batches with it ([`TileStore::rebase_journal`]): each open
 //! stroke writes its dabs not landed again, from its landed count, with the next flush, so the
-//! rows are kept at hand for it. Its pen-down is the new file's base if the store took no write
-//! since the stroke began, else unknown.
+//! rows are kept at hand for it. The writing stroke's pen-down is the new file's base if the store
+//! took no write since the stroke began, else unknown. A reserved stroke goes on naming the stroke
+//! before it while that one's journal is open; else that one has ended, nothing has written since,
+//! and the saved state, the new file's base, is the surface it left.
 //!
 //! A **roll-over** after a failed sync carries the open stroke instead
 //! ([`TileStore::fill_roll_over`]): the fresh file gets a save point of its own holding the
@@ -82,7 +107,10 @@
 //! crash right after it included. A stroke whose surface the store can't write from memory (a
 //! tile it changed with no shape kept, a tile lost to the roll-over, or a save in its middle)
 //! isn't carried: as after a save, its next flush writes its dabs not landed again, its
-//! pen-down unknown.
+//! pen-down unknown. A reserved stroke isn't carried: its next flush writes its dabs again, still
+//! naming the stroke before it while that one's journal is open (carried or not: if not, it is as
+//! unusable as that one), else unknown, as the roll-over names no save point of the surface that
+//! stroke left.
 //!
 //! # Memory and cost
 //!
@@ -110,9 +138,12 @@ use crate::stamp::Stamp;
 pub(crate) struct CutId(u64);
 
 /// Where a journal's pen-down surface is (see the module notes): in the save point of a flush not
-/// yet settled, or known.
+/// yet settled, or known; or, for a stroke whose op is reserved, its cut not yet taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PenDownPoint {
+    /// The stroke's op is reserved and hasn't begun: its cut is taken as it begins
+    /// ([`TileStore::journal_op_began`]). Its batches name the stroke before it meanwhile.
+    Reserved,
     /// The next flush to cut holds it: one is queued behind the one in flight. Its stroke lands
     /// nothing until that cut is taken.
     Next,
@@ -219,6 +250,11 @@ struct Journal {
     in_flight: Option<(CutId, Written)>,
     /// Where the stroke's pen-down surface is.
     pen_down: PenDownPoint,
+    /// What the stroke's batches name while `pen_down` isn't known: [`PenDown::After`] the stroke
+    /// before, for a stroke begun behind it (or what a move onto a fresh file left of that, see
+    /// [`TileStore::rebase_journal`]); `None` for a stroke begun as the writing one, whose batches
+    /// wait for its pen-down to settle.
+    before_cut: Option<PenDown>,
     /// The format of its rows, as the app set it when the stroke began (see
     /// [`crate::journal`]): every batch of it carries it.
     dab_format: u32,
@@ -243,7 +279,18 @@ impl Journal {
             written: None,
             in_flight: None,
             pen_down,
+            before_cut: None,
         }
+    }
+
+    /// Whether the stroke's op is reserved and hasn't begun: it lands nothing.
+    fn is_reserved(&self) -> bool {
+        self.pen_down == PenDownPoint::Reserved
+    }
+
+    /// Whether the stroke's pen-down waits on a flush to cut it or settle it.
+    const fn waits_on_flush(&self) -> bool {
+        matches!(self.pen_down, PenDownPoint::Next | PenDownPoint::Flush(_))
     }
 
     /// Adds the dabs `placed`, the next the stroke placed.
@@ -305,11 +352,12 @@ impl Journal {
             .max(self.landed)
     }
 
-    /// The settled pen-down, if it is: a batch names it.
+    /// The pen-down a batch names now, if one may be cut: the settled one, else what the batches
+    /// name until the stroke's own cut settles (see the module notes).
     const fn settled(&self) -> Option<PenDown> {
         match self.pen_down {
             PenDownPoint::Known(pen_down) => Some(pen_down),
-            PenDownPoint::Next | PenDownPoint::Flush(_) => None,
+            PenDownPoint::Reserved | PenDownPoint::Next | PenDownPoint::Flush(_) => self.before_cut,
         }
     }
 
@@ -392,12 +440,14 @@ impl Journal {
     }
 }
 
-/// The store's journals: the open stroke's, and those of strokes ended with their last count not
+/// The store's journals: the open strokes', and those of strokes ended with their last count not
 /// yet written (see the module notes).
 #[derive(Debug, Default)]
 pub(super) struct Journals {
-    /// The open stroke's journal, from [`TileStore::begin_journal`] to its end.
-    open: Option<Journal>,
+    /// The open strokes' journals, in op order: the writing stroke's, from
+    /// [`TileStore::begin_journal`] to its end, then those of the strokes reserved behind it,
+    /// from [`TileStore::begin_journal_after`]. Only the first may be of an op begun.
+    open: Vec<Journal>,
     /// Journals of strokes that have ended, each waiting for a flush to write its last batch, in
     /// the order they ended.
     ended: Vec<Journal>,
@@ -416,16 +466,33 @@ impl Journals {
     /// [`JournalRefused::NotOpen`] if no journal of `op` is open.
     fn open(&mut self, op: OpId) -> Result<&mut Journal, JournalRefused> {
         self.open
-            .as_mut()
-            .filter(|journal| journal.op == op)
+            .iter_mut()
+            .find(|journal| journal.op == op)
             .ok_or(JournalRefused::NotOpen)
     }
 
-    /// Closes the open journal, if any, counting every dab landed: it waits for its last batch
-    /// if one is due (or will be once its pen-down settles) or a cut of it is in flight, else
-    /// goes.
-    fn close(&mut self) {
-        if let Some(mut journal) = self.open.take() {
+    /// The open journal of a stroke whose op has begun, if one is: the writing stroke's.
+    fn begun(&self) -> Option<&Journal> {
+        self.open.iter().find(|journal| !journal.is_reserved())
+    }
+
+    /// Opens `journal`, of an op newer than every open one's.
+    fn push(&mut self, journal: Journal) {
+        debug_assert!(
+            self.open.last().is_none_or(|last| last.op < journal.op),
+            "journals open in op order"
+        );
+        self.open.push(journal);
+    }
+
+    /// Closes the open journals `close` picks, counting every dab of them landed: each waits for
+    /// its last batch if one is due (or will be once its pen-down settles) or a cut of it is in
+    /// flight, else goes.
+    fn close_where(&mut self, close: impl Fn(&Journal) -> bool) {
+        let (closed, open): (Vec<Journal>, Vec<Journal>) =
+            std::mem::take(&mut self.open).into_iter().partition(close);
+        self.open = open;
+        for mut journal in closed {
             journal.rows.clear();
             journal.landed = journal.placed;
             if journal.is_pending() {
@@ -434,7 +501,12 @@ impl Journals {
         }
     }
 
-    /// Every journal: the ended ones in the order they ended, then the open one.
+    /// Closes the journals of strokes whose op has begun: the writing stroke's.
+    fn close_begun(&mut self) {
+        self.close_where(|journal| !journal.is_reserved());
+    }
+
+    /// Every journal: the ended ones in the order they ended, then the open ones in op order.
     fn all(&self) -> impl Iterator<Item = &Journal> {
         self.ended.iter().chain(&self.open)
     }
@@ -452,11 +524,55 @@ impl Journals {
 
 impl TileStore {
     /// The stroke made as `op` begins, its pen-down surface at `pen_down` (see the module
-    /// notes): opens its journal, closing any still open (see [`TileStore::end_journal`]).
+    /// notes): opens its journal, closing the writing stroke's if it is still open (see
+    /// [`TileStore::end_journal`]). No op may be reserved: it would begin first.
     pub(crate) fn begin_journal(&mut self, op: OpId, pen_down: PenDownPoint) {
-        self.journals.close();
+        self.journals.close_begun();
+        debug_assert!(
+            self.journals.open.is_empty(),
+            "no stroke is reserved behind a stroke that begins"
+        );
         let dab_format = self.journals.dab_format;
-        self.journals.open = Some(Journal::new(op, pen_down, dab_format, self.last_write));
+        let journal = Journal::new(op, pen_down, dab_format, self.last_write);
+        self.journals.push(journal);
+    }
+
+    /// The op of the newest open stroke, which a stroke begun now would follow; `None` with none
+    /// open.
+    pub(crate) fn newest_open_stroke(&self) -> Option<OpId> {
+        self.journals.open.last().map(|journal| journal.op)
+    }
+
+    /// The stroke made as `op`, an op just reserved ([`TileStore::reserve_op`]), begins behind
+    /// the stroke made as `after`, the newest open one, which still lands: opens its journal, its
+    /// batches naming [`PenDown::After`] `after` until its own pen-down cut, taken as its op
+    /// begins ([`TileStore::journal_op_began`]), settles (see the module notes).
+    pub(crate) fn begin_journal_after(&mut self, op: OpId, after: OpId) {
+        debug_assert_eq!(
+            self.newest_open_stroke(),
+            Some(after),
+            "a stroke begins behind the newest open one"
+        );
+        let dab_format = self.journals.dab_format;
+        let mut journal = Journal::new(op, PenDownPoint::Reserved, dab_format, self.last_write);
+        journal.before_cut = Some(PenDown::After(after));
+        self.journals.push(journal);
+    }
+
+    /// The reserved op `op` began ([`TileStore::begin_reserved_op`]) and its stroke's pen-down cut
+    /// was taken: its pen-down surface is at `pen_down`, which its batches name once it settles;
+    /// until then they go on naming the stroke before. A roll-over while the cut was taken, which
+    /// carried the stroke and so settled its pen-down already, keeps that. Its writes from now on
+    /// are its own, which a save in its middle looks for, as for any stroke
+    /// ([`TileStore::rebase_journal`]). Nothing for an op whose journal isn't open and reserved.
+    pub(crate) fn journal_op_began(&mut self, op: OpId, pen_down: PenDownPoint) {
+        let last_write = self.last_write;
+        if let Ok(journal) = self.journals.open(op)
+            && journal.is_reserved()
+        {
+            journal.pen_down = pen_down;
+            journal.begun_at = Some(last_write);
+        }
     }
 
     /// The stroke made as `op`, restored after a crash, lands on (see
@@ -484,9 +600,9 @@ impl TileStore {
             .ok()
             .and_then(|count| landed.checked_add(count))
             .ok_or(JournalCountError::PastLastIndex)?;
-        self.journals.close();
+        self.journals.close_begun();
         let written = Written { placed, landed };
-        self.journals.open = Some(Journal {
+        self.journals.push(Journal {
             op,
             placed,
             landed,
@@ -494,17 +610,19 @@ impl TileStore {
             written: Some(written),
             in_flight: None,
             pen_down: PenDownPoint::Known(pen_down),
+            before_cut: None,
             dab_format,
             begun_at: None,
         });
         Ok(())
     }
 
-    /// Drops the open journal without ending it: no batch is written of it, as if it had never
-    /// opened. For a resume that failed after [`TileStore::resume_journal`], which must leave the
-    /// file saying nothing it didn't (ending it would write a batch counting every dab landed).
-    pub(crate) fn discard_journal(&mut self) {
-        self.journals.open = None;
+    /// Drops the open journal of `op` without ending it: no batch is written of it, as if it had
+    /// never opened. For a resume that failed after [`TileStore::resume_journal`], which must
+    /// leave the file saying nothing it didn't (ending it would write a batch counting every dab
+    /// landed).
+    pub(crate) fn discard_journal(&mut self, op: OpId) {
+        self.journals.open.retain(|journal| journal.op != op);
     }
 
     /// The stroke made as `op`, restored still landing and never resumed, has ended: its dabs
@@ -529,6 +647,7 @@ impl TileStore {
             written: Some(Written { placed, landed }),
             in_flight: None,
             pen_down: PenDownPoint::Known(pen_down),
+            before_cut: None,
             dab_format,
             begun_at: None,
         };
@@ -564,45 +683,69 @@ impl TileStore {
     /// `landed` of the dabs the stroke made as `op` placed have landed: passed with each landing,
     /// on the owner thread, with no cut between the landing's edits and this count, in either
     /// order, so a flush's cut always pairs the store's tiles with the count that made them (see
-    /// the module notes).
+    /// the module notes). Only the writing stroke lands: a reserved one's count stays 0.
     ///
     /// # Errors
     ///
-    /// [`JournalRefused::NotOpen`] if no journal of `op` is open; [`JournalRefused::Count`] with
-    /// [`JournalCountError::LandedBack`] below the count it had, or
-    /// [`JournalCountError::LandedPastPlaced`] past the dabs journalled. Nothing changes then.
+    /// [`JournalRefused::NotOpen`] if no journal of `op` is open, or `op` is reserved and hasn't
+    /// begun; [`JournalRefused::Count`] with [`JournalCountError::LandedBack`] below the count it
+    /// had, or [`JournalCountError::LandedPastPlaced`] past the dabs journalled. Nothing changes
+    /// then.
     pub(crate) fn journal_landed(&mut self, op: OpId, landed: u32) -> Result<(), JournalRefused> {
-        Ok(self.journals.open(op)?.land(landed)?)
+        let journal = self.journals.open(op)?;
+        if journal.is_reserved() {
+            return Err(JournalRefused::NotOpen);
+        }
+        Ok(journal.land(landed)?)
     }
 
-    /// The open stroke ended: its journal counts every dab landed (those it dropped never land),
-    /// and goes once that count is written, if it isn't yet (see the module notes).
+    /// The writing stroke ended: its journal counts every dab landed (those it dropped never
+    /// land), and goes once that count is written, if it isn't yet (see the module notes). The
+    /// journals of the strokes reserved behind it stay open.
     pub(crate) fn end_journal(&mut self) {
-        self.journals.close();
+        self.journals.close_begun();
     }
 
-    /// Whether the open stroke has dabs journalled and not landed: a save must wait for them.
+    /// The reserved ops `dropped` were let go before they began
+    /// ([`TileStore::drop_reserved_ops_from`]): their strokes' journals close, every dab of them
+    /// counted landed, as an ended stroke's are, so a restore never lands one.
+    pub(super) fn end_dropped_journals(&mut self, dropped: &[OpId]) {
+        self.journals
+            .close_where(|journal| journal.is_reserved() && dropped.contains(&journal.op));
+    }
+
+    /// Whether an open stroke has dabs journalled and not landed, the writing one or one reserved
+    /// behind it: a save must wait for them.
     pub(crate) fn is_landing(&self) -> bool {
-        self.journals.open.as_ref().is_some_and(Journal::is_landing)
+        self.journals.open.iter().any(Journal::is_landing)
     }
 
-    /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut
-    /// (see the module notes). True with no stroke open.
+    /// Whether the writing stroke may land, edit the store: its pen-down flush has taken its cut
+    /// (see the module notes). True with no stroke open; a reserved stroke lands nothing until
+    /// its op begins.
     pub(crate) fn may_land(&self) -> bool {
         self.journals
-            .open
-            .as_ref()
+            .begun()
             .is_none_or(|journal| journal.pen_down != PenDownPoint::Next)
     }
 
-    /// Whether a restore could go on with the open stroke, as far as its pen-down surface goes:
-    /// true with no stroke open, or with its pen-down in a save point or still to settle; false
-    /// once it is unknown, which it stays (see [`crate::Project::open_stroke_restorable`]).
+    /// Whether the stroke made as `op` may land: its op has begun and its pen-down flush has
+    /// taken its cut. False for a stroke reserved, or one whose journal isn't open.
+    pub(crate) fn stroke_may_land(&self, op: OpId) -> bool {
+        self.journals
+            .begun()
+            .is_some_and(|journal| journal.op == op && journal.pen_down != PenDownPoint::Next)
+    }
+
+    /// Whether a restore could go on with the open strokes, as far as their pen-down surfaces
+    /// go: true with no stroke open, or with each one's pen-down in a save point, after the
+    /// stroke before it or still to settle; false once one is unknown, which it stays (see
+    /// [`crate::Project::open_stroke_restorable`]).
     pub(crate) fn open_stroke_restorable(&self) -> bool {
         self.journals
             .open
-            .as_ref()
-            .is_none_or(|journal| journal.pen_down != PenDownPoint::Known(PenDown::Unknown))
+            .iter()
+            .all(|journal| journal.settled() != Some(PenDown::Unknown))
     }
 
     /// Whether the open stroke made as `op` waits for its pen-down flush's cut before it may land
@@ -610,8 +753,8 @@ impl TileStore {
     pub(super) fn waits_to_land(&self, op: OpId) -> bool {
         self.journals
             .open
-            .as_ref()
-            .is_some_and(|journal| journal.op == op && journal.pen_down == PenDownPoint::Next)
+            .iter()
+            .any(|journal| journal.op == op && journal.pen_down == PenDownPoint::Next)
     }
 
     /// Whether a flush now would write a batch.
@@ -733,17 +876,17 @@ impl TileStore {
     /// stroke may land.
     pub(crate) fn pen_downs_abandoned(&mut self) {
         for journal in self.journals.all_mut() {
-            if journal.settled().is_none() {
+            if journal.waits_on_flush() {
                 journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
             }
         }
         self.journals.forget_written();
     }
 
-    /// The open journal's pen-down save point, if a journal is open: for tests.
+    /// The writing stroke's pen-down save point, if its journal is open: for tests.
     #[cfg(test)]
     pub(crate) fn open_pen_down(&self) -> Option<PenDownPoint> {
-        self.journals.open.as_ref().map(|journal| journal.pen_down)
+        self.journals.begun().map(|journal| journal.pen_down)
     }
 
     /// Test hook: makes the working file's next save point fail before anything is written, as
@@ -754,10 +897,10 @@ impl TileStore {
     }
 
     /// The store moved onto a fresh working file, by `how`, which holds no batch: the ended
-    /// journals go (no batch in the new file is behind its tiles), and the open one writes its dabs
-    /// not landed again, from its landed count, with the next flush.
+    /// journals go (no batch in the new file is behind its tiles), and the open ones write their
+    /// dabs not landed again, from their landed counts, with the next flush.
     ///
-    /// The open stroke's pen-down surface:
+    /// The writing stroke's pen-down surface:
     ///
     /// - **After a save**, if the store took no write since the stroke began (none of the stroke's,
     ///   none of any other op's), the saved state is its surface, and the new file's base:
@@ -770,71 +913,85 @@ impl TileStore {
     ///   cut in the new file, whose batches hold what the carry wrote: the journal goes on from
     ///   there, its next batch the dabs placed since, or its landed count alone. After one that
     ///   couldn't, unknown.
+    ///
+    /// A reserved stroke's, which the new file holds no save point of: it goes on naming the
+    /// stroke before it while that one's journal is open, whatever became of that one's pen-down
+    /// (the surface that stroke leaves is the same). Else that stroke has ended, and nothing has
+    /// written since (ops edit in order, and the reserved one hasn't begun): after a save, the
+    /// saved state, the new file's base, is the surface it left; after a roll-over, no save point
+    /// the store knows of is named for it, so it is unknown until its own cut settles.
     pub(super) fn rebase_journal(&mut self, how: Rebase) {
         self.journals.ended.clear();
         let last_write = self.last_write;
-        let Some(journal) = &mut self.journals.open else {
-            return;
-        };
-        journal.in_flight = None;
-        let (pen_down, written) = match how {
-            Rebase::Save => {
-                let found = journal
-                    .begun_at
-                    .is_some_and(|begun_at| last_write <= begun_at);
-                (
-                    if found {
+        let open_ops: Vec<OpId> = self
+            .journals
+            .open
+            .iter()
+            .map(|journal| journal.op)
+            .collect();
+        for journal in &mut self.journals.open {
+            journal.in_flight = None;
+            match how {
+                Rebase::RollOver(Some(carried)) if carried.op == journal.op => {
+                    journal.pen_down = PenDownPoint::Known(PenDown::At(carried.pen_down));
+                    journal.written = carried.written;
+                }
+                _ if journal.is_reserved() => {
+                    let before_open = matches!(
+                        journal.before_cut,
+                        Some(PenDown::After(before)) if open_ops.contains(&before)
+                    );
+                    if !before_open {
+                        journal.before_cut = Some(match how {
+                            Rebase::Save => PenDown::Base,
+                            Rebase::RollOver(_) => PenDown::Unknown,
+                        });
+                    }
+                    journal.written = None;
+                }
+                Rebase::Save => {
+                    let found = journal
+                        .begun_at
+                        .is_some_and(|begun_at| last_write <= begun_at);
+                    let pen_down = if found {
                         PenDown::Base
                     } else {
                         PenDown::Unknown
-                    },
-                    None,
-                )
+                    };
+                    journal.pen_down = PenDownPoint::Known(pen_down);
+                    journal.written = None;
+                }
+                Rebase::RollOver(_) => {
+                    journal.pen_down = PenDownPoint::Known(PenDown::Unknown);
+                    journal.written = None;
+                }
             }
-            Rebase::RollOver(Some(carried)) if carried.op == journal.op => {
-                (PenDown::At(carried.pen_down), carried.written)
-            }
-            Rebase::RollOver(_) => (PenDown::Unknown, None),
-        };
-        journal.pen_down = PenDownPoint::Known(pen_down);
-        journal.written = written;
+        }
     }
 
-    /// Whether the open journal is `op`'s: its stroke hasn't ended.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only `TileStore::end_op` asks, which the project calls later"
-        )
-    )]
+    /// Whether a journal of `op` is open: its stroke hasn't ended.
     pub(super) fn journal_open_for(&self, op: OpId) -> bool {
-        self.journals
-            .open
-            .as_ref()
-            .is_some_and(|journal| journal.op == op)
+        self.journals.open.iter().any(|journal| journal.op == op)
     }
 
     /// The op of the open stroke a roll-over carries into its fresh file, if one is open and the
-    /// store's op is still its own (see [`TileStore::fill_roll_over`]).
+    /// store's op is still its own (see [`TileStore::fill_roll_over`]): the writing stroke. A
+    /// stroke reserved behind it isn't carried (see the module notes).
     ///
     /// The stroke's edits are then exactly the writes of its op since it began (strokes don't
     /// overlap, see `crate::recovery`), which is how the roll-over tells the tiles it changed
     /// from those it found. A save in its middle moves its later edits to a new op: then nothing
     /// tells them apart, and the stroke isn't carried.
     pub(super) fn journal_to_carry(&self) -> Option<OpId> {
-        self.journals
-            .open
-            .as_ref()
-            .map(|journal| journal.op)
-            .filter(|&op| self.op == Some(op))
+        let op = self.op?;
+        self.journal_open_for(op).then_some(op)
     }
 
-    /// The open stroke's journal as a roll-over carries it into its fresh file, whose pen-down
+    /// The writing stroke's journal as a roll-over carries it into its fresh file, whose pen-down
     /// cut is the save point at `pen_down` there: the batches of every dab not landed, from the
     /// landed count, naming that save point (none if every dab placed has landed), and what
     /// [`TileStore::rebase_journal`] sets the journal to once the file is swapped in; `None`
-    /// with no journal open. Nothing in the store changes.
+    /// with none to carry ([`TileStore::journal_to_carry`]). Nothing in the store changes.
     ///
     /// The cost is a copy of the rows not landed, on the calling thread.
     ///
@@ -846,7 +1003,13 @@ impl TileStore {
         &self,
         pen_down: u64,
     ) -> Result<Option<(Vec<DabBatch>, Carried)>, CacheError> {
-        let Some(journal) = &self.journals.open else {
+        let to_carry = self.journal_to_carry();
+        let found = self
+            .journals
+            .open
+            .iter()
+            .find(|journal| Some(journal.op) == to_carry);
+        let Some(journal) = found else {
             return Ok(None);
         };
         let (batches, written) = if journal.is_landing() {

@@ -14,12 +14,14 @@
 //!    the bounds an index computes with no edit pending stay out, see [`crate::bounds`]), so the
 //!    save point names the bounds of the state the snapshot copies. The records of the strokes
 //!    ended by then go in with the same write's neighbour ([`TileStore::flush_strokes`]), so the
-//!    save point that holds a stroke's last edits holds its record. The open stroke's dab journal
+//!    save point that holds a stroke's last edits holds its record. Every open stroke's dab journal
 //!    is cut at the same moment ([`TileStore::cut_journal`]): a [`crate::DabBatch`] of the dabs
 //!    placed and not yet written or landed, with the count landed as of the snapshot, so the count
-//!    describes exactly the tiles the snapshot copies (see `crate::tiles::journal`). This is all a
-//!    stroke end costs the drawing thread, and it grows with the edits since the last flush: a slot
-//!    copy per tile, and a copy of the dabs placed since (84 bytes each).
+//!    describes exactly the tiles the snapshot copies (see `crate::tiles::journal`). Only the
+//!    writing stroke, the store's current op's, lands: the strokes reserved behind it count none
+//!    landed, which is what the snapshot holds of them. This is all a stroke end costs the drawing
+//!    thread, and it grows with the edits since the last flush: a slot copy per tile, and a copy of
+//!    the dabs placed since (84 bytes each).
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
 //!    records come back, with the journal's batches framed after them. A copy that doesn't encode
 //!    is left out, and the bounds its edit could have changed are appended as unknown, at the cut,
@@ -100,8 +102,13 @@
 //! ([`RecoveryError::Unpaired`]), as one carrying a batch is; a pen-down flush abandoned leaves the
 //! stroke's pen-down unknown, and its journal unusable for a restore (the tiles restore alone).
 //!
-//! This holds while strokes don't overlap: a stroke begins only once the last one's op has ended
-//! (every dab landed or dropped), so no edit of the last stroke follows the next one's cut.
+//! This holds while strokes write one at a time: a stroke's op begins only once the last one's op
+//! has ended (every dab landed or dropped), so no edit of the last stroke follows the next one's
+//! cut. A stroke begun while the last one still lands is reserved behind it
+//! (`crate::Project::begin_stroke_after`): its dabs are journalled meanwhile, its batches naming
+//! the stroke before as where its surface is ([`PenDown::After`]), and its own cut is asked of
+//! [`RecoveryWriter::cut_before_op`] as its op begins, once the last one's has ended, exactly as
+//! for a stroke begun on its own; its batches name that save point once it is durable.
 //!
 //! # Failure
 //!

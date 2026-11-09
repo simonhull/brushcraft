@@ -840,7 +840,9 @@ impl TileStore {
     /// Lets reserved op `op` go, if it is reserved, and every op reserved after it: their pen-down
     /// shapes go, their bytes given back to the pools, and none of them begins (their ids aren't
     /// handed out again: ops only grow). A later op's futures are the earlier strokes' dabs
-    /// applied, `op`'s among them, so they can't stand without it. Returns the ops let go, in op
+    /// applied, `op`'s among them, so they can't stand without it. Their strokes' journals, if
+    /// open, close as an ended stroke's do, every dab counted landed: none of them ever lands, and
+    /// their last batches say so (see `crate::tiles::journal`). Returns the ops let go, in op
     /// order; their tokens are no longer reserved ([`CacheError::NotReserved`]), and are to be
     /// given back with [`TileStore::drop_reserved_op`], which then lets nothing more go.
     ///
@@ -853,8 +855,20 @@ impl TileStore {
             return Vec::new();
         }
         let dropped = self.reserved.drop_from(op);
+        self.end_dropped_journals(&dropped);
         self.withhold_pen_down(0);
         dropped
+    }
+
+    /// The oldest op reserved ([`TileStore::reserve_op`]), which begins next; `None` with none
+    /// reserved.
+    pub(crate) fn oldest_reserved_op(&self) -> Option<OpId> {
+        self.reserved.oldest()
+    }
+
+    /// Whether `reserved` is an op reserved on this store, not yet begun or let go.
+    pub(crate) fn holds_reserved(&self, reserved: &ReservedOp) -> bool {
+        reserved.store == self.id() && self.reserved.holds(reserved.op)
     }
 
     /// Lets every reserved op go, as [`TileStore::drop_reserved_ops_from`] the oldest: for an
@@ -884,13 +898,6 @@ impl TileStore {
     /// # Panics
     ///
     /// While a reserved op's pen-down shapes are read ([`TileStore::read_pen_down_of`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the project calls it as a stroke ends once strokes chain"
-        )
-    )]
     pub(crate) fn end_op(&mut self) {
         self.assert_not_reading();
         debug_assert!(

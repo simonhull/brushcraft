@@ -23,7 +23,7 @@ fn pen_down_of(project: &mut Project, op: OpId) -> PenDown {
 
 /// Starts a flush with the writer thread held back from its syncs, and steps it past its
 /// encoding: its records appended, it waits in its tile sync, in flight whatever the owner polls.
-fn hold_in_tile_sync(project: &mut Project) {
+pub(super) fn hold_in_tile_sync(project: &mut Project) {
     project.writer.as_ref().unwrap().pause_syncs(true);
     project.tick(Instant::now() + FLUSH_INTERVAL * 100).unwrap();
     let writer = project.writer.as_mut().unwrap();
@@ -37,14 +37,14 @@ fn hold_in_tile_sync(project: &mut Project) {
 }
 
 /// Lets a writer held back from its syncs go, and waits until every flush is durable.
-fn release_syncs(project: &mut Project) {
+pub(super) fn release_syncs(project: &mut Project) {
     project.writer.as_ref().unwrap().pause_syncs(false);
     crash::poll_until_idle(project);
 }
 
 /// Asserts that the recovery file at `path`, opened at its save point `offset`, evaluates as
 /// the dense evaluation of `map`.
-fn assert_save_point(path: &Path, offset: u64, map: &CorrectionMap, what: &str) {
+pub(super) fn assert_save_point(path: &Path, offset: u64, map: &CorrectionMap, what: &str) {
     let file = ProjectFile::open_at(path, offset).unwrap();
     let mesh = file.mesh();
     let mut store = TileStore::open(file, roomy()).unwrap();

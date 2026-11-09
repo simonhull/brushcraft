@@ -490,8 +490,9 @@ const FUZZ_DABS: usize = 200;
 /// The batch `parts` describe, made to be one a writer makes.
 ///
 /// Its dabs are cut at [`FUZZ_DABS`], the first index moved down so they end within a `u32`, the
-/// landed count wrapped to at most the dabs placed, and the pen-down's kind taken modulo three
-/// (an offset only where it takes one).
+/// landed count wrapped to at most the dabs placed, and the pen-down's kind taken modulo four
+/// (an offset only where it takes one; after an op of the batch's site before its own, the
+/// offset's remainder by the op's sequence, or unknown for a site's first op).
 fn batch_of((op, first, landed, (kind, offset), format, bytes): &BatchParts) -> DabBatch {
     let (rows, _) = bytes.as_chunks::<DAB_BYTES>();
     let dabs: Vec<[u8; DAB_BYTES]> = rows.iter().take(FUZZ_DABS).copied().collect();
@@ -499,12 +500,18 @@ fn batch_of((op, first, landed, (kind, offset), format, bytes): &BatchParts) -> 
     let first = (*first).min(u32::MAX - count);
     let placed = u64::from(first + count);
     let landed = u32::try_from(u64::from(*landed) % (placed + 1)).unwrap();
-    let pen_down = match kind % 3 {
-        0 => PenDown::Base,
-        1 => PenDown::At(*offset),
+    let op = op_of(op.0, op.1);
+    // An op before the batch's own, of its site; with none, no stroke came before it.
+    let before = offset
+        .checked_rem(op.seq())
+        .and_then(|seq| OpId::new(op.site(), seq));
+    let pen_down = match (kind % 4, before) {
+        (0, _) => PenDown::Base,
+        (1, _) => PenDown::At(*offset),
+        (3, Some(before)) => PenDown::After(before),
         _ => PenDown::Unknown,
     };
-    DabBatch::new(op_of(op.0, op.1), first, landed, pen_down, dabs)
+    DabBatch::new(op, first, landed, pen_down, dabs)
         .unwrap()
         .with_dab_format(*format)
 }
@@ -541,7 +548,7 @@ fn journal_decode() {
 /// strokes leave records, and so does the unsaved tile's. A recovery file holds a journal too:
 /// the third tile's stroke journals two batches before its save point (some dabs, then only its
 /// landed count moving), and the unsaved tile's one after it, each naming the save point before
-/// it as its stroke's pen-down.
+/// it as its stroke's pen-down, then a batch of a stroke begun while that one lands, naming it.
 fn seed_file(path: &Path, meta: Meta) {
     let journal = matches!(meta.role(), Role::Recovery { .. });
     let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
@@ -596,6 +603,14 @@ fn seed_file(path: &Path, meta: Meta) {
     seed_stroke(&mut file, op_of(0, 4));
     if journal {
         seed_batch(&mut file, op_of(0, 4), (0, 4), 1, PenDown::At(displayed));
+        // A stroke begun while the one before it lands: none of its dabs landed.
+        seed_batch(
+            &mut file,
+            op_of(0, 5),
+            (0, 3),
+            0,
+            PenDown::After(op_of(0, 4)),
+        );
     }
 }
 

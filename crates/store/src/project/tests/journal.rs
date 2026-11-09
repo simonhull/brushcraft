@@ -11,6 +11,7 @@ use crate::{FLUSH_INTERVAL, JournalCountError};
 mod flush_now;
 mod pen_down;
 mod resume;
+mod side_by_side;
 
 /// The tests' dabs `range`, as [`dab_at`] makes them.
 fn dabs(range: Range<u32>) -> Vec<[u8; DAB_BYTES]> {

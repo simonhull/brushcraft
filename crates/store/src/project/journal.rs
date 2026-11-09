@@ -1,10 +1,25 @@
-//! The open stroke's journal and landing.
+//! The open strokes' journals and landing.
 //!
-//! Whether it may land, its pen-down cut as it begins, the dabs it places and lands, resuming one
-//! a restore found, and the flush a close asks for to make it all durable.
+//! Whether a stroke may land, its pen-down cut as it begins, the dabs it places and lands,
+//! strokes begun behind one still landing, resuming one a restore found, and the flush a close
+//! asks for to make it all durable.
 //!
 //! See [`crate::DabBatch`] for the record, and `crate::recovery` for the cut a stroke's first
 //! landing waits for.
+//!
+//! # A stroke begun while the last one lands
+//!
+//! A pen comes down while the open stroke's dabs still land: the new stroke begins behind it at
+//! once ([`Project::begin_stroke_after`]), its op reserved, ordered after the open one's but not
+//! current, and its journal open, so the dabs it places are journalled as it places them
+//! ([`Project::journal_placed_after`]) and reach the recovery file within a second. It lands
+//! nothing yet: one stroke writes at a time, in op order. Once the stroke before has ended
+//! ([`Project::end_stroke`], which then ends its op too), its op begins
+//! ([`Project::begin_reserved_stroke`]) and its pen-down cut is taken as any stroke's is, its
+//! first landing waiting for it; from then on it is the open stroke. Until that cut is durable its
+//! batches name the stroke before ([`PenDown::After`]), then that save point. A stroke reserved
+//! that won't land, as when a stroke before it fails, is let go with every stroke behind it
+//! ([`Project::drop_stroke_after`]).
 
 use std::time::Instant;
 
@@ -13,9 +28,122 @@ use super::{Project, ProjectError, Retry};
 use crate::OpId;
 use crate::journal::{DAB_BYTES, PenDown};
 use crate::recovery::RecoveryWriter;
-use crate::tiles::{CacheError, JournalRefused, PenDownPoint};
+use crate::tiles::{CacheError, JournalRefused, NotBegun, PenDownPoint, ReservedOp};
 
 impl Project {
+    /// A pen came down while the open stroke's dabs still land: a stroke begins behind the newest
+    /// open stroke, its op reserved (see the module notes and
+    /// [`TileStore::reserve_op`](crate::tiles::TileStore::reserve_op)), and its journal opens,
+    /// its batches naming that stroke as where its surface is until its own cut is durable. Its
+    /// dabs, placed on the futures installed for its op, are journalled at once
+    /// ([`Project::journal_placed_after`]); none lands until its op begins
+    /// ([`Project::begin_reserved_stroke`]), once every stroke before it has ended.
+    ///
+    /// Give the op back: begin it, or let it go ([`Project::drop_stroke_after`]).
+    ///
+    /// # Errors
+    ///
+    /// Nothing is reserved on an error: [`ProjectError::NoStroke`] with no stroke open to begin
+    /// after (begin one of its own, [`Project::begin_stroke`]); [`ProjectError::Cache`] with
+    /// [`CacheError::OpenStrokesFull`] when the open strokes' pen-down data holds its share of the
+    /// budget (the stroke waits for those before it to land, and begins its own then), or
+    /// [`CacheError::OpsExhausted`] if the site's ops are used up.
+    pub fn begin_stroke_after(&mut self) -> Result<ReservedOp, ProjectError> {
+        let after = self
+            .store
+            .newest_open_stroke()
+            .ok_or(ProjectError::NoStroke)?;
+        let reserved = self.store.reserve_op()?;
+        self.store.begin_journal_after(reserved.op(), after);
+        Ok(reserved)
+    }
+
+    /// Dabs the stroke reserved as `reserved` placed ([`Project::begin_stroke_after`]), the next
+    /// in placement order, as [`Project::journal_placed`] takes the open stroke's: kept for the
+    /// next flush to journal, none of them landed. Once its op has begun, its dabs go through
+    /// [`Project::journal_placed`].
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NoStroke`] if `reserved` isn't reserved on this project: begun, let go
+    /// (with a stroke before it, too), or of another project; [`ProjectError::Journal`] as for
+    /// [`Project::journal_placed`]. Nothing is kept then.
+    pub fn journal_placed_after(
+        &mut self,
+        reserved: &ReservedOp,
+        placed: &[[u8; DAB_BYTES]],
+    ) -> Result<(), ProjectError> {
+        if !self.store.holds_reserved(reserved) {
+            return Err(ProjectError::NoStroke);
+        }
+        self.store
+            .journal(reserved.op(), placed)
+            .map_err(journal_refused)
+    }
+
+    /// The stroke reserved as `reserved` begins its op, every stroke before it having ended: it
+    /// is the open stroke from now on, as one [`Project::begin_stroke`] begins, its pen-down
+    /// shapes the futures installed for it. Its pen-down cut is taken now, as for any stroke
+    /// (see [`Project::begin_stroke`]): it **lands nothing until that cut is taken**
+    /// ([`Project::may_land`]), and its batches go on naming the stroke before until the cut is
+    /// durable, then name its save point.
+    ///
+    /// The stroke begins whatever the cut meets, as [`Project::begin_stroke`]'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`NotBegun`], the op handed back with nothing changed, for what
+    /// [`TileStore::begin_reserved_op`](crate::tiles::TileStore::begin_reserved_op) refuses:
+    /// the stroke before is still open ([`CacheError::OpBegun`]; end it first), an older stroke
+    /// is reserved ([`CacheError::OpReserved`]), or `reserved` isn't reserved on this project.
+    /// Begin it later, or let it go ([`Project::drop_stroke_after`]).
+    pub fn begin_reserved_stroke(&mut self, reserved: ReservedOp) -> Result<OpId, NotBegun> {
+        // A refusal is handed back as it is, the token in it.
+        let begun = self.store.begin_reserved_op(reserved);
+        begun.inspect(|&op| {
+            // The op is current and has edited nothing: the cut holds every earlier op's edits
+            // and none of its own, as for a stroke begun on its own. A roll-over on the way
+            // carries it, which settles its pen-down there, and that stands.
+            let pen_down = self.cut_before_op(Instant::now());
+            self.store.journal_op_began(op, pen_down);
+            self.stroke = Some(op);
+        })
+    }
+
+    /// Lets the stroke reserved as `reserved` go before its op begins, and every stroke reserved
+    /// behind it, whose surfaces were futures over its dabs: none of their dabs ever lands, and
+    /// their journals close, the last batch of each counting every dab landed (see
+    /// [`TileStore::drop_reserved_ops_from`](crate::tiles::TileStore::drop_reserved_ops_from)).
+    /// Returns the ops let go, in op order; the tokens of those behind it are given back here
+    /// too, then letting nothing more go.
+    ///
+    /// # Panics
+    ///
+    /// While a reserved op's pen-down shapes are read, as
+    /// [`TileStore::drop_reserved_op`](crate::tiles::TileStore::drop_reserved_op).
+    pub fn drop_stroke_after(&mut self, reserved: ReservedOp) -> Vec<OpId> {
+        self.store.drop_reserved_op(reserved)
+    }
+
+    /// Whether the stroke made as `op` may land, edit the store: it is the open stroke, its op
+    /// begun, and its pen-down flush has taken its cut ([`Project::may_land`]). False for a
+    /// stroke reserved behind it, which lands nothing until its op begins, and for a stroke not
+    /// open.
+    #[must_use]
+    pub fn stroke_may_land(&self, op: OpId) -> bool {
+        self.store.stroke_may_land(op)
+    }
+
+    /// The open stroke's journal closes, and, with a stroke reserved behind it, its op ends, so
+    /// that stroke's may begin: a step of [`Project::end_stroke`]. The journal closes first, so
+    /// none is open for the op as it ends, as the store asks.
+    pub(super) fn end_journal_and_op(&mut self) {
+        self.store.end_journal();
+        if self.store.oldest_reserved_op().is_some() {
+            self.store.end_op();
+        }
+    }
+
     /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut (see
     /// [`Project::begin_stroke`]). While it may not, the app places, journals and shows its
     /// dabs ahead, but applies none; the frame loop's [`Project::tick`] and [`Project::poll`] drive
@@ -181,7 +309,7 @@ impl Project {
         }
         if let Err(e) = self.resume_op(op) {
             // Dropped, not ended: ending it would write a batch counting every dab landed.
-            self.store.discard_journal();
+            self.store.discard_journal(op);
             self.store.release_pen_down();
             return Err(NotResumed::new(stroke, e.into()));
         }

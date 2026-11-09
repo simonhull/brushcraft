@@ -250,8 +250,10 @@ pub enum ProjectError {
     /// stroke ended then, and its record is kept once. Nothing was recorded again.
     #[error("the stroke of op {0:?} has its record already")]
     AlreadyRecorded(OpId),
-    /// [`Project::journal_placed`] or [`Project::journal_landed`] with no stroke open: there is no
-    /// journal to add to. Nothing changed.
+    /// [`Project::journal_placed`] or [`Project::journal_landed`] with no stroke open, or
+    /// [`Project::journal_placed_after`] for a stroke not reserved here: there is no journal to
+    /// add to. Or [`Project::begin_stroke_after`] with no stroke open to begin after. Nothing
+    /// changed.
     #[error("no stroke is open to journal dabs for")]
     NoStroke,
     /// The open stroke's journal refused what it was given: a landed count that goes back or
@@ -1208,14 +1210,22 @@ impl Project {
     /// failed for good is replaced, as for any call; an old file it couldn't delete is reported by
     /// the next call that reports ([`ProjectError::OldRecoveryKept`]), and so are tiles found lost.
     ///
+    /// A stroke begun while the last one still lands begins behind it instead
+    /// ([`Project::begin_stroke_after`]).
+    ///
     /// # Errors
     ///
-    /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
+    /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up,
+    /// or with [`CacheError::OpReserved`] while a stroke is reserved behind the open one (it
+    /// begins next, [`Project::begin_reserved_stroke`]): nothing changes then.
     pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
-        // Strokes don't overlap (see `crate::recovery`, "A stroke's first landing waits for its
-        // cut"): a stroke landing while the next begins would edit past the next one's cut. A
-        // stroke beginning while the last one lands is the next roadmap item, which must revisit
-        // this.
+        if let Some(reserved) = self.store.oldest_reserved_op() {
+            return Err(CacheError::OpReserved(reserved).into());
+        }
+        // Strokes write one at a time (see `crate::recovery`, "A stroke's first landing waits
+        // for its cut"): a stroke landing while the next begins would edit past the next one's
+        // cut. A stroke begun while the last one lands is reserved behind it instead
+        // (`Project::begin_stroke_after`), and begins its op once that one's has ended.
         debug_assert!(
             !self.store.is_landing(),
             "a stroke began while the last one's dabs were still landing"
@@ -1283,6 +1293,9 @@ impl Project {
     ///
     /// The stroke's pen-down shapes go once its record is kept
     /// ([`TileStore::release_pen_down`]): the next stroke reads the surface the stroke left.
+    /// With a stroke reserved behind it ([`Project::begin_stroke_after`]), its op ends too, so
+    /// that stroke's may begin ([`Project::begin_reserved_stroke`]); otherwise the store's op
+    /// stays its own until the next stroke begins, as it always has.
     ///
     /// # Errors
     ///
@@ -1318,7 +1331,7 @@ impl Project {
         self.recorded = Some(op);
         self.stroke = None;
         self.store.release_pen_down();
-        self.store.end_journal();
+        self.end_journal_and_op();
         self.end_stroke_at(Instant::now())
     }
 
@@ -1333,7 +1346,7 @@ impl Project {
     pub fn end_unrecorded_stroke(&mut self) -> Result<(), ProjectError> {
         self.stroke = None;
         self.store.release_pen_down();
-        self.store.end_journal();
+        self.end_journal_and_op();
         self.end_stroke_at(Instant::now())
     }
 
