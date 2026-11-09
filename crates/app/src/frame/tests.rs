@@ -2707,6 +2707,33 @@ struct Lands {
     routes_to: Option<Route>,
     /// What its strokes' ends said of the recovery file.
     reports: Vec<ProjectError>,
+    /// How it closes, for the finisher's tests.
+    finishes: Finishes,
+}
+
+/// How [`Lands`] closes: what the finisher's tests set and read.
+#[derive(Debug, Default)]
+struct Finishes {
+    /// Whether it journals its dabs ([`Brush::journals`]): the close bar's Save then lets the
+    /// window go before the save is written.
+    journals: bool,
+    /// How long each of a close's steps takes, a dab each.
+    step_time: Duration,
+    /// Whether a close's steps drop their dabs, as a store error would.
+    drops: bool,
+    /// What a close's steps saw, shared with the test as the owner goes
+    /// ([`Owner::finish_unseen`]).
+    seen: std::rc::Rc<std::cell::RefCell<CloseSteps>>,
+}
+
+/// What [`Lands`]'s close steps saw.
+#[derive(Debug, Default)]
+struct CloseSteps {
+    /// When the step that made its edit began, its op left open.
+    edited_at: Option<Instant>,
+    /// Each step's start, with whether every edit and dab was in a durable save point by then
+    /// ([`Project::flushed`]).
+    steps: Vec<(Instant, bool)>,
 }
 
 impl Brush for Lands {
@@ -2763,6 +2790,39 @@ impl Brush for Lands {
         let landed = self.held > 0;
         self.held = self.held.saturating_sub(1);
         Ok(landed)
+    }
+
+    fn journals(&self) -> bool {
+        self.finishes.journals
+    }
+
+    /// A dab a step, each [`Finishes::step_time`] long. The first edits a tile in an op of its
+    /// own, left open until the last: only the finisher's ticks flush it meanwhile.
+    fn close_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
+        if self.held == 0 {
+            return Ok(false);
+        }
+        let project = context.project;
+        let mut seen = self.finishes.seen.borrow_mut();
+        seen.steps.push((Instant::now(), project.flushed()));
+        if seen.edited_at.is_none() {
+            seen.edited_at = Some(Instant::now());
+            project.begin_stroke_and_wait()?;
+            let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST)?, 0, 0)?;
+            project
+                .store()
+                .edit_tile(key, |edit| edit.set(3, 3, Vec3::new(0.0, 0.0, 0.02)))??;
+            project.store().close_epoch()?;
+        }
+        std::thread::sleep(self.finishes.step_time);
+        self.held -= 1;
+        if self.finishes.drops {
+            self.drops += 1;
+        }
+        if self.held == 0 {
+            project.end_unrecorded_stroke()?;
+        }
+        Ok(true)
     }
 
     fn end_saving(&mut self) {
@@ -2998,6 +3058,184 @@ fn navigating_while_finishing_keeps_the_exit() {
         owner.take_request(),
         Some(WindowRequest::Exit),
         "not cancelled"
+    );
+}
+
+/// [`asked_owner`], its brush journalling its dabs as the app's does: the close bar's Save lets the
+/// window go before the save is written.
+fn journalled_owner(dir: &TestDir, held: usize) -> Owner<Lands, NoUploads> {
+    let mut owner = asked_owner(dir, held);
+    owner.brush.finishes.journals = true;
+    owner
+}
+
+/// Passes of the window's loop, a step then a frame, until the owner asks something of the window.
+///
+/// Or until the save under way ends; returns what it asked, if anything. Bounded by time, not
+/// passes: a flush's syncs can outlast any count of passes that don't wait for them.
+fn until_asked<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> Option<WindowRequest> {
+    let began = Instant::now();
+    loop {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        run(owner, 1);
+        if let Some(request) = owner.take_request() {
+            return Some(request);
+        }
+        if owner.save_stage().is_none() {
+            owner.save_step();
+            return owner.take_request();
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "it ends");
+    }
+}
+
+/// The close bar's Save on `owner` (its bar up, dabs landing), passes until the window is asked to
+/// go unseen, and the owner's recovery file then.
+fn saved_to_finish<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> PathBuf {
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    assert_eq!(until_asked(owner), Some(WindowRequest::Finish));
+    recovery_of(owner)
+}
+
+/// A notifier that must not be called: nothing failed.
+fn no_notice(summary: &str, body: &str) {
+    panic!("nothing to tell: {summary}: {body}");
+}
+
+#[test]
+fn save_while_landing_waits_only_for_the_journal_to_be_durable() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    assert!(
+        owner.dialogs.finishing(),
+        "the bar's progress line meanwhile"
+    );
+    assert_eq!(
+        owner.take_request(),
+        None,
+        "not before the journal is durable"
+    );
+    let asked = until_asked(&mut owner);
+    assert_eq!(asked, Some(WindowRequest::Finish), "the window goes unseen");
+    assert_eq!(
+        owner.landing(),
+        3,
+        "nothing landed for it: it waited for no dab"
+    );
+    assert!(
+        owner.project().flushed(),
+        "every edit and dab placed is in a durable save point"
+    );
+    assert!(
+        owner.save_stage().is_some(),
+        "the save is left to the finisher"
+    );
+    assert_eq!(owner.take_request(), None, "asked once");
+    owner.finish_unseen(no_notice).expect("finished");
+}
+
+/// With nothing guarding the work the window waits for the save, as it always did: the finisher
+/// would have nothing to leave behind if it failed.
+#[cfg(unix)]
+#[test]
+fn save_while_landing_with_protection_paused_waits_in_the_window() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    pause_protection(&mut owner);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    assert_eq!(until_asked(&mut owner), Some(WindowRequest::Exit));
+    assert_eq!(owner.landing(), 0, "it landed in the window");
+    assert!(!owner.unsaved(), "and saved");
+}
+
+/// Cancel during the journal's wait is Cancel as ever: the window stays, and the save goes on in
+/// it, harmless.
+#[test]
+fn cancel_during_the_journal_wait_keeps_the_window_and_the_save() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.save_step();
+    assert_eq!(owner.save_stage(), Some(Stage::Landing));
+    assert_eq!(
+        owner.after_save,
+        AfterSave::Unseen(Unseen::Flushing),
+        "waiting for the journal"
+    );
+    assert!(owner.key(UiKey::Escape, Instant::now()), "Cancel");
+    assert_eq!(owner.after_save, AfterSave::Stay, "the window stays");
+    assert_eq!(until_asked(&mut owner), None, "the window stays");
+    assert_eq!(owner.landing(), 0, "the save landed it all");
+    assert!(!owner.unsaved(), "and holds it");
+}
+
+#[test]
+fn the_finisher_lands_saves_and_removes_the_recovery_file() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    let recovery = saved_to_finish(&mut owner);
+    let seen = std::rc::Rc::clone(&owner.brush.finishes.seen);
+    owner.finish_unseen(no_notice).expect("finished");
+    assert_eq!(seen.borrow().steps.len(), 3, "it landed every dab");
+    assert!(!recovery.exists(), "the save holds everything");
+    let left = store::find_recoveries(&dir.path().join("recovery")).expect("listed");
+    assert!(left.is_empty(), "nothing else either: {left:?}");
+    let file = store::ProjectFile::open(&dir.path().join("first-sculpt.bcrf")).expect("opened");
+    let points = file.save_points().expect("save points");
+    assert_eq!(points.len(), 2, "the first save, and the finisher's");
+}
+
+#[test]
+fn the_finisher_keeps_the_recovery_file_and_notifies_when_the_save_fails() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 2);
+    owner.brush.finishes.drops = true;
+    let recovery = saved_to_finish(&mut owner);
+    let mut told = Vec::new();
+    let finished =
+        owner.finish_unseen(|summary, body| told.push((summary.to_owned(), body.to_owned())));
+    let said = format!("{:#}", finished.expect_err("not saved"));
+    assert!(said.contains("dabs were dropped"), "{said}");
+    assert_eq!(
+        told,
+        vec![(
+            "BrushCraft couldn't save first-sculpt".to_owned(),
+            "A stroke didn't finish. Your work is safe and comes back when you open it.".to_owned()
+        )],
+        "once, in the user's words"
+    );
+    assert!(recovery.exists(), "the recovery file keeps the work");
+}
+
+/// The finisher's batches have the project ticked between them, so its edits stay within a second.
+///
+/// What lands reaches the recovery file within about a second, as in a window: a kill loses no
+/// more. A tick starts a flush a second after the last began, and its syncs take what the disk
+/// takes (a few hundred milliseconds measured here), so the bound is that plus a batch or two; with
+/// no tick nothing would be durable until the landing ended.
+#[test]
+fn the_finisher_ticks_so_its_journal_stays_within_a_second() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 16);
+    let step = Duration::from_millis(150);
+    owner.brush.finishes.step_time = step;
+    saved_to_finish(&mut owner);
+    let seen = std::rc::Rc::clone(&owner.brush.finishes.seen);
+    owner.finish_unseen(no_notice).expect("finished");
+    let seen = seen.borrow();
+    let edited = seen.edited_at.expect("an edit");
+    let durable = seen
+        .steps
+        .iter()
+        .find(|(at, flushed)| *at > edited && *flushed);
+    let (at, _) = durable.expect("the edit reached a durable save point before the landing ended");
+    let took = at.saturating_duration_since(edited);
+    assert!(
+        took <= store::FLUSH_INTERVAL + step * 5,
+        "within a second, its syncs and a batch or two: {took:?}"
     );
 }
 

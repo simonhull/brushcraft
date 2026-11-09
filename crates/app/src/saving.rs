@@ -68,7 +68,10 @@
 //! That close is a scripted run's. With a person at the window a close never lands anything: it
 //! asks, on a bar ([`crate::dialogs`]), and Save on the bar is an ordinary save that can still be
 //! cancelled, the window exiting once it has succeeded ([`crate::frame::Owner::ask_close`]). If it
-//! fails the window stays and the failure bar takes the close bar's place.
+//! fails the window stays and the failure bar takes the close bar's place. With dabs still landing
+//! the window doesn't wait for them: once the recovery file holds every dab placed, it goes, and
+//! the save is finished unseen ([`crate::frame::Owner::finish_unseen`]), a failure said in a
+//! desktop notification instead, the recovery file kept.
 //!
 //! **Leaving on a failure:** with any failed save told, Ctrl+S's too, a further close asks nothing
 //! and leaves ([`crate::frame::Owner::ask_close`]), as above: the recovery file is kept, opening

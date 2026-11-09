@@ -1118,3 +1118,83 @@ fn dabs_dropped_under_the_bar_stop_the_exit() {
     assert!(title.contains("save failed"), "{title}");
     owner.close().expect("closed");
 }
+
+/// A saved project with a backlog: every dab of a stroke shown, none landed.
+///
+/// The project is in a directory of its own, the stroke to and fro `passes` times, its pen lifted,
+/// drawn with a brush that lands a dab at a time from `epoch`.
+fn backlogged(passes: u32, epoch: Instant) -> (TestDir, Owner<Sculpting, NoUploads>) {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        saved_project(&dir),
+        |project| {
+            Sculpting::new(project)
+                .with_cost(DabCost::one_at_a_time())
+                .with_epoch(epoch)
+        },
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    let mut pen = to_and_fro(passes);
+    pen.push(sample(Phase::Up, ACROSS.0, 0.0));
+    queue(&mut owner, pen);
+    run(&mut owner, 1);
+    (dir, owner)
+}
+
+/// Save on the close bar with a large backlog: the window is asked to go within 100 ms of Save.
+///
+/// The journal is durable by then, and the finisher's file is a waited save's, bit for bit: both
+/// land the same dabs live, from the same pen-down surface, and only their batches differ, which
+/// the landed bits never depend on.
+///
+/// In process, as the binary can't build a backlog on a small project; the time measured is from
+/// Save to the window's request to go ([`WindowRequest::Finish`]), which ends its event loop.
+#[test]
+fn save_on_a_large_backlog_closes_the_window_within_100_ms() {
+    const PASSES: u32 = 512;
+    let epoch = Instant::now();
+    let (dir, mut owner) = backlogged(PASSES, epoch);
+    let backlog = owner.landing();
+    assert!(backlog >= 4_000, "{backlog} dabs to land");
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    let saved = Instant::now();
+    assert!(owner.key(UiKey::Enter, saved), "Save");
+    let mut asked = None;
+    while asked.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        run(&mut owner, 1);
+        asked = owner.take_request();
+        assert!(saved.elapsed() < Duration::from_secs(60), "it ends");
+    }
+    let took = saved.elapsed();
+    assert_eq!(asked, Some(WindowRequest::Finish));
+    assert!(took < Duration::from_millis(100), "{took:?} from Save");
+    assert_eq!(owner.landing(), backlog, "nothing waited for the landing");
+    // The app's own cost model from here: the test's lands a dab a batch.
+    owner.brush_mut().cost = DabCost::default();
+    let finishing = Instant::now();
+    owner
+        .finish_unseen(|summary, body| panic!("{summary}: {body}"))
+        .expect("finished");
+    let finished = finishing.elapsed();
+    assert_eq!(recovery_files(&dir), 0, "saved, the recovery file gone");
+
+    let (waited_dir, mut waited) = backlogged(PASSES, epoch);
+    waited.brush_mut().cost = DabCost::default();
+    waited.request_save(Instant::now());
+    let waiting = Instant::now();
+    finish_save(&mut waited);
+    let in_window = waiting.elapsed();
+    waited.close().expect("closed");
+    println!(
+        "{backlog} dabs: Save to Finish {took:?}; finisher {finished:?}, waited {in_window:?}"
+    );
+    assert_eq!(
+        tiles_on_disk(&dir),
+        tiles_on_disk(&waited_dir),
+        "bit for bit"
+    );
+}

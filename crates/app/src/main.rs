@@ -16,7 +16,10 @@
 //! and the brush (`[` and `]` its size, `-` and `=` its strength); F frames the model, as opening
 //! the project does; Ctrl+S saves ([`saving`]). A window opens a project with what a crash left of
 //! it ([`ProjectToOpen::open_restoring`]), saying so on a note the user can answer by going back
-//! to the last save, which swaps the project under the running window ([`swap`]).
+//! to the last save, which swaps the project under the running window ([`swap`]). A window's run
+//! closes its project once the event loop has ended ([`settled`]), as its [`End`] says: the close
+//! bar's Save while dabs still land has the window go at once, and the process finishes unseen,
+//! landing and saving with no window, a failure said in a desktop notification ([`notify`]).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -32,10 +35,10 @@ mod dialogs;
 mod frame;
 mod navigate;
 #[cfg_attr(
-    any(not(test), not(target_os = "linux")),
+    not(target_os = "linux"),
     expect(
         dead_code,
-        reason = "the finisher that sends a notification comes next"
+        reason = "elsewhere there is no bus client yet, so what it alone uses goes unused"
     )
 )]
 mod notify;
@@ -180,6 +183,11 @@ pub(crate) enum End {
     Keep,
     /// It goes: Don't save on the close bar, the one way here.
     Discard,
+    /// It lands and is saved with no window, the process finishing unseen
+    /// ([`frame::Owner::finish_unseen`]): Save on the close bar while dabs were still landing,
+    /// once the recovery file held every dab placed. A failure keeps the recovery file and says
+    /// so in a desktop notification ([`notify`]).
+    Finish,
 }
 
 /// A window's run as it ended: how it went, and its frame loop if it got that far, to close once
@@ -555,11 +563,26 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
         bail!("the event loop ended without closing the project");
     };
     let closing = (ended.owner, ended.end);
-    settled(ended.run, ran, closing, AppOwner::close, AppOwner::discard)
+    let ends = Ends {
+        close: AppOwner::close,
+        discard: AppOwner::discard,
+        finish: |owner: AppOwner| owner.finish_unseen(desktop_notification),
+    };
+    settled(ended.run, ran, closing, ends)
+}
+
+/// The ways a window's frame loop can close, one for each [`End`].
+struct Ends<C, D, F> {
+    /// [`End::Keep`]: what it holds lands, and stays in the recovery file.
+    close: C,
+    /// [`End::Discard`]: what isn't saved goes.
+    discard: D,
+    /// [`End::Finish`]: it lands and is saved, unseen.
+    finish: F,
 }
 
 /// How a window's run ended, once its owner has closed, whatever `run` and the event loop's `ran`
-/// say: through `close`, or through `discard` if the run's [`End`] says so.
+/// say: through the one of `ends` its [`End`] says.
 ///
 /// So what it holds lands and the project closes after any failure, unless the user said to drop
 /// it. The first error is the one returned, with those after it as its context.
@@ -571,14 +594,29 @@ fn settled<O>(
     run: Result<Summary>,
     ran: Result<()>,
     (owner, end): (Option<O>, End),
-    close: impl FnOnce(O) -> Result<()>,
-    discard: impl FnOnce(O) -> Result<()>,
+    ends: Ends<
+        impl FnOnce(O) -> Result<()>,
+        impl FnOnce(O) -> Result<()>,
+        impl FnOnce(O) -> Result<()>,
+    >,
 ) -> Result<Summary> {
     let closed = owner.map_or(Ok(()), |owner| match end {
-        End::Keep => close(owner),
-        End::Discard => discard(owner),
+        End::Keep => (ends.close)(owner),
+        End::Discard => (ends.discard)(owner),
+        End::Finish => (ends.finish)(owner),
     });
     said_too(said_too(run, ran), closed)
+}
+
+/// Shows the finisher's word of a failed save as a desktop notification ([`notify::send`]).
+///
+/// `summary` is its title, `body` its text. With no bus, or none that answers, it is said in the
+/// log alone, as the run's error is anyway.
+fn desktop_notification(summary: &str, body: &str) {
+    if let Err(error) = notify::send(summary, body) {
+        let error = anyhow::Error::new(error);
+        saving::log(&format!("brushcraft: notifying \"{summary}\": {error:#}"));
+    }
 }
 
 /// `first`, or `later`'s error if it was fine; if both failed, the first error with the later as
@@ -1844,6 +1882,19 @@ mod tests {
         }
     }
 
+    /// The ways to close a test's owner: `close` and `discard`, and a finisher nobody asked for.
+    fn ends<C, D>(close: C, discard: D) -> Ends<C, D, impl FnOnce(()) -> Result<()>>
+    where
+        C: FnOnce(()) -> Result<()>,
+        D: FnOnce(()) -> Result<()>,
+    {
+        Ends {
+            close,
+            discard,
+            finish: |()| panic!("nobody asked to finish unseen"),
+        }
+    }
+
     /// However the run or its event loop failed, the frame loop closes: what it holds lands, and
     /// the op ends. An early return on the error would lose them.
     #[test]
@@ -1858,43 +1909,43 @@ mod tests {
         for (run, ran) in cases {
             let failing = run.is_err() || ran.is_err();
             let mut closed = false;
+            let closing = |()| {
+                closed = true;
+                Ok(())
+            };
             let outcome = settled(
                 run,
                 ran,
                 (Some(()), End::Keep),
-                |()| {
-                    closed = true;
-                    Ok(())
-                },
-                |()| panic!("nobody said so"),
+                ends(closing, |()| panic!("nobody said so")),
             );
             assert!(closed, "closed all the same");
             assert_eq!(outcome.is_err(), failing);
         }
         let keep = (Some(()), End::Keep);
-        let no_room = |()| Err(anyhow!("no room"));
-        let both = settled(failed(), Ok(()), keep, no_room, |()| Ok(()));
+        let no_room = || ends(|()| Err(anyhow!("no room")), |()| Ok(()));
+        let both = settled(failed(), Ok(()), keep, no_room());
         let said = format!("{:#}", both.expect_err("failed"));
         assert!(
             said.contains("the device was lost") && said.contains("no room"),
             "{said}"
         );
-        let closing = settled(Ok(summary()), Ok(()), keep, no_room, |()| Ok(()));
+        let closing = settled(Ok(summary()), Ok(()), keep, no_room());
         assert!(closing.is_err(), "a close that failed fails the run");
     }
 
     #[test]
     fn settled_discards_when_the_run_says_so() {
         let mut discarded = false;
+        let discarding = |()| {
+            discarded = true;
+            Ok(())
+        };
         let outcome = settled(
             Ok(summary()),
             Ok(()),
             (Some(()), End::Discard),
-            |()| panic!("Don't save lands nothing"),
-            |()| {
-                discarded = true;
-                Ok(())
-            },
+            ends(|()| panic!("Don't save lands nothing"), discarding),
         );
         assert!(discarded, "it went the other way");
         outcome.expect("it went well");
@@ -1903,9 +1954,46 @@ mod tests {
             Ok(summary()),
             Ok(()),
             (Some(()), End::Discard),
-            |()| Ok(()),
-            |()| Err(anyhow!("no room")),
+            ends(|()| Ok(()), |()| Err(anyhow!("no room"))),
         );
         assert!(failed.is_err(), "a discard that failed fails the run");
+    }
+
+    /// Save on the close bar while dabs landed: the window has gone, and the owner finishes unseen,
+    /// never through the close that leaves the work unsaved.
+    #[test]
+    fn settled_finishes_when_the_run_says_so() {
+        let mut finished = false;
+        let outcome = settled(
+            Ok(summary()),
+            Ok(()),
+            (Some(()), End::Finish),
+            Ends {
+                close: |()| panic!("the save would be left unwritten"),
+                discard: |()| panic!("nobody said to drop it"),
+                finish: |()| {
+                    finished = true;
+                    Ok(())
+                },
+            },
+        );
+        assert!(finished, "it finished unseen");
+        outcome.expect("it went well");
+
+        let failed = settled(
+            Ok(summary()),
+            Ok(()),
+            (Some(()), End::Finish),
+            Ends {
+                close: |()| Ok(()),
+                discard: |()| Ok(()),
+                finish: |()| Err(anyhow!("no room")),
+            },
+        );
+        let said = format!(
+            "{:#}",
+            failed.expect_err("a finisher that failed fails the run")
+        );
+        assert!(said.contains("no room"), "{said}");
     }
 }

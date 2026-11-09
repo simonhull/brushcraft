@@ -107,6 +107,17 @@
 //! come since it was asked for. One loop ends, [`Owner::close_for_reopen`], and another takes over
 //! ([`Owner::go_on_from`]): what the user has set up and what the run has counted go across
 //! ([`Carried`]), and what belongs to the project stays behind.
+//!
+//! **Save on the close bar while dabs are still landing** (the dab journal spec, "Closing") doesn't
+//! wait for the landing. The save begins as any, but its landing holds back while the project
+//! flushes ([`Project::request_flush`]); once every dab placed is in a durable save point of the
+//! recovery file ([`Project::flushed`], milliseconds), the window is asked to go
+//! ([`WindowRequest::Finish`]), and the process **finishes unseen** after it
+//! ([`Owner::finish_unseen`]): it lands in full batches with no frames, ticking the project between
+//! them so a kill loses about a second, writes the save, and removes the recovery file. A failure
+//! keeps the recovery file and is said in a desktop notification. That needs a brush that journals
+//! its dabs ([`Brush::journals`]) and a recovery file that guards the work; otherwise, or after
+//! Cancel, the window waits for the save as for any.
 
 pub(crate) mod schedule;
 
@@ -514,6 +525,15 @@ pub(crate) trait Brush {
     /// a close waits for.
     fn landing(&self) -> usize {
         0
+    }
+
+    /// Whether every dab the brush places is journalled in the recovery file
+    /// ([`Project::journal`]), so a crash keeps what hasn't landed, and the close bar's Save can
+    /// let the window go as soon as the journal is durable, the landing finishing unseen
+    /// ([`Owner::finish_unseen`]). A brush that doesn't keeps the window until the save is
+    /// written. None does by default.
+    fn journals(&self) -> bool {
+        false
     }
 
     /// A save was asked for at `asked`: from now on a stroke whose `Down` came later waits, its
@@ -948,6 +968,22 @@ enum AfterSave {
     /// It exits: Save on the close bar, or a close during a save. Cancelling takes that back, and
     /// the save carries on, harmless.
     Exit,
+    /// It exits before the save is written, which finishes unseen ([`Owner::finish_unseen`]).
+    ///
+    /// The close bar's Save while dabs still land: the window goes once every dab placed is in a
+    /// durable save point of the recovery file (the dab journal spec, "Closing"). Cancelling takes
+    /// that back as for [`AfterSave::Exit`], and the save goes on in the window.
+    Unseen(Unseen),
+}
+
+/// How far a save the window goes before has got ([`AfterSave::Unseen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unseen {
+    /// Its landing waits while the recovery file takes the journal: a flush was asked for, and the
+    /// window goes as soon as [`Project::flushed`] says it is durable.
+    Flushing,
+    /// It was durable: the window was asked to go ([`WindowRequest::Finish`]).
+    Asked,
 }
 
 /// How the recovery file came to fall short of the edits.
@@ -994,6 +1030,9 @@ pub(crate) enum CloseAnswer {
 pub(crate) enum WindowRequest {
     /// Close: everything is saved.
     Exit,
+    /// Close at once, the save under way finishing with no window ([`Owner::finish_unseen`]):
+    /// every dab placed is in a durable save point of the recovery file.
+    Finish,
     /// Close, dropping what isn't saved: the user said so on the close bar.
     ExitDiscarding,
     /// Swap this project in for the one open.
@@ -1720,7 +1759,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             return CloseAnswer::Now;
         }
         let asked = if self.saving.stage().is_some() {
-            self.after_save = AfterSave::Exit;
+            if self.after_save == AfterSave::Stay {
+                self.after_save = AfterSave::Exit;
+            }
             if !self.dialogs.finishing() {
                 self.dialogs.finish(self.save_counts(), now);
             }
@@ -1867,9 +1908,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     fn act(&mut self, action: Action, now: Instant) {
         match action {
             Action::Save => {
+                let unseen = self.may_finish_unseen(now);
                 self.request_save(now);
                 self.after_save = AfterSave::Exit;
                 self.dialogs.finish(self.save_counts(), now);
+                if unseen {
+                    self.flush_to_finish(now);
+                }
             }
             // The one way to losing work on purpose: only the close bar leads here.
             Action::DontSave if self.dialogs.asking_close() => {
@@ -1903,7 +1948,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 } else {
                     self.request_save(now);
                     self.after_save = self.after_retry;
-                    if self.after_save == AfterSave::Exit {
+                    if self.after_save != AfterSave::Stay {
                         self.dialogs.finish(self.save_counts(), now);
                     }
                 }
@@ -3558,7 +3603,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Some(Stage::Landing) => self.land_for_save(),
             Some(Stage::Writing) => self.write_save(),
         };
-        if self.after_save == AfterSave::Exit {
+        if self.after_save != AfterSave::Stay {
             self.exit_step(Instant::now());
         }
         step
@@ -3668,6 +3713,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if self.closing() {
             return SaveStep::Worked;
         }
+        if let AfterSave::Unseen(unseen) = self.after_save {
+            return self.journal_step(unseen);
+        }
         match self.with_brush(size, B::save_step) {
             Ok(landed) => {
                 if landed {
@@ -3677,6 +3725,73 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Err(error) => self.end_save(Err(error.context("landing the dabs to save"))),
         }
         SaveStep::Worked
+    }
+
+    /// Whether the close bar's Save at `now` can let the window go before the save is written, the
+    /// landing and the save finishing unseen: dabs are still landing, the brush journals them, the
+    /// pen holds none back, the project has a file to save to, and the recovery file guards the
+    /// work. Otherwise the window waits for the save, as for any: a pen still down or a stroke
+    /// not yet routed needs frames, and with crash protection paused, or a flush failed or short,
+    /// the journal can't be trusted to keep what a failure would leave.
+    fn may_finish_unseen(&self, now: Instant) -> bool {
+        let landing = self.brush.journals() && self.brush.landing_for_save() > 0;
+        let pen = self.brush.pen_down() || self.pen_queued(now);
+        let saved_to = self.project.path().is_some();
+        landing && !pen && saved_to && self.saving.stage().is_none() && self.journal_guards()
+    }
+
+    /// Whether the recovery file guards the work as far as the frame loop knows: crash protection
+    /// is running and no flush has failed or fallen short since the last save.
+    fn journal_guards(&self) -> bool {
+        self.project.protection().is_active() && self.exposed.is_none()
+    }
+
+    /// Asks the project at `now` for a flush of every edit and every dab journalled so far, so the
+    /// window can go once it is durable ([`Owner::journal_step`]). A project that can't take it
+    /// leaves the save to finish in the window, as any.
+    fn flush_to_finish(&mut self, now: Instant) {
+        let asked = self.project.request_flush(now);
+        self.after_save = match self.heard(asked, "asking for a flush to close") {
+            Ok(()) if self.journal_guards() => AfterSave::Unseen(Unseen::Flushing),
+            Ok(()) => AfterSave::Exit,
+            Err(error) => {
+                saving::log(&format!("brushcraft: {error:#}"));
+                AfterSave::Exit
+            }
+        };
+    }
+
+    /// A step of the wait for the journal, in place of the save's landing while the window is to
+    /// go unseen: the recovery writer polled (the save's landing holds the frames' landing back,
+    /// so nothing new lands meanwhile), and once every edit and dab placed is in a durable save
+    /// point, the window asked to go ([`WindowRequest::Finish`]). Expected: milliseconds, one
+    /// flush's syncs. Anything else editing the project meanwhile, a store job say, is asked for
+    /// again, queued behind the flush in flight.
+    ///
+    /// If the recovery file stops guarding the work (protection paused, a flush failed or short),
+    /// the save goes on in the window instead, landing and then writing as any, and the window
+    /// waits for it.
+    fn journal_step(&mut self, unseen: Unseen) -> SaveStep {
+        if unseen == Unseen::Asked {
+            return SaveStep::Idle;
+        }
+        let polled = self.project.poll();
+        if let Err(error) = self.heard(polled, "polling the project") {
+            saving::log(&format!("brushcraft: {error:#}"));
+            self.after_save = AfterSave::Exit;
+            return SaveStep::Worked;
+        }
+        if !self.journal_guards() {
+            self.after_save = AfterSave::Exit;
+            return SaveStep::Worked;
+        }
+        if self.project.flushed() {
+            self.after_save = AfterSave::Unseen(Unseen::Asked);
+            self.request = Some(WindowRequest::Finish);
+            return SaveStep::Worked;
+        }
+        self.flush_to_finish(Instant::now());
+        SaveStep::Waiting
     }
 
     /// Dabs landed outside the frames' brush steps: the next frame shows them, the next pick is
@@ -3834,14 +3949,82 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// As [`Brush::flush`], [`Project::save`] and [`Project::close`]; a save that failed with the
     /// window closing, or can't be made as dabs were dropped.
     pub(crate) fn close(mut self) -> Result<()> {
-        let flushed = match self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
+        let flushed = self.flush_brush();
+        let saved = self.last_save(flushed.is_ok());
+        let closed = self.close_project();
+        said_too(said_too(flushed, saved), closed)
+    }
+
+    /// Finishes unseen what the close bar's Save left when the window went at once
+    /// ([`WindowRequest::Finish`]), with no window and no frames (the dab journal spec, "Finishing
+    /// unseen"): the brush lands everything it holds in full batches ([`Brush::close_step`], up
+    /// to [`crate::sculpting::WAITED_BATCH`] of finest work each), the project ticked and polled
+    /// between them, so the journal and the landed tiles keep reaching the recovery file at least
+    /// once a second and a kill at any moment loses about a second; then the save under way is
+    /// written, and the project closes, its recovery file removed once the save holds everything.
+    ///
+    /// **A failure** (a landing that fails, dabs dropped, a save that fails, a full disk) keeps
+    /// the recovery file, which holds the work: opening the project brings it back. Nobody is at a
+    /// window to read it, so it is said through `notify`, as a desktop notification's summary and
+    /// body ([`finisher_notice`]), and is the run's error, as a close's is.
+    ///
+    /// # Errors
+    ///
+    /// As [`Owner::close`], and any error of the landing's steps or the upkeep between them.
+    pub(crate) fn finish_unseen(mut self, notify: impl FnOnce(&str, &str)) -> Result<()> {
+        let landed = self.land_unseen();
+        let flushed = self.flush_brush();
+        let whole = landed.is_ok() && flushed.is_ok();
+        let saved = said_too(said_too(landed, flushed), self.last_save(whole));
+        if let Err(error) = &saved {
+            let (summary, body) = finisher_notice(self.saving.name(), error);
+            notify(&summary, &body);
+        }
+        let closed = self.close_project();
+        said_too(saved, closed)
+    }
+
+    /// The finisher's landing ([`Owner::finish_unseen`]): the pen's samples no longer taken, then
+    /// batch after batch of what the brush holds until it holds nothing or a batch lands nothing,
+    /// the project's recovery writer tended before each.
+    ///
+    /// # Errors
+    ///
+    /// As [`Owner::request_close`], [`Owner::close_step`] and [`Owner::tend_recovery`].
+    fn land_unseen(&mut self) -> Result<()> {
+        self.request_close()?;
+        loop {
+            self.tend_recovery(Instant::now())?;
+            if self.landing() == 0 || !self.close_step()? {
+                break;
+            }
+        }
+        self.tend_recovery(Instant::now())
+    }
+
+    /// Has the brush apply what it still holds and end its stroke, as the project is about to
+    /// close; nothing if it never had a view to place dabs through.
+    ///
+    /// # Errors
+    ///
+    /// As [`Brush::flush`].
+    fn flush_brush(&mut self) -> Result<()> {
+        match self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
             Some(size) => {
                 let flushed = self.with_brush(size, B::flush);
                 flushed.context("ending the brush's stroke")
             }
             None => Ok(()),
-        };
-        let saved = self.last_save(flushed.is_ok());
+        }
+    }
+
+    /// Leaves the feed and closes the project, keeping its recovery file only if it has edits no
+    /// save holds. A scripted run fails on what fell short of the recovery file.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::close`], or what fell short of the recovery file in a scripted run.
+    fn close_project(self) -> Result<()> {
         let Self {
             mut project,
             cursor,
@@ -3852,7 +4035,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let keep = project.has_unsaved_edits();
         let closed = project.close(keep).context("closing the project");
         let protected = fell_short.map_or(Ok(()), |why| Err(anyhow!("recovery fell short: {why}")));
-        said_too(said_too(said_too(flushed, saved), closed), protected)
+        said_too(closed, protected)
     }
 
     /// Closes the project without saving: Don't save. What the brush holds is dropped, not landed,
@@ -4079,6 +4262,22 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// What the finisher tells the desktop when it couldn't save: a notification's summary and body.
+///
+/// For the project named `name`, failed for `error` ([`Owner::finish_unseen`]): in the user's
+/// words ([`SaveTrouble`]), the reason first in the body. The recovery file holds the work.
+fn finisher_notice(name: &str, error: &anyhow::Error) -> (String, String) {
+    let said = SaveTrouble::of(error).said();
+    let mut letters = said.chars();
+    let reason: String = letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect())
+        .unwrap_or_default();
+    let summary = format!("BrushCraft couldn't save {name}");
+    let body = format!("{reason}. Your work is safe and comes back when you open it.");
+    (summary, body)
 }
 
 /// Whether `error`, of a tick or a poll, is the recovery file's alone, so a run can go on after it.

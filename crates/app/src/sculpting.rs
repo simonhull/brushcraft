@@ -2493,6 +2493,10 @@ impl Brush for Sculpting {
         self.queued().max(under_way) + self.deferred.len() + self.held.len()
     }
 
+    fn journals(&self) -> bool {
+        true
+    }
+
     fn begin_saving(&mut self, asked: Instant) {
         self.save_asked = Some(asked);
     }

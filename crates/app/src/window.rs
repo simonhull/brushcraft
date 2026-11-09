@@ -19,6 +19,12 @@
 //! **Reopening** ([`WindowApp::reopen`]) swaps the frame loop for one on another project, on the
 //! same window, pen, GPU and render thread.
 //!
+//! **Closing** ends the run with what becomes of the unsaved work ([`End`]): kept, dropped (Don't
+//! save), or finished unseen. The last is the close bar's Save while dabs still land: once the
+//! owner says the journal is durable ([`WindowRequest::Finish`]) the window goes at once, and the
+//! landing and the save go on after the event loop has ended
+//! ([`crate::frame::Owner::finish_unseen`]).
+//!
 //! **Order between the two:** within the pen stream, and within the mouse's input, everything
 //! keeps the order it happened in. Across them it doesn't: a frame's input phase applies all the
 //! mouse input queued since the last frame first, then routes the pen samples drained after each
@@ -816,6 +822,11 @@ impl ApplicationHandler for WindowApp {
             Some(WindowRequest::Exit) => self.close_now(event_loop),
             Some(WindowRequest::ExitDiscarding) => {
                 self.end = End::Discard;
+                self.finish(event_loop, Ok(()));
+            }
+            // The journal is durable: the window goes now, and the rest finishes unseen.
+            Some(WindowRequest::Finish) => {
+                self.end = End::Finish;
                 self.finish(event_loop, Ok(()));
             }
             Some(WindowRequest::Reopen(reopen)) => self.reopen(event_loop, reopen),
