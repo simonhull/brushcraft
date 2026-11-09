@@ -1318,12 +1318,11 @@ fn a_stroke_waiting_behind_the_landing_keeps_the_window_until_it_is_saved() {
     assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
 }
 
-/// A stroke half landed, the pen still on it, a second waiting behind it and a sample held over,
-/// abandoned: nothing is held, and nothing lands.
-#[test]
-fn abandoning_forgets_a_waiting_stroke_and_what_is_held() {
-    let dir = TestDir::new();
-    let mut owner = waiting_owner(&dir);
+/// [`holding_everything`] with the second stroke waiting behind the first ([`Begin::Waits`]).
+///
+/// A stroke half landed, the pen still on it, a second waiting, unplaced, and a sample held over.
+fn holding_everything_waiting(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
+    let mut owner = waiting_owner(dir);
     run(&mut owner, 10_000);
     let mut open = stroke(ACROSS, 12);
     open.pop();
@@ -1334,6 +1333,15 @@ fn abandoning_forgets_a_waiting_stroke_and_what_is_held() {
     run(&mut owner, 1);
     assert!(!owner.brush().deferred.is_empty(), "the second waits");
     owner.brush_mut().held.push(second.first().copied());
+    assert!(owner.brush().under_way(), "the first is under way");
+    assert!(owner.landing() > 1, "and there's plenty held");
+    owner
+}
+
+#[test]
+fn abandoning_forgets_a_waiting_stroke_and_what_is_held() {
+    let dir = TestDir::new();
+    let mut owner = holding_everything_waiting(&dir);
     let before = positions(owner.project());
     owner.brush_mut().abandon();
     assert_eq!(owner.landing(), 0, "nothing is held");
@@ -1342,4 +1350,64 @@ fn abandoning_forgets_a_waiting_stroke_and_what_is_held() {
     run(&mut owner, 10_000);
     assert_eq!(positions(owner.project()), before, "no tile changed");
     owner.discard().expect("discarded");
+}
+
+#[test]
+fn discard_with_a_stroke_waiting_leaves_the_saved_tiles() {
+    let dir = TestDir::new();
+    let owner = holding_everything_waiting(&dir);
+    let saved = tiles_on_disk(&dir);
+    owner.discard().expect("discarded");
+    assert_eq!(recovery_files(&dir), 0, "the work is gone, as asked");
+    assert_eq!(tiles_on_disk(&dir), saved, "the project is as it was saved");
+}
+
+/// Samples waiting for futures are in the save of a close.
+///
+/// A stroke over one still landing whose futures can't be had keeps its samples waiting: Save at
+/// the close lands the first, places them on the second's own surface, and saves both, the window
+/// kept until then.
+#[test]
+fn samples_waiting_for_futures_are_in_the_save_of_a_close() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    let second = stroke(((150.0, 80.0), (170.0, 120.0)), 6);
+    let (early, late) = second.split_at(2);
+    queue(&mut owner, early.to_vec());
+    run(&mut owner, 1);
+    assert_eq!(
+        owner.brush().strokes.len(),
+        2,
+        "the second began over the first"
+    );
+    owner.brush_mut().knob = Knob::FuturesFail;
+    queue(&mut owner, late.to_vec());
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "its samples wait");
+    let now = Instant::now();
+    assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, now), "Save");
+    let began = Instant::now();
+    let mut asked = None;
+    while asked.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        run(&mut owner, 1);
+        asked = owner.take_request();
+        assert!(began.elapsed() < Duration::from_secs(60), "it ends");
+    }
+    assert_eq!(asked, Some(WindowRequest::Exit), "saved in the window");
+    assert_eq!(owner.landing(), 0, "both landed first");
+    assert_eq!(owner.brush().error(), None);
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 2, "both strokes");
+    let file = ProjectFile::open(&copy_on_disk(&dir)).expect("it opens");
+    let read = file.strokes().map(|record| record.expect("a record"));
+    let records: Vec<StrokeRecord> = read.collect();
+    let counts: Vec<usize> = records.iter().map(StrokeRecord::len).collect();
+    assert_eq!(counts, [13, 7], "every sample of both, once");
 }

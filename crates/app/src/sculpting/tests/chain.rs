@@ -805,3 +805,56 @@ fn a_stroke_over_one_that_drops_dabs_goes_with_it() {
     );
     drop(dir);
 }
+
+/// A `Down` whose futures run past the share partway waits, and lands as waiting.
+///
+/// The store takes one future, then refuses the next, in one of `on_futures`'s rounds: the future
+/// installed is let go with its op; the stroke begins once the one before has landed, and leaves
+/// the tiles of waiting.
+///
+/// The test sphere is too small for the same refusal mid-stroke: a `Down` there reaches every
+/// tile the earlier stroke changes. The mid-stroke wait is driven by the knob
+/// (`a_stroke_whose_futures_cant_be_had_waits_its_samples_and_places_them_as_waiting`).
+#[test]
+fn a_down_whose_futures_run_past_the_share_partway_waits_and_lands_as_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let mut run = Chain::new(epoch, None);
+    run.frame(&first);
+    installs_left(Some(1));
+    run.frame(&second);
+    let left = INSTALLS_LEFT.get();
+    installs_left(None);
+    assert_eq!(
+        left,
+        Some(0),
+        "a round installed a future, and the next was refused"
+    );
+    assert!(!run.brush.deferred.is_empty(), "the second waits");
+    assert_eq!(run.ops().len(), 1, "nothing of it reserved");
+    assert_eq!(run.brush.error(), None, "nothing dropped");
+    run.land_all();
+    assert!(run.brush.deferred.is_empty(), "it began and landed");
+    let chained_tiles = run.close();
+    let (_, waited_tiles) = waited(epoch);
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+#[test]
+fn samples_waiting_for_futures_are_placed_by_a_flush_as_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let (early, late) = second.split_at(3);
+        run.frame(early);
+        run.brush.knob = Knob::FuturesFail;
+        run.frame(late);
+        assert_eq!(run.brush.deferred.len(), late.len(), "its samples wait");
+        // `drawn` flushes with them still waiting, the futures still unavailable: the flush
+        // lands the first, then places them on the second's own surface.
+    });
+    assert_eq!(chained.len(), 2, "both under way as the flush began");
+    let (_, waited_tiles) = waited(epoch);
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}

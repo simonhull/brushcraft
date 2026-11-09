@@ -187,7 +187,9 @@
 //!   stroke, its samples wait instead ([`Placing::Waits`]), deferred with every event after them,
 //!   its engine stroke kept as it was, while the catch-up lands the strokes before in frames; once
 //!   its op has begun they are placed on its own pen-down surface, the surface those strokes left,
-//!   which gives the same dabs ([`Sculpting::deferred_ready`]).
+//!   which gives the same dabs ([`Sculpting::deferred_ready`]). They are projected then, with the
+//!   camera and the brush's settings as they are at that step, as any sample is when it is taken: a
+//!   view or a size changed while the pen is down would place them otherwise than at once.
 //! - **A store error** while the oldest lands drops its dabs left, and every later stroke with
 //!   them, their reserved ops given back ([`Project::drop_stroke_after`]): they read the surface
 //!   those dabs were to leave.
@@ -1159,6 +1161,12 @@ fn install(
             remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))
         });
         let written_by = reaching.map(|stroke| stroke.op.id());
+        #[cfg(test)]
+        if !tests::may_install() {
+            // As the store refuses one past the open strokes' share.
+            outcome = Err(OnFutures::Futures);
+            break;
+        }
         if store
             .install_pen_down_of(token, key, tile, written_by)
             .is_err()
@@ -2862,8 +2870,16 @@ impl Sculpting {
     /// nobody resumed ([`Project::end_stroke_dropping_later`]). With its record if it has one the
     /// project takes, else unrecorded.
     fn end_dropping_later(&mut self, project: &mut Project, over: &Pending) {
-        let recording = over.record.as_ref();
-        let record = recording.and_then(|recording| self.record_of(over.op.id(), recording).ok());
+        let record = match &over.record {
+            Some(recording) => match self.record_of(over.op.id(), recording) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    self.fail("recording the stroke", &error);
+                    None
+                }
+            },
+            None => None,
+        };
         let ended = project.end_stroke_dropping_later(record.as_ref());
         let refused = match ended {
             Ok(_) => return,

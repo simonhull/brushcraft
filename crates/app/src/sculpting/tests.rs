@@ -26,6 +26,30 @@ mod lifecycle;
 mod navigation;
 mod saving;
 
+thread_local! {
+    /// How many more futures this thread's brushes may install before the store refuses the next
+    /// as past the open strokes' share; `None`: as many as the store takes.
+    static INSTALLS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lets this thread's brushes install `count` more futures, then refuses them as past the share
+/// (`None`: as the store says).
+pub(super) fn installs_left(count: Option<usize>) {
+    INSTALLS_LEFT.set(count);
+}
+
+/// Whether a brush on this thread may install one more future ([`installs_left`]), counting it.
+pub(super) fn may_install() -> bool {
+    match INSTALLS_LEFT.get() {
+        None => true,
+        Some(0) => false,
+        Some(left) => {
+            INSTALLS_LEFT.set(Some(left - 1));
+            true
+        }
+    }
+}
+
 /// The level the test projects are sculpted at: a 24-face sphere's 24 tiles of 32 × 32 quads.
 const LEVEL: u8 = 5;
 
