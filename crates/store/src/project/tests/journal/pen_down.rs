@@ -503,6 +503,40 @@ fn a_stroke_waiting_for_its_cut_or_its_flush_is_restorable() {
 }
 
 #[test]
+fn finishing_the_flushes_writes_the_rows_of_a_stroke_that_waited_for_its_cut() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 75));
+    hold_in_tile_sync(&mut project);
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 76));
+    let mut b = Stroke::begin(&mut project, 20, 77);
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Next),
+        "the flush queued holds it"
+    );
+    // Its rows are due only once that flush settles its pen-down.
+    b.place(&mut project, 6);
+    project.writer.as_ref().unwrap().pause_syncs(false);
+    project.finish_flushes().unwrap();
+    assert!(
+        project.flushed(),
+        "one call makes everything durable, the rows due after the pen-down settled too"
+    );
+    assert_eq!(
+        batches(&mut project)
+            .iter()
+            .filter(|batch| batch.op() == b.op)
+            .count(),
+        1,
+        "its rows are in the file"
+    );
+    project.close(false).unwrap();
+}
+
+#[test]
 fn a_flush_failing_while_the_next_stroke_waits_leaves_no_gap_or_overlap() {
     for fail in ["save point", "batch encode"] {
         let dir = TestDir::new();

@@ -279,6 +279,11 @@ fn count_down(n: &std::sync::atomic::AtomicUsize) -> bool {
         .is_ok()
 }
 
+/// The most rounds of flushes [`RecoveryWriter::finish`] makes: the flushes it finds, then a
+/// round for each kind of work the last let due (rows of a stroke whose pen-down it settled), with
+/// room to spare.
+const FINISH_ROUNDS: usize = 4;
+
 /// Test hooks shared with the writer thread.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Default)]
@@ -666,18 +671,30 @@ impl RecoveryWriter {
         Ok(())
     }
 
-    /// Flushes every edit made so far and waits until it is durable: the flush in flight and any
-    /// queued after it, then one more for the edits since, all blocking the calling thread.
-    /// `now` is when it started, for [`RecoveryWriter::tick`]'s interval.
+    /// Flushes every edit and journal row made so far and waits until it is durable: the flush
+    /// in flight and any queued after it, then one more for the edits since, all blocking the
+    /// calling thread, and again while work is left. A stroke that waited for its cut has rows due
+    /// only once the flush holding its pen-down settles, so one round can leave them: the next
+    /// writes them. `now` is when it started, for [`RecoveryWriter::tick`]'s interval.
+    ///
+    /// Each round settles what made the next one due: a round for the pen-down's flush and one
+    /// for the rows it let due. A bound of a few rounds holds them all the same, so a bug that
+    /// left work due for ever couldn't hang the caller; [`RecoveryWriter::is_flushed`] would then
+    /// say so.
     ///
     /// # Errors
     ///
     /// Any [`RecoveryError`] of a step on the way.
     pub fn finish(&mut self, store: &mut TileStore, now: Instant) -> Result<(), RecoveryError> {
         self.poll(store)?;
-        self.trigger(store, now)?;
-        while !matches!(self.phase, Phase::Idle | Phase::Failed) {
-            self.wait_step(store)?;
+        for _ in 0..FINISH_ROUNDS {
+            self.trigger(store, now)?;
+            while !matches!(self.phase, Phase::Idle | Phase::Failed) {
+                self.wait_step(store)?;
+            }
+            if self.phase == Phase::Failed || !self.has_work(store) {
+                break;
+            }
         }
         Ok(())
     }
