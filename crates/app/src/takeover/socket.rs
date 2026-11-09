@@ -13,8 +13,9 @@
 //! ([`Listener::bind`]): listening, mode 0600, at a name of its own first, then renamed over its
 //! name, so an opener never meets a socket that isn't listening yet. It removes it as it goes, on
 //! every path, a panic's unwinding included ([`Listener`]'s drop). A socket file a crashed or
-//! killed finisher left is stale: connecting is refused (`ECONNREFUSED`), so an opener asking
-//! removes it, if it is still the same file and ours, and the next finisher's rename replaces it.
+//! killed finisher left is stale: connecting is refused (`ECONNREFUSED`), which an opener takes
+//! as no finisher and leaves alone, and the next finisher's rename replaces it in one step. A
+//! staged socket a finisher killed before its rename left is swept by the next one's bind.
 //! Only a socket file owned by us is connected to or replaced, and only a peer whose credentials
 //! are ours is listened to or believed.
 //!
@@ -164,6 +165,34 @@ impl SocketDir {
     fn staged(&self, file: FileIdentity) -> PathBuf {
         let pid = std::process::id();
         self.0.join(format!("{}.{pid}.tmp", file.socket_name()))
+    }
+
+    /// Removes the staged sockets of `file` a process killed between its bind and its rename
+    /// left (`<name>.*.tmp`): ours, and refusing connections. Best effort; one that can't be
+    /// looked at stays.
+    fn sweep_staged(&self, file: FileIdentity) {
+        let Ok(entries) = fs::read_dir(&self.0) else {
+            return;
+        };
+        let prefix = format!("{}.", file.socket_name());
+        let named = entries.filter_map(Result::ok).filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && name.ends_with(".tmp")
+        });
+        let staged: Vec<PathBuf> = named.map(|entry| entry.path()).collect();
+        for path in staged {
+            let Ok(found) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !our_socket(&found, our_uid()) {
+                continue;
+            }
+            let deadline = Instant::now() + REQUEST_TIMEOUT;
+            if connect_by(&path, deadline).is_err_and(|error| nothing_listens(&error)) {
+                remove_if_same(&path, (found.dev(), found.ino()));
+            }
+        }
     }
 
     /// Makes the directory, mode 0700, if it is missing, then checks it as [`SocketDir::trusted`].
@@ -346,6 +375,7 @@ impl Listener {
         dir.ensure()?;
         let path = dir.socket(file);
         let staged = dir.staged(file);
+        dir.sweep_staged(file);
         if let Ok(left) = fs::symlink_metadata(&staged) {
             // A leftover of a process of ours with this pid, gone.
             if !our_socket(&left, our_uid()) {
@@ -471,8 +501,11 @@ fn place(socket: &UnixListener, staged: &Path, path: &Path) -> Result<(), Socket
 pub(crate) enum Answer {
     /// It said `stopped`: its project is closed, its locks released.
     Stopped,
-    /// There's no finisher to ask: no socket, a stale one (removed), or one we must not use.
+    /// There's no finisher to ask: no socket, a stale one, or one we must not use.
     NoFinisher,
+    /// There's no channel to ask on: the runtime directory is too deep for a socket's address,
+    /// so no finisher can listen in it either.
+    NoChannel,
     /// One listens, but didn't say `stopped` in time.
     Unanswered,
 }
@@ -482,15 +515,17 @@ pub(crate) enum Answer {
 ///
 /// Nothing is used that isn't ours: a directory open to others, a socket file of another user or
 /// not a socket at all, or a peer running as someone else is [`Answer::NoFinisher`], left as it
-/// is. A socket file nothing listens on is stale, and removed.
+/// is. A socket file nothing listens on is stale: [`Answer::NoFinisher`] too, and left for the
+/// next finisher's rename to replace, as removing it here could remove a finisher's socket
+/// renamed over it meanwhile. A runtime directory too deep for an address is
+/// [`Answer::NoChannel`].
 pub(crate) fn ask_to_stop(dir: &SocketDir, file: FileIdentity, within: Duration) -> Answer {
     let deadline = Instant::now() + within;
-    if dir.trusted().is_err() {
-        return Answer::NoFinisher;
-    }
     let path = dir.socket(file);
-    // A runtime directory too deep for a socket's address has no finisher listening in it.
     if SocketAddrUnix::new(path.as_path()).is_err() {
+        return Answer::NoChannel;
+    }
+    if dir.trusted().is_err() {
         return Answer::NoFinisher;
     }
     let Ok(found) = fs::symlink_metadata(&path) else {
@@ -501,10 +536,7 @@ pub(crate) fn ask_to_stop(dir: &SocketDir, file: FileIdentity, within: Duration)
     }
     let mut stream = match connect_by(&path, deadline) {
         Ok(stream) => stream,
-        Err(error) if nothing_listens(&error) => {
-            remove_if_same(&path, (found.dev(), found.ino()));
-            return Answer::NoFinisher;
-        }
+        Err(error) if nothing_listens(&error) => return Answer::NoFinisher,
         Err(_) => return Answer::Unanswered,
     };
     if !peer_is_us(&stream) {

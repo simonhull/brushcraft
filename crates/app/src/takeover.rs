@@ -33,11 +33,13 @@
 //!
 //! - *The project isn't locked:* nothing to take over ([`Way::Clear`]).
 //! - *A finisher that doesn't answer in time,* or that can't be reached as there is no channel at
-//!   all (no `XDG_RUNTIME_DIR`, or not Linux): [`Way::Busy`] with [`Holder::Finisher`], and the
-//!   window waits with the "Finishing your last session" bar and the time it has waited.
-//! - *Nobody answers on a working channel* (no socket, a socket nothing listens on, which is
-//!   removed as stale, or one that isn't ours): the project is open in another window, as a
-//!   finisher always listens. [`Holder::Elsewhere`]: the bar says "`<name>` is open elsewhere".
+//!   all (no `XDG_RUNTIME_DIR`, a runtime directory too deep for a socket's address, or not Linux):
+//!   [`Way::Busy`] with [`Holder::Finisher`], and the window waits with the "Finishing your last
+//!   session" bar and the time it has waited.
+//! - *Nobody answers on a working channel* (no socket, a stale socket nothing listens on, left for
+//!   the next finisher to replace, or one that isn't ours): the project is open in another window,
+//!   as a finisher always listens. [`Holder::Elsewhere`]: the bar says "`<name>` is open
+//!   elsewhere".
 //! - *It said `stopped` and the locks stay held:* [`Holder::Finisher`], after
 //!   [`Patience::release`].
 //! - Either way the project opens once it is free: the finisher has saved by then, or stopped, or
@@ -230,6 +232,7 @@ fn ask(path: &Path, sockets: Option<&SocketDir>, within: Duration) -> Asked {
         Answer::Stopped => Asked::Stopped,
         Answer::Unanswered => Asked::Finisher,
         Answer::NoFinisher => Asked::Nobody,
+        Answer::NoChannel => Asked::Unreachable,
     }
 }
 

@@ -108,7 +108,7 @@ fn a_finisher_never_removes_a_socket_put_there_since() {
 }
 
 #[test]
-fn a_stale_socket_with_no_finisher_is_removed() {
+fn a_stale_socket_is_no_finisher_and_the_next_finisher_replaces_it() {
     let dir = TestDir::new();
     let (_path, file) = file_in(&dir, "first-sculpt.bcrf");
     let sockets = sockets_in(&dir);
@@ -124,12 +124,53 @@ fn a_stale_socket_with_no_finisher_is_removed() {
         "at once, not after the patience: {:?}",
         began.elapsed()
     );
-    assert!(!socket.exists(), "the opener removed it");
+    assert!(
+        socket.exists(),
+        "the opener leaves it: a finisher may rename over it any moment"
+    );
 
-    // A finisher binding finds one too, and takes its place.
-    drop(UnixListener::bind(&socket).expect("bound"));
-    let listener = Listener::bind(&sockets, file).expect("over a stale socket");
-    assert!(listener.path().exists());
+    // A finisher binding renames its own over it, in one step.
+    let stale = std::fs::symlink_metadata(&socket).expect("stale").ino();
+    let mut listener = Listener::bind(&sockets, file).expect("over a stale socket");
+    let placed = std::fs::symlink_metadata(&socket).expect("placed").ino();
+    assert_ne!(placed, stale, "replaced");
+    let asking = thread::spawn(move || ask_to_stop(&sockets, file, Duration::from_secs(5)));
+    assert!(heard(&mut listener), "and heard");
+    listener.answer();
+    assert_eq!(asking.join().expect("asked"), Answer::Stopped);
+}
+
+#[test]
+fn a_staged_socket_a_killed_finisher_left_is_swept() {
+    let dir = TestDir::new();
+    let (_path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let (_other_path, other) = file_in(&dir, "other.bcrf");
+    let sockets = sockets_in(&dir);
+    let socket = socket_path(&sockets, file);
+    // Killed between its bind and its rename: its staged socket stays, nothing listening.
+    let staged = socket.with_file_name(format!(
+        "{}.4242.tmp",
+        socket.file_name().expect("a name").to_string_lossy()
+    ));
+    drop(UnixListener::bind(&staged).expect("bound"));
+    // One still binding, listening: not ours to sweep.
+    let binding = socket.with_file_name(format!(
+        "{}.4243.tmp",
+        socket.file_name().expect("a name").to_string_lossy()
+    ));
+    let live = UnixListener::bind(&binding).expect("bound");
+    // Another file's: not this finisher's to look at.
+    let theirs = socket_path(&sockets, other);
+    let theirs = theirs.with_file_name(format!(
+        "{}.4244.tmp",
+        theirs.file_name().expect("a name").to_string_lossy()
+    ));
+    drop(UnixListener::bind(&theirs).expect("bound"));
+    let listener = Listener::bind(&sockets, file).expect("bound");
+    assert!(!staged.exists(), "swept");
+    assert!(binding.exists(), "a live one stays");
+    assert!(theirs.exists(), "another file's stays");
+    drop((listener, live));
 }
 
 #[test]
@@ -253,19 +294,32 @@ fn a_socket_has_its_name_only_once_it_listens_and_is_ours_alone() {
 }
 
 #[test]
-fn a_runtime_directory_too_deep_for_an_address_has_no_finisher() {
+fn a_runtime_directory_too_deep_for_an_address_is_no_channel() {
     let dir = TestDir::new();
-    let (_path, file) = file_in(&dir, "first-sculpt.bcrf");
+    let (path, file) = file_in(&dir, "first-sculpt.bcrf");
     let deep = dir.path().join("d".repeat(120));
     let sockets = SocketDir::at(deep.join("brushcraft"));
     assert!(Listener::bind(&sockets, file).is_err(), "no socket there");
     let began = Instant::now();
     assert_eq!(
         ask_to_stop(&sockets, file, Duration::from_secs(5)),
-        Answer::NoFinisher,
-        "not a finisher that doesn't answer"
+        Answer::NoChannel,
+        "neither nobody listening nor a finisher that doesn't answer"
     );
     assert!(began.elapsed() < Duration::from_secs(1), "at once");
+    let held = File::open(&path).expect("opened");
+    held.lock().expect("locked");
+    let way = make_way(&path, Some(&sockets), QUICK);
+    assert!(
+        matches!(
+            way,
+            Way::Busy {
+                holder: Holder::Finisher,
+                ..
+            }
+        ),
+        "a finisher that can't be reached: {way:?}"
+    );
 }
 
 #[test]

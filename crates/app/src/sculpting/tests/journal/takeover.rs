@@ -12,7 +12,7 @@ use super::*;
 use crate::frame::{CloseAnswer, Finished, UiKey, WindowRequest};
 use crate::saving::SaveStep;
 use crate::sculpting::tests::saving::{backlogged_in, finish_save, path_in, recovery_files};
-use crate::takeover::{Listener, Patience, SocketDir, Way};
+use crate::takeover::{Patience, SocketDir, Way};
 use crate::{ProjectToOpen, held_elsewhere};
 
 /// Passes of the stroke to and fro: a backlog of more than 4,000 dabs.
@@ -179,26 +179,17 @@ fn finishing_child() {
     let backlog = owner.landing();
     saved_to_finish(&mut owner);
     let sockets = SocketDir::at(sockets.into());
-    let mut listener = crate::listen(owner.project_path(), Some(&sockets));
+    let listener = crate::listen(owner.project_path(), Some(&sockets));
     assert!(listener.is_some(), "it listens");
     println!("{LISTENING} {backlog}");
     let mut looks = 0_usize;
-    let finished = owner.finish_unseen_unless(
-        |summary, body| panic!("{summary}: {body}"),
-        || {
-            // A look before each batch: those before it have landed.
-            println!("{LANDED} {looks}");
-            looks += 1;
-            listener.as_mut().is_some_and(Listener::stop_asked)
-        },
-    );
-    if let Some(listener) = listener {
-        listener.answer();
-    }
-    assert_eq!(
-        finished.expect("stopped, which is no failure"),
-        Finished::Stopped { flushed: true }
-    );
+    let notify = |summary: &str, body: &str| panic!("{summary}: {body}");
+    // A look before each batch: those before it have landed.
+    let landed = || {
+        println!("{LANDED} {looks}");
+        looks += 1;
+    };
+    crate::finish_heard(owner, listener, notify, landed).expect("stopped, which is no failure");
 }
 
 /// What the child says, as the parent hears it.

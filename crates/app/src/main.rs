@@ -654,7 +654,7 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
     let ends = Ends {
         close: AppOwner::close,
         discard: AppOwner::discard,
-        finish: move |owner: AppOwner| finish_heard(owner, listener, desktop_notification),
+        finish: move |owner: AppOwner| finish_heard(owner, listener, desktop_notification, || {}),
     };
     settled(ended.run, ran, closing, ends)
 }
@@ -700,6 +700,9 @@ pub(crate) fn listen(
 /// stderr: the recovery file holds its last durable save point, which the opener restores. With
 /// no listener (no socket could be bound) it finishes all the same: an opener then waits.
 ///
+/// `look` is called at each of the finisher's looks for a takeover, before each batch: nothing
+/// for the app, which passes a no-op; a test's progress.
+///
 /// # Errors
 ///
 /// As [`Owner::finish_unseen_unless`]. A takeover is no failure.
@@ -707,8 +710,10 @@ fn finish_heard<B: Brush, U: Uploads>(
     owner: Owner<B, U>,
     mut listener: Option<takeover::Listener>,
     notify: impl FnOnce(&str, &str),
+    mut look: impl FnMut(),
 ) -> Result<()> {
     let asked = || {
+        look();
         listener
             .as_mut()
             .is_some_and(takeover::Listener::stop_asked)
