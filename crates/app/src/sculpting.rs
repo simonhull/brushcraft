@@ -1506,6 +1506,8 @@ enum Knob {
     /// The futures a stroke over strokes still landing reads can't be had, as if past the share
     /// mid-stroke ([`Placing::Waits`]).
     FuturesFail,
+    /// Every landing fails, as a store error would ([`Sculpting::drop_left`]).
+    LandingFails,
 }
 
 /// What became of a call into the stroke engine on a stroke over strokes still landing
@@ -1646,6 +1648,10 @@ pub(crate) struct Sculpting {
     /// waited ([`Sculpting::may_land`]).
     #[cfg(test)]
     waited_to_land: u64,
+    /// The tokens of the strokes let go behind the oldest, which dropped dabs: given back as it
+    /// ends, its end letting them go ([`Sculpting::end_dropping_later`]); `Some` (empty or not)
+    /// while it is to end so.
+    dropping_later: Option<Vec<ReservedOp>>,
     /// Test knob: how strokes over strokes still landing fail.
     #[cfg(test)]
     knob: Knob,
@@ -1693,6 +1699,7 @@ impl Sculpting {
             route_missed: false,
             #[cfg(test)]
             waited_to_land: 0,
+            dropping_later: None,
             #[cfg(test)]
             knob: Knob::None,
         };
@@ -2629,6 +2636,13 @@ impl Sculpting {
         let batch = dabs.get(..count).unwrap_or(dabs);
         let began = Instant::now();
         let applied = apply_dabs(scene.project.store(), scene.index, &mut self.state, batch);
+        #[cfg(test)]
+        let applied = if self.knob == Knob::LandingFails {
+            // As if the batch failed part way: it landed, but says it didn't.
+            applied.and_then(|_landed| Err(sculpt::FutureError::Unreadable.into()))
+        } else {
+            applied
+        };
         let took = began.elapsed();
         match applied {
             Ok(stats) => {
@@ -2688,8 +2702,9 @@ impl Sculpting {
     /// Drops every dab the oldest stroke has left to apply, those shown with them, and ends its
     /// engine stroke, keeping `error` from `doing` as one that dropped dabs: the stroke is then
     /// over, and [`Sculpting::apply`] ends its op in the same call. Every later stroke goes too
-    /// ([`Sculpting::drop_later`]): it read the surface those dabs were to leave. Returns how many
-    /// of the dabs dropped were shown: theirs are the previews to land ([`Sculpting::land`]).
+    /// ([`Sculpting::take_later`]), let go as that op ends ([`Sculpting::end_dropping_later`]): it
+    /// read the surface those dabs were to leave. Returns how many of the dabs dropped were shown:
+    /// theirs are the previews to land ([`Sculpting::land`]).
     fn drop_left(
         &mut self,
         project: &mut Project,
@@ -2703,28 +2718,31 @@ impl Sculpting {
             front.engine = None;
             shown
         });
-        let later = self.drop_later(project);
+        let (later, tokens) = self.take_later(project);
+        // Given back as the oldest ends, in the same call, its end letting them go with it.
+        self.dropping_later = Some(tokens);
         self.dropped(doing, error);
         shown + later
     }
 
-    /// Lets every stroke after the oldest go, none of its dabs landed: each reserved op is given
-    /// back to `project` ([`Project::drop_stroke_after`], which closes its journal counting every
-    /// dab landed, so a restore never lands them). Returns how many of their dabs were shown,
-    /// which come right after the oldest's among those the previews hold; the display previews
-    /// they showed are let go ([`Sculpting::let_go`]).
-    fn drop_later(&mut self, project: &mut Project) -> usize {
+    /// Takes every stroke after the oldest out, none of its dabs to land: the display previews
+    /// they showed are let go ([`Sculpting::let_go`]). Returns how many of their dabs were shown,
+    /// which come right after the oldest's among those the previews hold, and their reserved ops'
+    /// tokens, each to be given back to the project ([`Project::drop_stroke_after`], which closes
+    /// its journal counting every dab landed, so a restore never lands them).
+    fn take_later(&mut self, project: &mut Project) -> (usize, Vec<ReservedOp>) {
         let later = self.strokes.split_off(self.strokes.len().min(1));
         let ops: Vec<OpId> = later.iter().map(|stroke| stroke.op.id()).collect();
         self.let_go(project, &ops);
         let mut shown = 0;
+        let mut tokens = Vec::with_capacity(later.len());
         for stroke in later {
             shown += stroke.shown();
             if let StrokeOp::Reserved { token, .. } = stroke.op {
-                drop(project.drop_stroke_after(token));
+                tokens.push(token);
             }
         }
-        shown
+        (shown, tokens)
     }
 
     /// Lets go of the display previews of strokes `ops`, dropped with none of their dabs landed
@@ -2805,8 +2823,18 @@ impl Sculpting {
         }
     }
 
-    /// Ends `over`'s op (see [`Sculpting::end`]).
+    /// Ends `over`'s op (see [`Sculpting::end`]). One that dropped dabs ends letting every stroke
+    /// behind it go with it ([`Project::end_stroke_dropping_later`]), and their tokens are given
+    /// back after.
     fn end_op(&mut self, project: &mut Project, over: &Pending) {
+        if let Some(tokens) = self.dropping_later.take() {
+            self.end_dropping_later(project, over);
+            for token in tokens {
+                // Let go already: given back, letting nothing more go.
+                drop(project.drop_stroke_after(token));
+            }
+            return;
+        }
         let Some(recording) = &over.record else {
             self.end_unrecorded(project);
             return;
@@ -2826,6 +2854,30 @@ impl Sculpting {
                 self.end_unrecorded(project);
             }
             Err(error) => self.ended_with(error),
+        }
+    }
+
+    /// Ends `over`'s op, it having dropped dabs, and lets every stroke behind it go in the same
+    /// call, with no tick between: the strokes reserved behind it and those a restore found and
+    /// nobody resumed ([`Project::end_stroke_dropping_later`]). With its record if it has one the
+    /// project takes, else unrecorded.
+    fn end_dropping_later(&mut self, project: &mut Project, over: &Pending) {
+        let recording = over.record.as_ref();
+        let record = recording.and_then(|recording| self.record_of(over.op.id(), recording).ok());
+        let ended = project.end_stroke_dropping_later(record.as_ref());
+        let refused = match ended {
+            Ok(_) => return,
+            Err(error @ (ProjectError::NotTheStroke { .. } | ProjectError::AlreadyRecorded(_))) => {
+                error
+            }
+            Err(error) => {
+                self.ended_with(error);
+                return;
+            }
+        };
+        self.fail("recording the stroke", &refused);
+        if let Err(error) = project.end_stroke_dropping_later(None) {
+            self.ended_with(error);
         }
     }
 
@@ -2855,7 +2907,10 @@ impl Sculpting {
                 let shown = next.shown();
                 self.let_go(scene.project, &[id]);
                 drop(scene.project.drop_stroke_after(given_back));
-                let later = self.drop_later(scene.project);
+                let (later, tokens) = self.take_later(scene.project);
+                for later_token in tokens {
+                    drop(scene.project.drop_stroke_after(later_token));
+                }
                 self.strokes.clear();
                 self.dropped("beginning a stroke's op", &error);
                 self.land(scene, shown + later, false);
@@ -3488,6 +3543,10 @@ impl Brush for Sculpting {
     fn abandon(&mut self) {
         // The project is discarded next, its store with it: a reserved op has nothing to go
         // back to.
+        let let_go = self.dropping_later.take().unwrap_or_default();
+        for token in let_go {
+            token.abandon_with_store_gone();
+        }
         let strokes = std::mem::take(&mut self.strokes);
         for stroke in strokes {
             if let StrokeOp::Reserved { token, .. } = stroke.op {

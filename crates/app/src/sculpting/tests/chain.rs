@@ -760,3 +760,48 @@ fn a_small_stroke_on_a_ridge_taller_than_its_radius_is_shown_on_the_ridge() {
     assert_shown_as_landed(&shown, &before, &records, &landed, "shown");
     assert_shown_as_landed(&part_landed, &before, &records, &landed, "part landed");
 }
+
+#[test]
+fn a_stroke_over_one_that_drops_dabs_goes_with_it() {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.frame(&crossing());
+    let ops = run.ops();
+    let [_, later] = ops.as_slice() else {
+        panic!("two strokes under way: {ops:?}");
+    };
+    let later = *later;
+    run.cut();
+    run.brush.knob = Knob::LandingFails;
+    let failed = run.land_one();
+    assert_eq!(failed.dabs_applied, 0, "the first's landing failed");
+    assert!(run.ops().is_empty(), "both strokes ended");
+    assert!(run.brush.drops() > 0, "dabs dropped");
+    let error = run.brush.error().map(str::to_owned);
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("applying dabs")),
+        "{error:?}"
+    );
+    run.brush.knob = Knob::None;
+    run.cut();
+    let Chain {
+        dir,
+        project,
+        brush,
+        ..
+    } = run;
+    drop(brush);
+    let path = project.recovery_path().expect("a recovery file").to_owned();
+    project.close(true).expect("closed");
+    let batches = batches_at(&path, later);
+    let last = batches.last().expect("the second was journalled");
+    assert!(last.placed() > 0, "{last:?}");
+    assert_eq!(
+        last.landed(),
+        last.placed(),
+        "its journal closes counting every dab landed: a restore lands none"
+    );
+    drop(dir);
+}
