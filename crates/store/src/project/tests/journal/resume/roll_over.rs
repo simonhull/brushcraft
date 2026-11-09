@@ -338,12 +338,18 @@ fn a_roll_over_of_a_stroke_whose_tiles_have_no_shapes_leaves_its_pen_down_unknow
     let mut landing = begin_on_top(&mut project, 30, 91);
     landing.place(&mut project, 30);
     landing.land(&mut project, &mut map, 5);
+    assert!(project.open_stroke_restorable(), "before the roll-over");
     let points = fail_and_roll_over(&mut project);
     assert_eq!(points.len(), 1, "no pen-down cut: {points:?}");
     assert_eq!(
         project.store().open_pen_down(),
         Some(PenDownPoint::Known(PenDown::Unknown)),
         "unknown"
+    );
+    assert!(project.protection().is_active(), "rolled over quietly");
+    assert!(
+        !project.open_stroke_restorable(),
+        "its journal can't be restored from the fresh file"
     );
     project.close(false).unwrap();
 }

@@ -116,8 +116,9 @@
 //! ([`Owner::finish_unseen_unless`]): it lands in full batches with no frames, ticking the project
 //! between them so a kill loses about a second, writes the save, and removes the recovery file. A
 //! failure keeps the recovery file and is said in a desktop notification. That needs a brush that
-//! journals its dabs ([`Brush::journals`]) and a recovery file that guards the work; otherwise, or
-//! after Cancel, the window waits for the save as for any.
+//! journals its dabs ([`Brush::journals`]) and a recovery file that guards the work, the open
+//! stroke's journal among it ([`Project::open_stroke_restorable`]); otherwise, or after Cancel, the
+//! window waits for the save as for any.
 //!
 //! **A finisher can be asked to stop** ([`Owner::finish_unseen_unless`]): reopening the project
 //! takes over from it ([`crate::takeover`]). Before each batch, its recovery writer just tended, it
@@ -3779,13 +3780,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Whether a durable journal would keep everything the save holds, as far as the frame loop
     /// knows: crash protection is running, no flush has failed or fallen short since the last
-    /// save, and the brush has placed every pen event the save holds as dabs. A stroke waiting
-    /// behind the one landing is raw pen samples ([`Brush::unplaced_for_save`]), which no journal
-    /// holds until they are placed; with crash protection paused, or a flush failed or short,
-    /// the journal can't be trusted to keep what a failure would leave.
+    /// save, the open stroke's pen-down surface is (or will be) in a save point
+    /// ([`Project::open_stroke_restorable`]), and the brush has placed every pen event the save
+    /// holds as dabs. A stroke waiting behind the one landing is raw pen samples
+    /// ([`Brush::unplaced_for_save`]), which no journal holds until they are placed; with crash
+    /// protection paused, or a flush failed or short, the journal can't be trusted to keep what a
+    /// failure would leave; and a journal whose pen-down is unknown restores nothing, which not
+    /// every way there reports (a cut failing as the stroke began, a roll-over that couldn't
+    /// carry it), so [`Project::flushed`] alone can't say it.
     fn journal_holds_it(&self) -> bool {
         let guarded = self.project.protection().is_active() && self.exposed.is_none();
-        guarded && self.brush.unplaced_for_save() == 0
+        guarded && self.project.open_stroke_restorable() && self.brush.unplaced_for_save() == 0
     }
 
     /// Asks the project at `now` for a flush of every edit and every dab journalled so far, so the
@@ -3812,8 +3817,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// flight, so whatever else edits the project meanwhile (a store job, say) is taken too.
     ///
     /// If the journal stops holding everything the save does ([`Owner::journal_holds_it`]:
-    /// protection paused, a flush failed or short, a pen event not placed), the save goes on in
-    /// the window instead, landing and then writing as any, and the window waits for it.
+    /// protection paused, a flush failed or short, the pen-down unknown, a pen event not placed),
+    /// the save goes on in the window instead, landing and then writing as any, and the window
+    /// waits for it.
     fn journal_step(&mut self, unseen: Unseen) -> SaveStep {
         if unseen == Unseen::Asked {
             return SaveStep::Idle;

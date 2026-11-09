@@ -1239,6 +1239,18 @@ impl Project {
         }
     }
 
+    /// Makes the recovery writer's next flush fail as it takes its cut, on the calling thread
+    /// before anything is written, as an append of its stroke records failing would: the flush is
+    /// abandoned and its edits wait for the next trigger. A stroke beginning then finds its
+    /// pen-down surface in no save point, and nothing reports it ([`Project::begin_stroke`]). For
+    /// other crates' tests, through the `test-hooks` feature; nothing with no writer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_cut(&self) {
+        if let Some(writer) = &self.writer {
+            writer.fail_cuts(1);
+        }
+    }
+
     /// Whether the open stroke may land, edit the store: its pen-down flush has taken its cut (see
     /// [`Project::begin_stroke`]). While it may not, the app places, journals and shows its
     /// dabs ahead, but applies none; the frame loop's [`Project::tick`] and [`Project::poll`] drive
@@ -1250,6 +1262,21 @@ impl Project {
     #[must_use]
     pub fn may_land(&self) -> bool {
         self.store.may_land()
+    }
+
+    /// Whether a crash now would leave the open stroke restorable from the recovery file, as far as
+    /// its pen-down surface goes: true with no stroke open, or with its pen-down surface in a save
+    /// point ([`PenDown::Base`] or [`PenDown::At`]) or still to be cut by a flush pending; false
+    /// once it is [`PenDown::Unknown`], which no later flush mends (see [`crate::DabBatch`]).
+    ///
+    /// Not every way there is reported: a cut failing as [`Project::begin_stroke`] begins the
+    /// stroke is dropped (the stroke begins all the same), and a roll-over that can't carry the
+    /// stroke goes through quietly. A close that would let the window go on the journal asks
+    /// this, with [`Project::flushed`]: a durable journal of an unknown pen-down restores
+    /// nothing.
+    #[must_use]
+    pub fn open_stroke_restorable(&self) -> bool {
+        self.store.open_stroke_restorable()
     }
 
     /// Blocks until the open stroke may land ([`Project::may_land`]): the flush in flight is
@@ -1611,6 +1638,9 @@ impl Project {
     /// failed (the next call rolls over); false again after any edit or row made since, until a
     /// flush holds it. Reads state only: the app calls [`Project::poll`] between checks to move
     /// the flush on.
+    ///
+    /// Durable isn't usable: rows of an open stroke whose pen-down is unknown are durable, and a
+    /// restore can't land them ([`Project::open_stroke_restorable`] says which).
     #[must_use]
     pub fn flushed(&self) -> bool {
         self.paused.is_none()

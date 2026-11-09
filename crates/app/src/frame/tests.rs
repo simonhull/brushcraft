@@ -3156,6 +3156,46 @@ fn save_while_landing_with_protection_paused_waits_in_the_window() {
     assert!(!owner.unsaved(), "and saved");
 }
 
+/// With the open stroke's pen-down surface in no save point, a durable journal restores nothing:
+/// the window waits for the save, even though nothing reported the cut that failed.
+#[test]
+fn save_while_landing_with_the_pen_down_unknown_waits_in_the_window() {
+    let dir = TestDir::new();
+    let mut owner = journalled_owner(&dir, 3);
+    let project = &mut owner.project;
+    // Edits waiting, the writer idle: the next stroke's cut starts a flush, which fails as it
+    // cuts, and the stroke begins all the same, unreported.
+    let began = Instant::now();
+    while !project.flushed() {
+        project.request_flush(Instant::now()).expect("asked");
+        project.poll().expect("polled");
+        assert!(began.elapsed() < Duration::from_secs(60), "the flushes end");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    project.begin_stroke_and_wait().expect("begun");
+    let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST).expect("a level"), 0, 0)
+        .expect("a tile");
+    project
+        .store()
+        .edit_tile(key, |edit| edit.set(2, 2, Vec3::new(0.0, 0.0, 0.01)))
+        .expect("edited")
+        .expect("in range");
+    project.store().close_epoch().expect("closed");
+    project.fail_next_cut();
+    project.begin_stroke().expect("begun");
+    assert!(
+        project.protection().is_active() && owner.exposed.is_none(),
+        "nothing said so"
+    );
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    assert_eq!(
+        until_asked(&mut owner),
+        Some(WindowRequest::Exit),
+        "never Finish"
+    );
+    assert_eq!(owner.landing(), 0, "it landed in the window");
+}
+
 /// Cancel during the journal's wait is Cancel as ever: the window stays, and the save goes on in
 /// it, harmless.
 #[test]

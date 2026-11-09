@@ -587,6 +587,16 @@ impl TileStore {
             .is_none_or(|journal| journal.pen_down != PenDownPoint::Next)
     }
 
+    /// Whether a restore could go on with the open stroke, as far as its pen-down surface goes:
+    /// true with no stroke open, or with its pen-down in a save point or still to settle; false
+    /// once it is unknown, which it stays (see [`crate::Project::open_stroke_restorable`]).
+    pub(crate) fn open_stroke_restorable(&self) -> bool {
+        self.journals
+            .open
+            .as_ref()
+            .is_none_or(|journal| journal.pen_down != PenDownPoint::Known(PenDown::Unknown))
+    }
+
     /// Whether the open stroke made as `op` waits for its pen-down flush's cut before it may land
     /// ([`TileStore::may_land`]): an edit of `op` now would be a bug.
     pub(super) fn waits_to_land(&self, op: OpId) -> bool {

@@ -431,6 +431,78 @@ fn a_stroke_whose_pen_down_flush_is_abandoned_names_none() {
 }
 
 #[test]
+fn a_cut_failing_as_a_stroke_begins_leaves_it_unrestorable_and_says_so_only_there() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    assert!(project.open_stroke_restorable(), "no stroke open");
+    let mesh = project.store().working().mesh();
+    // Edits waiting, the writer idle: the stroke's cut starts a flush, which fails as it cuts.
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 69));
+    project.fail_next_cut();
+    let mut stroke = Stroke::begin(&mut project, 20, 70);
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Known(PenDown::Unknown)),
+        "no save point holds it"
+    );
+    assert!(project.may_land(), "it lands all the same");
+    assert!(
+        !project.open_stroke_restorable(),
+        "a durable journal of it would restore nothing"
+    );
+    // Nothing else says so: the next flush cuts and holds every edit.
+    stroke.place(&mut project, 5);
+    stroke.land(&mut project, &mut map, 5);
+    project.finish_flushes().unwrap();
+    project.poll().unwrap();
+    assert!(project.protection().is_active(), "protection runs");
+    assert!(project.flushed(), "everything durable");
+    assert!(!project.open_stroke_restorable(), "and still unrestorable");
+    project.end_unrecorded_stroke().unwrap();
+    assert!(project.open_stroke_restorable(), "no stroke open again");
+    project.close(false).unwrap();
+}
+
+#[test]
+fn a_stroke_waiting_for_its_cut_or_its_flush_is_restorable() {
+    let dir = TestDir::new();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mesh = project.store().working().mesh();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 71));
+    hold_in_tile_sync(&mut project);
+    Stroke::begin(&mut project, 20, 72);
+    assert!(
+        matches!(
+            project.store().open_pen_down(),
+            Some(PenDownPoint::Flush(_))
+        ),
+        "the flush in flight holds it"
+    );
+    assert!(project.open_stroke_restorable(), "once that is durable");
+    project.end_unrecorded_stroke().unwrap();
+    apply(project.store(), &mut map, &random_edits(&mesh, TOP, 20, 73));
+    Stroke::begin(&mut project, 20, 74);
+    assert_eq!(
+        project.store().open_pen_down(),
+        Some(PenDownPoint::Next),
+        "the flush queued holds it"
+    );
+    assert!(project.open_stroke_restorable(), "once that is cut");
+    release_syncs(&mut project);
+    assert!(
+        matches!(
+            project.store().open_pen_down(),
+            Some(PenDownPoint::Known(PenDown::At(_)))
+        ),
+        "settled in a save point"
+    );
+    assert!(project.open_stroke_restorable(), "and so restorable");
+    project.close(false).unwrap();
+}
+
+#[test]
 fn a_flush_failing_while_the_next_stroke_waits_leaves_no_gap_or_overlap() {
     for fail in ["save point", "batch encode"] {
         let dir = TestDir::new();

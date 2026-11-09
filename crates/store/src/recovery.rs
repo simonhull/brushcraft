@@ -294,6 +294,9 @@ struct Hooks {
     /// Encodes of dab batches still to fail, counting down, as [`Hooks::failing_encodes`] for
     /// tiles.
     failing_batch_encodes: std::sync::atomic::AtomicUsize,
+    /// Flushes still to fail as they take their cut, counting down: each fails on the owner
+    /// thread before anything is written, as an append of its stroke records failing would.
+    failing_cuts: std::sync::atomic::AtomicUsize,
     /// Bytes of snapshot copies handed to the writer thread and not yet dropped by it.
     in_flight: std::sync::atomic::AtomicUsize,
     /// The most [`Hooks::in_flight`] has been.
@@ -334,6 +337,11 @@ impl Hooks {
     /// Whether this batch's encode is to fail, counting it down.
     fn batch_encode_fails(&self) -> bool {
         count_down(&self.failing_batch_encodes)
+    }
+
+    /// Whether this flush's cut is to fail, counting it down.
+    fn cut_fails(&self) -> bool {
+        count_down(&self.failing_cuts)
     }
 
     /// The bytes `snapshots` hold: their slots' copies.
@@ -590,6 +598,14 @@ impl RecoveryWriter {
         Ok(PenDownPoint::Next)
     }
 
+    /// Makes the next `fail` flushes fail as they take their cut, on the owner thread before
+    /// anything is written, as an append of their stroke records failing would: the flush is
+    /// abandoned, its edits left for the next trigger, and the writer stays usable.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_cuts(&self, fail: usize) {
+        self.hooks.failing_cuts.store(fail, Ordering::SeqCst);
+    }
+
     /// Holds the writer thread back before its syncs, as the tests' `pause_syncs` does,
     /// until a stroke waits for its cut ([`RecoveryWriter::wait_for_cut`]), which lets it go.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -779,6 +795,12 @@ impl RecoveryWriter {
         let snapshot = store
             .snapshot_dirty(self.consumer, &mut self.skipped)
             .and_then(|snapshots| {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if self.hooks.cut_fails() {
+                    return Err(CacheError::WriteBack(FileError::Io(io::Error::other(
+                        "a failing cut, for a test",
+                    ))));
+                }
                 // The journal as of the snapshot, so its landed count is the snapshot's; the
                 // bounds of the snapshot's state, at the same cut; and the records of the strokes
                 // it ends.
