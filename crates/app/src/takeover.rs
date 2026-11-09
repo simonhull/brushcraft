@@ -52,6 +52,12 @@
 //!   open restores the recovery file as after any crash.
 //! - *Garbage or a second `stop`:* garbage is dropped unanswered; another `stop` is one more asker
 //!   answered. Neither changes what the finisher does.
+//! - *The project file replaced while a finisher holds the locks:* the socket is named by the
+//!   file's inode, so a save that wrote a new file in its place (a new inode) would leave the
+//!   finisher listening under the old name, and an opener would find no socket under the new one
+//!   and show "`<name>` is open elsewhere" until the finisher exits. Saves append to the project
+//!   file in place today, so its inode stays; a save that replaces the file must rename the socket
+//!   with it.
 //!
 //! Elsewhere than Linux there is no socket yet: the opener goes straight to the waiting bar.
 

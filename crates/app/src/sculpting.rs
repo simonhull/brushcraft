@@ -133,6 +133,10 @@
 //!   loop's ticks and polls drive the flushes ([`Project::tick`]), so it may land within the flush
 //!   in flight's syncs, and lands then. A close's or a save's landing, which has no frames to wait
 //!   for, waits for the cut ([`Project::wait_to_land`]).
+//! - **The op begins at the `Down`,** before any dab is placed: a stroke that places no dab (a tap
+//!   off the brush's reach, say) still records an op, with no edits. And [`Project::begin_stroke`]
+//!   may roll the recovery file over then, if its writer failed since the last call: the `Down`
+//!   takes that roll-over's time.
 //!
 //! # A stroke a restore found
 //!
@@ -2147,7 +2151,8 @@ impl Sculpting {
 /// It blocks the thread for the whole landing, the window's event loop included, with no frames
 /// and in full batches: a copy is saved in one call that holds the thread anyway (the bar says
 /// "Saving" first), the landing is at most a stroke's backlog, and a copy that lacked the stroke
-/// would lose work the user asked to keep.
+/// would lose work the user asked to keep. The window is frozen meanwhile, for minutes with a
+/// large backlog at scripted rates; accepted for now.
 ///
 /// Returns what became of it: [`LastStroke::Whole`] if there was none or it landed, and
 /// [`LastStroke::Unfinished`] if it can't be (a journal the project can't use, rows of another
