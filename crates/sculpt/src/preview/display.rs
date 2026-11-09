@@ -45,6 +45,14 @@
 //! dabs of every stroke shown, larger than its own: each plane's final step is then bounded from
 //! its scale before any of them lands, every stroke's dabs over it growing it.
 //!
+//! A display preview that stays an earlier stroke's while a later stroke's dabs reach a finest tile
+//! under it (the later one's futures not in yet) doesn't draw them: they are **pending**
+//! ([`DisplayState::pend`]). The finest result is then the earlier strokes' result `F''`, which the
+//! bound above takes, moved by the later dabs: each moves a place at most its strength, and the
+//! dabs over any one place at most the largest overlap of the strokes' dabs. So the bound adds
+//! their strengths summed, capped by that overlap: `|F'(u) − Σλ D(v)| ≤ |F''(u) − Σλ D(v)| +
+//! min(Σ s, max overlap)`.
+//!
 //! # Normals
 //!
 //! A vertex's pen-down normal `n0` is its record's (averaged, the same bits in every tile holding
@@ -87,8 +95,10 @@
 //!   `|M(F₀(u)) − Σλ M(P0(v))| ≤ |M(F₀(u))| + max |M(P0(v))| ≤ 2 max_p |M(p)|`, and `|M(p)|` is at
 //!   most the strengths of the dabs overlapping any one dab (every dab holding `p` overlaps the one
 //!   nearest it): local to the stroke, not its length.
-//! - `max |D(v) − G(v)|` is measured, in `f64`, over every vertex: the rebased vertices' store bits
-//!   against the sum, and every vertex's rounding.
+//! - `max |D(v) − G(v)|` is measured, in `f64`, over every vertex as drawn: the rebased vertices'
+//!   store bits against the sum, every vertex's rounding, and a vertex drawn as a later stroke's
+//!   display preview draws it where the two meet (the parent module's "Seams"): `D` is whatever is
+//!   drawn, the derivation holding for any.
 //! - `ε`, the finest work's rounding into its stored corrections, lands on every vertex of a finest
 //!   tile the stroke writes (a plane's scale that grows re-rounds every interior value), quads no
 //!   dab touches included: it is bounded per finest tile the stroke's dabs reach by its planes'
@@ -242,6 +252,9 @@ pub(super) struct DisplayState {
     /// The open stroke whose dabs it shows, made over that stroke's pen-down surface: the newest
     /// whose dabs reach it (the parent module's "Strokes over strokes still landing").
     pub(super) op: Tag,
+    /// The newest later stroke whose dabs reach a finest tile under it while it stays `op`'s,
+    /// and those dabs' strengths summed: what its bound takes for them ([`DisplayState::pend`]).
+    pub(super) later: Option<(Tag, f64)>,
 }
 
 /// Where display vertex `(i, j)` of `key` lies on the finest level `finest`: the finest tile
@@ -671,6 +684,7 @@ impl DisplayState {
             replayed: 0,
             published_held: None,
             op: None,
+            later: None,
         };
         // A dab that misses the tile's box takes nothing: only those near it are walked.
         if let Some(whole) = state.bounds {
@@ -880,10 +894,8 @@ impl DisplayState {
         any
     }
 
-    /// The preview to hand the store: what is drawn, its normals and bound (module notes),
-    /// `held` as given.
-    pub(super) fn publish(&mut self, held: bool, rounding: f64, moves_cap: f64) -> DisplayPreview {
-        // The normals of the vertices a dab turned since the last, made again.
+    /// Makes the normals of the vertices a dab turned since they were last made again.
+    pub(super) fn refresh_normals(&mut self) {
         let vertices = self
             .normals
             .iter_mut()
@@ -894,9 +906,46 @@ impl DisplayState {
                 *normal = (*t1 + *a1).cross(*t2 + *a2).normalized().unwrap_or(n0);
             }
         }
+    }
+
+    /// Vertex `v`'s position as drawn and its normal as last made; `None` past the tile.
+    pub(super) fn vertex(&self, v: usize) -> Option<(Vec3, Vec3)> {
+        Some((*self.drawn.get(v)?, *self.normals.get(v)?))
+    }
+
+    /// Notes a dab of a later stroke, of strength `strength`, reaching a finest tile under it while
+    /// it stays this stroke's (the later stroke's pen-down tile isn't at hand yet): it isn't
+    /// drawn, and the bound takes its whole move (module notes, "A later stroke's").
+    pub(super) fn pend(&mut self, op: Tag, strength: f64) {
+        self.later = Some(match self.later {
+            Some((newest, sum)) => (newest.max(op), sum + strength),
+            None => (op, strength),
+        });
+    }
+
+    /// The preview to hand the store: what is drawn, its normals and bound (module notes),
+    /// `held` as given, with `seams` in place of its own vertices there: each a vertex's index
+    /// and the position and normal a later stroke's preview holding it draws (module notes,
+    /// "Seams"). Its normals are made again first.
+    pub(super) fn publish(
+        &mut self,
+        held: bool,
+        rounding: f64,
+        moves_cap: f64,
+        seams: &[(usize, Vec3, Vec3)],
+    ) -> DisplayPreview {
+        self.refresh_normals();
+        let mut positions = self.drawn.clone();
+        let mut normals = self.normals.clone();
+        for &(v, position, normal) in seams {
+            if let (Some(p), Some(n)) = (positions.get_mut(v), normals.get_mut(v)) {
+                *p = position;
+                *n = normal;
+            }
+        }
         let mut deviation_squared = 0.0_f64;
         let mut largest = 0.0_f64;
-        for (drawn, ideal) in self.drawn.iter().zip(&self.ideal) {
+        for (drawn, ideal) in positions.iter().zip(&self.ideal) {
             let d = wide(*drawn);
             let (dx, dy, dz) = (d[0] - ideal[0], d[1] - ideal[1], d[2] - ideal[2]);
             deviation_squared = deviation_squared.max(dz.mul_add(dz, dx.mul_add(dx, dy * dy)));
@@ -905,7 +954,9 @@ impl DisplayState {
         let deviation = deviation_squared.sqrt();
         // The moves' part: the per-cell sums, or twice the most any place moves, the smaller.
         let terms = self.deepest.min(moves_cap);
-        let sum = (self.pen_down_bound + terms + rounding + deviation) * SLACK
+        // A later stroke's dabs not drawn: the most they move a place, as its whole moves.
+        let later = self.later.map_or(0.0, |(_, sum)| sum.min(moves_cap / 2.0));
+        let sum = (self.pen_down_bound + terms + later + rounding + deviation) * SLACK
             + largest * MAGNITUDE_SLACK;
         #[expect(
             clippy::cast_possible_truncation,
@@ -923,8 +974,8 @@ impl DisplayState {
             f32::MAX
         };
         DisplayPreview {
-            positions: self.drawn.clone(),
-            normals: self.normals.clone(),
+            positions,
+            normals,
             roughness: self.roughness.clone(),
             bound,
             held,

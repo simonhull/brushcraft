@@ -168,6 +168,7 @@ impl Sculpting {
             record: None,
             op: StrokeOp::Begun(op),
             remaining: None,
+            display_reads: None,
             dabs,
             landed,
             sources,

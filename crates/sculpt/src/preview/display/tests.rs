@@ -5,19 +5,24 @@
 //! replaces them exactly; the saved file is that of the dabs applied at once; and the normals
 //! follow the moved surface.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brush::Imprint;
 use geom::{Channel, FaceId, Level, TileKey, Vec3};
-use store::{DisplayPreview, Project, SpatialIndex, TileStore};
+use store::{
+    CacheError, DisplayPreview, OpId, PenDownReading, Project, ReservedOp, SpatialIndex, TileStore,
+};
 use stroke::Dab;
 
 use super::{cell_box, cells_touched, finest_place, quad_box};
 use crate::apply::apply_dabs;
-use crate::preview::tests::{at_once, base, level, open_copy, path, previewed_drawing, run_jobs};
-use crate::preview::{DrawsAll, Preview, WAITING_A_CALL};
+use crate::preview::tests::{
+    at_once, base, finest_tiles, level, open_copy, path, previewed_drawing, run_jobs,
+};
+use crate::preview::{DrawsAll, OpenStrokes, Preview, WAITING_A_CALL};
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab};
+use crate::{Futures, PenDownTiles, StrokeEdits};
 
 /// A renderer drawing display tiles alone.
 fn display_only(key: &TileKey) -> bool {
@@ -1031,5 +1036,139 @@ fn a_preview_held_again_by_a_dab_that_touches_none_of_it_says_so() {
         let shown = store.display_preview(&tile).unwrap();
         assert!(shown.held, "{tile:?} is held and says so");
     }
+    drop(project.close(false));
+}
+
+/// Two strokes' previews, the later reserved behind the earlier.
+///
+/// Over a store holding every future the later's previews read: as the app's strokes, but for the
+/// display previews' futures, which are in only if `displays_ready` (else past the open strokes'
+/// share, say).
+struct Two<'a> {
+    /// The store.
+    store: &'a mut TileStore,
+    /// The spatial index, refitted over the futures.
+    index: &'a SpatialIndex,
+    /// The earlier stroke's op, begun.
+    earlier: OpId,
+    /// The later stroke's, reserved.
+    later: &'a ReservedOp,
+    /// Whether a display preview of the later stroke's may be made.
+    displays_ready: bool,
+}
+
+impl OpenStrokes for Two<'_> {
+    fn current(&mut self) -> (PenDownReading<'_>, &SpatialIndex) {
+        (self.store.read_pen_down(), self.index)
+    }
+
+    fn read(&mut self, op: OpId) -> Result<(PenDownReading<'_>, &SpatialIndex), CacheError> {
+        if op == self.earlier {
+            return Ok(self.current());
+        }
+        Ok((self.store.read_pen_down_of(self.later)?, self.index))
+    }
+
+    fn reserved(&self, op: OpId) -> bool {
+        op == self.later.op()
+    }
+
+    fn ready(&mut self, op: OpId, _dabs: &[Dab], _tiles: &[TileKey], displays: &[TileKey]) -> bool {
+        op != self.later.op() || displays.is_empty() || self.displays_ready
+    }
+}
+
+#[test]
+fn a_later_strokes_display_previews_wait_for_their_futures_and_drop_no_earlier_work() {
+    // A ridge still to land, and a small stroke along its crest, reserved behind it, its finest
+    // futures installed: the display previews over the ridge stay the ridge's until the small
+    // stroke's can be made, bounding its dabs, then become its own.
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "waits");
+    let earlier = project.begin_stroke_and_wait().unwrap();
+    let ridge_dabs = ridge(project.store(), 24);
+    let mut state = Stroke::new(project.store());
+    let all: BTreeSet<TileKey> = finest_tiles(project.store()).into_iter().collect();
+    let mut edits = StrokeEdits::new(earlier, None);
+    {
+        let store = project.store();
+        let pen_down = PenDownTiles::of_oldest(store, earlier, &all).unwrap();
+        edits.place(store, &ridge_dabs, &pen_down).unwrap();
+        edits.seal();
+    }
+    let later = project.begin_stroke_after().unwrap();
+    {
+        let store = project.store();
+        let futures = Futures::new(store, &state, &[&edits]).unwrap();
+        for &key in &all {
+            let future = futures.future_of(store, key).unwrap();
+            store
+                .install_pen_down_of(&later, key, future, Some(earlier))
+                .unwrap();
+        }
+    }
+    let keys: Vec<TileKey> = all.iter().copied().collect();
+    index.refit(project.store(), &keys).unwrap();
+    // Along the crest, as the ridge will leave it.
+    let crest: Vec<Dab> = {
+        let mut reading = project.store().read_pen_down_of(&later).unwrap();
+        (0..8_u32)
+            .map(|n| {
+                let tile = u16::from(n >= 4);
+                let key = TileKey::displacement(FaceId::new(0), level(), tile, 0).unwrap();
+                let (i, j) = ((n * 12 + 6) % 64, 64);
+                let at = usize::try_from(j * 65 + i).unwrap();
+                let centre = reading.pen_down_positions(key).unwrap()[at];
+                dab(centre, 0.03, 0.004, 0.0, 100 + n)
+            })
+            .collect()
+    };
+    let mut preview = Preview::new();
+    let mut two = Two {
+        store: project.store(),
+        index: &index,
+        earlier,
+        later: &later,
+        displays_ready: false,
+    };
+    preview
+        .show_over(&mut two, earlier, &ridge_dabs, &DrawsAll)
+        .unwrap();
+    let ridge_shown = previews(two.store);
+    let shown = preview
+        .show_over(&mut two, later.op(), &crest, &DrawsAll)
+        .unwrap();
+    assert_eq!(shown.dabs, crest.len(), "its finest futures are in: shown");
+    let waiting = previews(two.store);
+    let dropped = ridge_shown.keys().filter(|key| !waiting.contains_key(key));
+    let dropped: Vec<&TileKey> = dropped.collect();
+    assert!(dropped.is_empty(), "the ridge's previews stay: {dropped:?}");
+    let pending = ridge_shown.iter().filter(|(key, was)| {
+        waiting
+            .get(key)
+            .is_some_and(|now| now.positions == was.positions && now.bound > was.bound)
+    });
+    assert!(
+        pending.count() > 0,
+        "drawn as the ridge's, the small stroke's dabs pending in their bounds"
+    );
+    two.displays_ready = true;
+    preview.take_over_displays(&mut two, &DrawsAll).unwrap();
+    let taken = previews(two.store);
+    let changed = taken
+        .iter()
+        .filter(|(key, made)| waiting.get(key) != Some(made));
+    assert!(changed.count() > 0, "taken over once its futures are in");
+    // Both land, one after the other.
+    apply_dabs(project.store(), &mut index, &mut state, &ridge_dabs).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    project.begin_reserved_stroke(later).unwrap();
+    project.wait_to_land().unwrap();
+    apply_dabs(project.store(), &mut index, &mut state, &crest).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    let store = project.store();
+    assert_bounds(store, &waiting, "waiting for its futures");
+    assert_bounds(store, &taken, "taken over");
     drop(project.close(false));
 }

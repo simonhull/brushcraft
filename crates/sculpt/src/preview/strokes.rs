@@ -34,12 +34,17 @@ pub trait OpenStrokes {
     fn reserved(&self, op: OpId) -> bool;
 
     /// Installs, for reserved stroke `op`, the future of every tile the strokes before it still
-    /// change that a preview of its dabs reads (none for an op begun): the finest tiles within
-    /// the spheres of `dabs` (as the spatial index finds them once refitted over the futures) and
-    /// in their rings, and the finest tiles a display preview of each of `displays` reads (every
-    /// tile under it, and around those). Returns whether they all are installed: if not, the
-    /// preview leaves those dabs or display tiles for later.
-    fn ready(&mut self, op: OpId, dabs: &[Dab], displays: &[TileKey]) -> bool;
+    /// change that a preview of its reads (none for an op begun): the finest tiles within the
+    /// spheres of `dabs` (as the spatial index finds them once refitted over the futures) and in
+    /// their rings, those in the blocks of finest tiles `tiles` (each tile and its ring), and the
+    /// finest tiles a display preview of each of `displays` reads (every tile under it, and
+    /// around those). Returns whether they all are installed: if not, the preview leaves those
+    /// dabs, tiles or display tiles for later.
+    ///
+    /// It may install at most a share of them a call, the rest in the calls after (and return
+    /// `false` until it has): what a call costs is then bounded, whatever an earlier stroke's
+    /// backlog.
+    fn ready(&mut self, op: OpId, dabs: &[Dab], tiles: &[TileKey], displays: &[TileKey]) -> bool;
 }
 
 /// One stroke shown alone, the store's current one: what [`Preview::show`](super::Preview::show)
@@ -65,7 +70,13 @@ impl OpenStrokes for Lone<'_> {
         false
     }
 
-    fn ready(&mut self, _op: OpId, _dabs: &[Dab], _displays: &[TileKey]) -> bool {
+    fn ready(
+        &mut self,
+        _op: OpId,
+        _dabs: &[Dab],
+        _tiles: &[TileKey],
+        _displays: &[TileKey],
+    ) -> bool {
         true
     }
 }

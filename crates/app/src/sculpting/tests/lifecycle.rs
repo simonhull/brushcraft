@@ -337,6 +337,7 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting, op: OpId) -> Pending {
         }),
         op: StrokeOp::Begun(op),
         remaining: None,
+        display_reads: None,
         landed: 0,
         dabs: VecDeque::from([Dab::default()]),
         sources: VecDeque::new(),

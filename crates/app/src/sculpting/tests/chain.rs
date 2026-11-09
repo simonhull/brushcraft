@@ -423,6 +423,9 @@ struct Previews {
     finest: BTreeMap<TileKey, Vec<Vec3>>,
     /// Each display preview.
     display: BTreeMap<TileKey, DisplayPreview>,
+    /// Where two previews holding the same vertex draw it differently: each such vertex's place,
+    /// once.
+    cracks: Vec<String>,
 }
 
 impl Previews {
@@ -441,8 +444,89 @@ impl Previews {
             Some((key, preview.clone()))
         });
         let display: BTreeMap<TileKey, DisplayPreview> = display.collect();
-        Self { finest, display }
+        let cracks = cracks(store);
+        Self {
+            finest,
+            display,
+            cracks,
+        }
     }
+}
+
+/// A source answering each vertex with its own place (face, column, row) as exact small floats:
+/// a gather from it says which vertex each slot of a block holds.
+struct Places;
+
+impl geom::PositionSource for Places {
+    fn position(&self, face: geom::FaceId, _level: Level, i: u32, j: u32) -> Option<Vec3> {
+        let exact = |n: u32| u16::try_from(n).ok().map(f32::from);
+        Some(Vec3::new(exact(face.index())?, exact(i)?, exact(j)?))
+    }
+}
+
+/// Every point a gathered block holds, in order: its positions with the ring, then each corner
+/// ring's edges and diagonals.
+fn points(block: &geom::GatheredBlock) -> Vec<Vec3> {
+    let rings = (0..4).filter_map(|c| block.corner(c));
+    let ring_points = rings.flat_map(|ring| ring.edges().iter().chain(ring.diagonals()));
+    let all = block.padded().iter().chain(ring_points);
+    all.copied().collect()
+}
+
+/// The vertices two previews in `store` hold and draw differently, bit for bit.
+///
+/// Positions, and for display previews normals: a finest preview's every point, ring included,
+/// against every other's; a display preview's own vertices against the other display previews'
+/// at its level.
+fn cracks(store: &TileStore) -> Vec<String> {
+    let mesh = store.mesh();
+    let mut seen: BTreeMap<(u8, [u32; 3]), [u32; 6]> = BTreeMap::new();
+    let mut cracks = Vec::new();
+    let mut note = |level: u8, place: Vec3, bits: [u32; 6], what: &TileKey| {
+        if place.x.is_nan() || bits.iter().take(3).all(|b| f32::from_bits(*b).is_nan()) {
+            return;
+        }
+        let at = [place.x.to_bits(), place.y.to_bits(), place.z.to_bits()];
+        match seen.get(&(level, at)) {
+            Some(was) if *was != bits => cracks.push(format!("{what:?} at {place:?}")),
+            Some(_) => {}
+            None => {
+                seen.insert((level, at), bits);
+            }
+        }
+    };
+    let bits_of = |p: Vec3, n: Vec3| {
+        [
+            p.x.to_bits(),
+            p.y.to_bits(),
+            p.z.to_bits(),
+            n.x.to_bits(),
+            n.y.to_bits(),
+            n.z.to_bits(),
+        ]
+    };
+    for key in store.previewed() {
+        let block = store.preview(key).expect("previewed");
+        let places = geom::gather_block(mesh, &Places, geom::Region::of_tile(key)).expect("places");
+        let pairs = points(&places).into_iter().zip(points(block));
+        for (place, point) in pairs {
+            note(key.level().get(), place, bits_of(point, Vec3::ZERO), key);
+        }
+    }
+    for key in store.display_previewed() {
+        let preview = store.display_preview(key).expect("previewed");
+        let places = geom::gather_block(mesh, &Places, geom::Region::of_tile(key)).expect("places");
+        let side = key.side();
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        for (i, j) in grid {
+            let v = usize::try_from(j * side + i).expect("a vertex");
+            let place = places.get(i64::from(i), i64::from(j));
+            let bits = bits_of(preview.positions[v], preview.normals[v]);
+            // Display levels apart from the finest: offset past it.
+            note(100 + key.level().get(), place, bits, key);
+        }
+    }
+    cracks
 }
 
 /// `bits` as positions.
@@ -614,12 +698,16 @@ fn record_errors(
 /// how far the strokes moved the tiles shown), and a display preview lies within its bound of
 /// every finest vertex under it.
 ///
-/// A display preview's bound is loose on these coarse tiles, so its vertices are held closer:
-/// each within twice its record's error before the strokes (`records`) of the finest vertex it
-/// subsamples, and the encoding. A vertex drawn from its record is weighed where the record has
-/// it, and moves as the finest vertex does but for the slope of the dabs over that error; a
-/// stroke's dabs weighed elsewhere, or left out, put it a dab's move away. `before` is every tile
-/// before the strokes.
+/// A display preview's bound, derived and asserted above, is loose on these coarse tiles, so its
+/// vertices are also held closer: each within twice its record's error before the strokes
+/// (`records`) of the finest vertex it subsamples, plus a thousandth of how far the strokes moved.
+/// That tolerance is empirical, not derived: a vertex drawn from its record is weighed where the
+/// record has it, and its moves differ from the finest vertex's by the dabs' slopes over that
+/// error, which no term here bounds; measured, it stays under the record's error, where a
+/// stroke's dabs weighed on another stroke's surface, or left out, put a vertex a dab's move away
+/// (five to a hundred times further). It is a check that the previews show the right dabs, the
+/// bound the one that is guaranteed. `before` is every tile before the strokes; every preview
+/// also meets every other bit for bit.
 fn assert_shown_as_landed(
     shown: &Previews,
     before: &BTreeMap<TileKey, Vec<[u32; 3]>>,
@@ -629,6 +717,12 @@ fn assert_shown_as_landed(
 ) {
     assert!(!shown.finest.is_empty(), "{what}: finest previews");
     assert!(!shown.display.is_empty(), "{what}: display previews");
+    assert!(
+        shown.cracks.is_empty(),
+        "{what}: previews meet bit for bit, but not at {} vertices: {:?}",
+        shown.cracks.len(),
+        shown.cracks.first()
+    );
     let landed: BTreeMap<TileKey, Vec<Vec3>> = landed
         .iter()
         .map(|(key, bits)| (*key, from_bits(bits)))

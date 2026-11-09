@@ -176,9 +176,14 @@
 //!   they hold the earlier strokes' work exactly and stay as it lands. The futures they read are
 //!   installed first ([`Open`], [`sculpt::OpenStrokes::ready`]): those about each dab's sphere and
 //!   in the rings there ([`needed`]), and for a display preview every tile the earlier strokes
-//!   change under it and around those ([`under_displays`]). A dab whose futures can't be had stays
-//!   unshown until they can be, or its op begins. The previews end with the last stroke; a later
-//!   stroke dropped unlanded has its display previews let go ([`Sculpting::let_go`]).
+//!   change under it and around those ([`display_reads`]), at most [`FUTURES_TIME`] of them a call,
+//!   the rest in the calls after. A dab whose finest futures (and those of the earlier strokes'
+//!   finest previews its own take over, so previews of two strokes never meet) can't be had stays
+//!   unshown until they can be, or its op begins; a display preview whose futures aren't in yet
+//!   stays the earlier stroke's, the new dabs pending in its bound, and is made the later stroke's
+//!   off the pen's path ([`Brush::prepare`], [`Preview::take_over_displays`]). The previews end
+//!   with the last stroke; a later stroke dropped unlanded has its display previews let go
+//!   ([`Sculpting::let_go`]).
 //! - **Landing in order:** the catch-up lands the oldest stroke only. As it ends, the next's op
 //!   begins ([`Project::begin_reserved_stroke`]), its futures its own pen-down shapes now, and its
 //!   first landing waits for its pen-down cut as any stroke's ([`Project::may_land`]). A close, a
@@ -1243,33 +1248,70 @@ fn on_futures<T>(
     Err(OnFutures::Futures)
 }
 
-/// The tiles the strokes `earlier` still change that a later stroke's display preview of each of
-/// `displays` reads.
+/// Per display tile, the tiles the strokes before a reserved stroke still change that its display
+/// preview there reads ([`display_reads`]).
+type DisplayReads = BTreeMap<TileKey, BTreeSet<TileKey>>;
+
+/// How long the previews of one call may spend installing futures for a reserved stroke.
 ///
-/// Every one whose ring (its normal inputs, itself included) holds a finest tile under one of
-/// them: the tiles under them and around those, as neighbourhood goes both ways. A tile whose ring
-/// can't be listed counts.
-fn under_displays(
-    store: &TileStore,
-    earlier: &[Pending],
-    displays: &[TileKey],
-) -> BTreeSet<TileKey> {
-    if displays.is_empty() {
-        return BTreeSet::new();
+/// [`Open`]'s [`OpenStrokes::ready`]: what they need past that is installed by the calls after,
+/// so a display preview over much of an earlier stroke never holds a frame for its backlog. A
+/// future costs about what landing the tile costs: a fraction of a millisecond for a tile few
+/// dabs reach, several for one under many.
+const FUTURES_TIME: Duration = Duration::from_millis(2);
+
+/// How many futures [`Open`]'s [`OpenStrokes::ready`] installs between looks at the clock.
+const FUTURES_A_LOOK: usize = 4;
+
+/// What one call's previews may still spend installing futures ([`FUTURES_TIME`]).
+#[derive(Debug, Clone, Copy)]
+struct Installing {
+    /// When its time is up.
+    until: Instant,
+    /// Whether it has installed any: the first futures of a call are always installed, so the
+    /// calls make progress however dear one is.
+    any: bool,
+}
+
+impl Installing {
+    /// A call's, its time from now.
+    fn new() -> Self {
+        Self {
+            until: Instant::now() + FUTURES_TIME,
+            any: false,
+        }
     }
-    let displays: BTreeSet<TileKey> = displays.iter().copied().collect();
+
+    /// Whether it may install more: always its first, then until its time is up.
+    fn more(&self) -> bool {
+        !self.any || Instant::now() < self.until
+    }
+}
+
+/// Per display tile, the tiles the strokes `earlier` still change that a later stroke's display
+/// preview of it reads.
+///
+/// Every one whose ring (its normal inputs, itself included) holds a finest tile under it: the
+/// tiles under it and around those, as neighbourhood goes both ways. A tile whose ring can't be
+/// listed is left out, its future made when a finest preview reads it. Made once a stroke: what
+/// the strokes before it change is set by then (their pens are up), and only shrinks as they land,
+/// the future of a tile landed being the tile itself.
+fn display_reads(store: &TileStore, earlier: &[Pending]) -> DisplayReads {
     let kept = earlier
         .iter()
         .filter_map(|stroke| stroke.remaining.as_ref());
     let changed = kept.flat_map(|remaining| remaining.reach.keys());
-    let read = changed.filter(|key| {
-        store.normal_inputs(key).map_or(true, |ring| {
-            ring.iter().any(|input| {
-                sculpt::display_ancestors(input).any(|above| displays.contains(&above))
-            })
-        })
-    });
-    read.copied().collect()
+    let mut reads = DisplayReads::new();
+    for key in changed {
+        let Ok(ring) = store.normal_inputs(key) else {
+            continue;
+        };
+        let above = ring.iter().flat_map(sculpt::display_ancestors);
+        for display in above {
+            reads.entry(display).or_default().insert(*key);
+        }
+    }
+    reads
 }
 
 /// The strokes under way as the previews read them ([`OpenStrokes`]).
@@ -1286,6 +1328,8 @@ struct Open<'a> {
     strokes: &'a mut [Pending],
     /// The session's stroke state, which the futures are made from.
     state: &'a sculpt::Stroke,
+    /// What the call may still spend installing futures ([`FUTURES_TIME`]).
+    installing: Installing,
 }
 
 impl OpenStrokes for Open<'_> {
@@ -1311,7 +1355,7 @@ impl OpenStrokes for Open<'_> {
             .any(|stroke| stroke.op.id() == op && matches!(stroke.op, StrokeOp::Reserved { .. }))
     }
 
-    fn ready(&mut self, op: OpId, dabs: &[Dab], displays: &[TileKey]) -> bool {
+    fn ready(&mut self, op: OpId, dabs: &[Dab], tiles: &[TileKey], displays: &[TileKey]) -> bool {
         let Some(at) = self.strokes.iter().position(|stroke| stroke.op.id() == op) else {
             return false;
         };
@@ -1336,8 +1380,30 @@ impl OpenStrokes for Open<'_> {
         let Ok(mut wanted) = needed(store, self.index, earlier, &reads) else {
             return false;
         };
-        wanted.extend(under_displays(store, earlier, displays));
-        if wanted.is_subset(installed) {
+        // What the blocks of `tiles` read: each tile and its ring.
+        let changed = |key: &TileKey| {
+            let mut kept = earlier
+                .iter()
+                .filter_map(|before| before.remaining.as_ref());
+            kept.any(|remaining| remaining.reach.contains_key(key))
+        };
+        for tile in tiles {
+            let Ok(ring) = store.normal_inputs(tile) else {
+                return false;
+            };
+            wanted.extend(ring.iter().filter(|input| changed(input)));
+        }
+        if !displays.is_empty() {
+            let under = stroke
+                .display_reads
+                .get_or_insert_with(|| display_reads(store, earlier));
+            let read = displays.iter().filter_map(|display| under.get(display));
+            for tiles_read in read {
+                wanted.extend(tiles_read);
+            }
+        }
+        let missing: Vec<TileKey> = wanted.difference(installed).copied().collect();
+        if missing.is_empty() {
             return true;
         }
         let Some(chain) = chain_of(earlier) else {
@@ -1346,16 +1412,27 @@ impl OpenStrokes for Open<'_> {
         let Ok(futures) = Futures::new(store, self.state, &chain) else {
             return false;
         };
-        install(
-            self.project,
-            self.index,
-            &futures,
-            earlier,
-            token,
-            installed,
-            &wanted,
-        )
-        .is_ok()
+        // As many as the call's time allows; the rest in the calls after.
+        for some in missing.chunks(FUTURES_A_LOOK) {
+            if !self.installing.more() {
+                return false;
+            }
+            let now: BTreeSet<TileKey> = some.iter().copied().collect();
+            let installed_now = install(
+                self.project,
+                self.index,
+                &futures,
+                earlier,
+                token,
+                installed,
+                &now,
+            );
+            if installed_now.is_err() {
+                return false;
+            }
+            self.installing.any = true;
+        }
+        true
     }
 }
 
@@ -1377,6 +1454,9 @@ struct Pending {
     /// What a later stroke reads of it while it lands: its remaining dabs' edits and reach, made
     /// once a stroke begins over it (its pen up by then), and kept as it lands.
     remaining: Option<Remaining>,
+    /// While its op is reserved: per display tile, the tiles the strokes before it change that a
+    /// display preview there reads ([`display_reads`]), made once, as it first shows one.
+    display_reads: Option<DisplayReads>,
     /// Its dabs not yet applied, oldest first.
     dabs: VecDeque<Dab>,
     /// How many of its dabs [`apply_dabs`] has applied, in placement order: the last landed count
@@ -2132,6 +2212,7 @@ impl Sculpting {
             }),
             op,
             remaining: None,
+            display_reads: None,
             dabs: VecDeque::new(),
             landed: 0,
             sources: VecDeque::new(),
@@ -2426,6 +2507,7 @@ impl Sculpting {
                 index: &mut *index,
                 strokes: &mut self.strokes,
                 state: &self.state,
+                installing: Installing::new(),
             };
             let shown = preview.show_over(&mut open, op, &dabs, &wanted);
             let count = preview.shown() - before;
@@ -2683,6 +2765,7 @@ impl Sculpting {
                         index: &mut *scene.index,
                         strokes: &mut self.strokes,
                         state: &self.state,
+                        installing: Installing::new(),
                     };
                     if let Err(error) = preview.note_applied_over(&mut open, op, &direct) {
                         self.fail("moving the previews by dabs applied at once", &error);
@@ -2779,6 +2862,7 @@ impl Sculpting {
             index: &mut *scene.index,
             strokes: &mut self.strokes,
             state: &self.state,
+            installing: Installing::new(),
         };
         let mut landed = preview.land_over(&mut open, count, &|key: &TileKey| drawn.draws(key));
         if rebase && landed.is_ok() {
@@ -3432,9 +3516,28 @@ impl Brush for Sculpting {
                 index: &mut *scene.index,
                 strokes: &mut self.strokes,
                 state: &self.state,
+                installing: Installing::new(),
             };
             if let Err(error) = preview.make_waiting_over(&mut open, scene.waiting) {
                 self.fail("making the previews the renderer waits for", &error);
+            }
+        }
+        // The display previews a later stroke's futures weren't in for yet, made its own as they
+        // come: a call's time of futures at a time.
+        if let Some(preview) = &mut self.preview
+            && self.strokes.len() > 1
+        {
+            let drawn = scene.drawn;
+            let mut open = Open {
+                project: &mut *scene.project,
+                index: &mut *scene.index,
+                strokes: &mut self.strokes,
+                state: &self.state,
+                installing: Installing::new(),
+            };
+            let wanted = |key: &TileKey| drawn.draws(key);
+            if let Err(error) = preview.take_over_displays(&mut open, &wanted) {
+                self.fail("making a later stroke's display previews", &error);
             }
         }
         // Ahead of a drawing pen, the ground its next dabs will reach is warmed first, a batch a
