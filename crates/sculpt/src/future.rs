@@ -12,7 +12,9 @@
 //!   ([`StrokeEdits::place`], the tiles brushed on the store's workers, off the pen's path) and
 //!   dropped as they land ([`StrokeEdits::land`]). It depends on the stroke's pen-down shapes alone
 //!   ([`PenDownTiles`]), which don't change while it is open (for a later stroke, they are the
-//!   earlier strokes' futures, whose final surface their landing doesn't change).
+//!   earlier strokes' futures, whose final surface their landing doesn't change). A later stroke
+//!   names the stroke it follows ([`StrokeEdits::after`]) and reads its pen-down once the strokes
+//!   before it are sealed, their pens up ([`StrokeEdits::seal`]); see "A chain" on [`StrokeEdits`].
 //! - [`Futures`], a short borrow of the session's [`Stroke`] and the chain's [`StrokeEdits`]: the
 //!   stroke state's decisions for each stroke's remaining dabs, made from its bookkeeping as it is
 //!   now, and each tile's future from them ([`Futures::future_of`]).
@@ -121,63 +123,175 @@ pub enum FutureError {
     /// mesh).
     #[error("the tile's prediction, corrections or border can't be read")]
     Unreadable,
+    /// The strokes given aren't a chain: the oldest follows a stroke not landed
+    /// ([`StrokeEdits::after`]), a later one doesn't follow the stroke before it, or a stroke's
+    /// dabs are placed on the pen-down of another place in the chain ([`PenDownTiles::after`]).
+    #[error("the strokes given aren't a chain of open strokes")]
+    Chain,
+    /// Dabs are placed in a stroke sealed already ([`StrokeEdits::seal`]): its pen is up.
+    #[error("the stroke is sealed: no more dabs are placed in it")]
+    Sealed,
+    /// A later stroke's pen-down is read on the futures of a stroke still placing dabs: its
+    /// futures would change as it places more ([`StrokeEdits::seal`]).
+    #[error("an earlier stroke isn't sealed: its futures aren't final")]
+    Unsealed,
 }
 
-/// Tiles at a stroke's pen-down: each one's positions, row-major, as the stroke reads them.
+/// Tiles at a stroke's pen-down: each one's positions, row-major, as the stroke reads them, with
+/// the boxes of the tile and of each of its rows.
 ///
 /// What [`StrokeEdits::place`] brushes a stroke's new dabs over: it must hold every tile one of
 /// them touches by its box at the stroke's pen-down (more are harmless; fewer are unsound, a
-/// dab's edits and touches of a tile left out being missed).
+/// dab's edits and touches of a tile left out being missed). A caller keeps one for a stroke and
+/// extends it as the pen moves on ([`PenDownTiles::extend_oldest`],
+/// [`PenDownTiles::extend_futures`]): a stroke's pen-down doesn't change while it is open.
+///
+/// For a later stroke, which tiles a dab touches is a question about the earlier strokes'
+/// futures, not about the surface as stored: take them from the futures' boxes (or the stored
+/// boxes grown by the earlier strokes' largest remaining displacement of each tile), never from
+/// the spatial index's boxes, which hold the tiles as stored and at pen-down. An index query at
+/// a later stroke's dab can miss a tile whose future moved toward it.
 #[derive(Debug, Clone, Default)]
 pub struct PenDownTiles {
-    /// Each tile's positions.
-    tiles: BTreeMap<TileKey, Vec<Vec3>>,
+    /// The op of the stroke whose futures the tiles are, the newest of the chain before the
+    /// stroke they are the pen-down of; `None` for the oldest open stroke's own pen-down.
+    after: Option<OpId>,
+    /// Each tile at pen-down.
+    tiles: BTreeMap<TileKey, KeptTile>,
+}
+
+/// One tile of [`PenDownTiles`].
+#[derive(Debug, Clone)]
+struct KeptTile {
+    /// Its positions, row-major.
+    positions: Vec<Vec3>,
+    /// The box of them all; `None` for none.
+    bounds: Option<Aabb>,
+    /// The box of each row's.
+    rows: Vec<Option<Aabb>>,
+}
+
+impl KeptTile {
+    /// Tile `key` at `positions`, its boxes made.
+    fn new(key: TileKey, positions: Vec<Vec3>) -> Self {
+        let width = usize::try_from(key.side()).unwrap_or(0).max(1);
+        let rows: Vec<Option<Aabb>> = positions
+            .chunks(width)
+            .map(|row| Aabb::from_points(row.iter().copied()))
+            .collect();
+        Self {
+            bounds: Aabb::from_points(positions.iter().copied()),
+            rows,
+            positions,
+        }
+    }
 }
 
 impl PenDownTiles {
-    /// The tiles of `keys` at the pen-down of the oldest open stroke, of op `op`: the store's
-    /// ([`TileStore::pen_down_positions`]), a changed tile's shape, any other as stored.
+    /// The tiles of `keys` at the pen-down of the oldest open stroke, of op `op`: see
+    /// [`PenDownTiles::extend_oldest`].
     ///
     /// # Errors
     ///
-    /// [`SculptError::Future`] with [`FutureError::ForeignPenDown`] if the store keeps a shape of
-    /// one and `op` isn't its current op, whose shapes it keeps; as
-    /// [`TileStore::pen_down_positions`].
+    /// As [`PenDownTiles::extend_oldest`].
     pub fn of_oldest(
         store: &mut TileStore,
         op: OpId,
         keys: &BTreeSet<TileKey>,
     ) -> Result<Self, SculptError> {
-        let tiles: Result<BTreeMap<TileKey, Vec<Vec3>>, SculptError> = keys
-            .iter()
-            .map(|&key| Ok((key, own_pen_down(store, op, key)?)))
-            .collect();
-        Ok(Self { tiles: tiles? })
+        let mut tiles = Self::default();
+        tiles.extend_oldest(store, op, keys)?;
+        Ok(tiles)
     }
 
-    /// The tiles of `keys` at the pen-down of the stroke after those of `before`: each the future
-    /// they leave, at its positions.
+    /// The tiles of `keys` at the pen-down of the stroke after those of `before`: see
+    /// [`PenDownTiles::extend_futures`].
     ///
     /// # Errors
     ///
-    /// As [`Futures::future_of`], and as [`TileStore::keep_predictions_of`] and
-    /// [`TileStore::frames_many`] for the tile's prediction.
+    /// As [`PenDownTiles::extend_futures`].
     pub fn of_futures(
         store: &mut TileStore,
         before: &Futures<'_>,
         keys: &BTreeSet<TileKey>,
     ) -> Result<Self, SculptError> {
-        let tiles: Result<BTreeMap<TileKey, Vec<Vec3>>, SculptError> = keys
-            .iter()
-            .map(|&key| {
-                let tile = before.future_of(store, key)?;
-                let _pins = store.pin(&[key])?;
-                let made = ensure_prediction(store, key)?;
-                let prediction = prediction_of(store, key, made)?;
-                Ok((key, positions_of(&prediction, &tile)?))
-            })
-            .collect();
-        Ok(Self { tiles: tiles? })
+        let mut tiles = Self {
+            after: before.newest(),
+            tiles: BTreeMap::new(),
+        };
+        tiles.extend_futures(store, before, keys)?;
+        Ok(tiles)
+    }
+
+    /// Adds the tiles of `keys` it doesn't hold, at the pen-down of the oldest open stroke, of
+    /// op `op`: the store's ([`TileStore::pen_down_positions`]), a changed tile's shape, any other
+    /// as stored.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Future`] with [`FutureError::Chain`] if these are a later stroke's tiles
+    /// ([`PenDownTiles::after`] isn't `None`), or [`FutureError::ForeignPenDown`] if the store
+    /// keeps a shape of one and `op` isn't its current op, whose shapes it keeps; as
+    /// [`TileStore::pen_down_positions`]. The tiles added before the failing one stay.
+    pub fn extend_oldest(
+        &mut self,
+        store: &mut TileStore,
+        op: OpId,
+        keys: &BTreeSet<TileKey>,
+    ) -> Result<(), SculptError> {
+        if self.after.is_some() {
+            return Err(FutureError::Chain.into());
+        }
+        for &key in keys {
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.tiles.entry(key) {
+                let positions = own_pen_down(store, op, key)?;
+                entry.insert(KeptTile::new(key, positions));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the tiles of `keys` it doesn't hold, at the pen-down of the stroke after those of
+    /// `before`: each the future they leave, at its positions.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Future`] with [`FutureError::Chain`] if `before` ends with another stroke
+    /// than the one these tiles follow, or [`FutureError::Unsealed`] if a stroke of `before` may
+    /// still place dabs; as [`Futures::future_of`], and as [`TileStore::keep_predictions_of`] and
+    /// [`TileStore::frames_many`] for the tile's prediction. The tiles added before the failing
+    /// one stay.
+    pub fn extend_futures(
+        &mut self,
+        store: &mut TileStore,
+        before: &Futures<'_>,
+        keys: &BTreeSet<TileKey>,
+    ) -> Result<(), SculptError> {
+        if before.newest() != self.after {
+            return Err(FutureError::Chain.into());
+        }
+        if !before.sealed() {
+            return Err(FutureError::Unsealed.into());
+        }
+        for &key in keys {
+            if self.tiles.contains_key(&key) {
+                continue;
+            }
+            let tile = before.future_of(store, key)?;
+            let _pins = store.pin(&[key])?;
+            let made = ensure_prediction(store, key)?;
+            let prediction = prediction_of(store, key, made)?;
+            let positions = positions_of(&prediction, &tile)?;
+            self.tiles.insert(key, KeptTile::new(key, positions));
+        }
+        Ok(())
+    }
+
+    /// The op of the stroke whose futures the tiles are: the stroke before the one they are the
+    /// pen-down of; `None` for the oldest open stroke's own pen-down.
+    #[must_use]
+    pub const fn after(&self) -> Option<OpId> {
+        self.after
     }
 
     /// The tiles held.
@@ -190,10 +304,22 @@ impl PenDownTiles {
 ///
 /// What its futures need beside the stroke's state (see the module notes), kept for the stroke's
 /// life beside its queue.
+///
+/// # A chain
+///
+/// A stroke started while others land follows the newest of them ([`StrokeEdits::after`]); its
+/// pen-down is their futures, read once each earlier stroke is sealed ([`StrokeEdits::seal`], at
+/// its pen-up), so they don't change. An earlier stroke's error while landing (dabs dropped)
+/// makes its futures wrong, and with them every later stroke's [`StrokeEdits`] and the dabs placed
+/// on them: those strokes end too (the stroke-while-landing spec, "Errors").
 #[derive(Debug, Clone)]
 pub struct StrokeEdits {
     /// The stroke's op: the op its dabs land in.
     op: OpId,
+    /// The op of the stroke it follows, still open; `None` once there is none.
+    after: Option<OpId>,
+    /// Whether its pen is up: no more dabs are placed.
+    sealed: bool,
     /// The number of the first dab not landed: the dabs are numbered from the stroke's first,
     /// so a dab's number stays as earlier ones land.
     first: usize,
@@ -219,11 +345,14 @@ struct PlacedDab {
 }
 
 impl StrokeEdits {
-    /// The edits of the stroke of op `op`, before any dab is placed.
+    /// The edits of the stroke of op `op`, before any dab is placed, following the open stroke of
+    /// op `after` (`None`: no stroke before it is open).
     #[must_use]
-    pub const fn new(op: OpId) -> Self {
+    pub const fn new(op: OpId, after: Option<OpId>) -> Self {
         Self {
             op,
+            after,
+            sealed: false,
             first: 0,
             dabs: VecDeque::new(),
             touching: BTreeMap::new(),
@@ -235,6 +364,31 @@ impl StrokeEdits {
     #[must_use]
     pub const fn op(&self) -> OpId {
         self.op
+    }
+
+    /// The op of the open stroke it follows; `None` if none is open before it.
+    #[must_use]
+    pub const fn after(&self) -> Option<OpId> {
+        self.after
+    }
+
+    /// The stroke it followed has landed and ended: it is the oldest open stroke now. Its dabs
+    /// placed stay right (they were placed on the surface that stroke left), and the next are
+    /// placed on its own pen-down ([`PenDownTiles::of_oldest`]).
+    pub const fn earlier_landed(&mut self) {
+        self.after = None;
+    }
+
+    /// The stroke's pen is up: no more dabs are placed ([`StrokeEdits::place`] refuses them), so
+    /// its futures are final, and a later stroke may read its pen-down on them.
+    pub const fn seal(&mut self) {
+        self.sealed = true;
+    }
+
+    /// Whether the stroke is sealed ([`StrokeEdits::seal`]).
+    #[must_use]
+    pub const fn is_sealed(&self) -> bool {
+        self.sealed
     }
 
     /// How many of its dabs haven't landed.
@@ -251,19 +405,33 @@ impl StrokeEdits {
     ///
     /// # Errors
     ///
-    /// [`SculptError::Dab`] for a dab the brush can't apply (its place in `dabs`), before any is
-    /// added.
+    /// [`SculptError::Future`] with [`FutureError::Sealed`] for a sealed stroke, or
+    /// [`FutureError::Chain`] if `pen_down` is the pen-down of another place in the chain (its
+    /// [`PenDownTiles::after`] isn't this stroke's [`StrokeEdits::after`]); [`SculptError::Dab`]
+    /// for a dab the brush can't apply (its place in `dabs`). Nothing is added then.
     pub fn place(
         &mut self,
         store: &TileStore,
         dabs: &[Dab],
         pen_down: &PenDownTiles,
     ) -> Result<(), SculptError> {
+        if self.sealed {
+            return Err(FutureError::Sealed.into());
+        }
+        if pen_down.after != self.after {
+            return Err(FutureError::Chain.into());
+        }
         let imprints = imprints_of(dabs)?;
         let topology = store.mesh().topology();
-        let tiles: Vec<(&TileKey, &Vec<Vec3>)> = pen_down.tiles.iter().collect();
-        let found = store.par_map(&tiles, |&(key, positions)| {
-            tile_edits(topology, *key, positions, &imprints)
+        let spheres: Vec<(Vec3, f32)> = imprints.iter().map(sphere).collect();
+        // Only the tiles one of the dabs can reach are sent to the workers.
+        let tiles: Vec<(&TileKey, &KeptTile)> = pen_down
+            .tiles
+            .iter()
+            .filter(|(_, tile)| spheres.iter().any(|&each| touches(tile.bounds, each)))
+            .collect();
+        let found = store.par_map(&tiles, |&(key, tile)| {
+            tile_edits(topology, *key, tile, &imprints, &spheres)
         });
         let mut placed: Vec<PlacedDab> = imprints
             .into_iter()
@@ -350,35 +518,45 @@ impl StrokeEdits {
     }
 }
 
-/// For each of `imprints` touching tile `key`, whose pen-down positions are `positions`: its
-/// place, and whether it edits the tile (moves a vertex the tile owns).
+/// `imprint`'s sphere: its centre and squared radius.
+fn sphere(imprint: &Imprint) -> (Vec3, f32) {
+    let [x, y, z] = imprint.center;
+    (Vec3::new(x, y, z), imprint.radius * imprint.radius)
+}
+
+/// Whether the sphere of centre and squared radius `(centre, radius_squared)` touches `bounds`
+/// (`None`: a box of no points, which nothing touches).
+fn touches(bounds: Option<Aabb>, (centre, radius_squared): (Vec3, f32)) -> bool {
+    bounds.is_some_and(|aabb| aabb.distance_squared(centre) <= radius_squared)
+}
+
+/// For each of `imprints` (with their `spheres`) touching tile `key` at pen-down: its place, and
+/// whether it edits the tile (moves a vertex the tile owns).
 ///
-/// A dab touches the tile when its sphere touches the box of one of its rows; it is brushed over
-/// those rows alone, as a replay brushes it ([`draw_imprint`], each vertex on its own, so the
-/// bits of the whole tile's pass), into one buffer reused for every dab.
+/// A dab touches the tile when its sphere touches the box of one of its rows (a dab missing the
+/// whole tile's box is passed over at once); it is brushed over those rows alone, as a replay
+/// brushes it ([`draw_imprint`], each vertex on its own, so the bits of the whole tile's pass),
+/// into one buffer reused for every dab.
 fn tile_edits(
     topology: &Topology,
     key: TileKey,
-    positions: &[Vec3],
+    tile: &KeptTile,
     imprints: &[Imprint],
+    spheres: &[(Vec3, f32)],
 ) -> Vec<(usize, bool)> {
     let side = key.side();
     let last = side.saturating_sub(1);
     let width = usize::try_from(side).unwrap_or(0);
-    let rows: Vec<Option<Aabb>> = positions
-        .chunks(width.max(1))
-        .map(|row| Aabb::from_points(row.iter().copied()))
-        .collect();
     let mut deltas = vec![0.0_f32; width];
     let mut out = Vec::new();
-    let dabs = imprints.iter().enumerate();
-    for (k, imprint) in dabs {
-        let [x, y, z] = imprint.center;
-        let centre = Vec3::new(x, y, z);
-        let radius_squared = imprint.radius * imprint.radius;
-        let touched = (0..side).zip(&rows).filter(|(_, aabb)| {
-            aabb.is_some_and(|aabb| aabb.distance_squared(centre) <= radius_squared)
-        });
+    let dabs = imprints.iter().zip(spheres).enumerate();
+    for (k, (imprint, &each)) in dabs {
+        if !touches(tile.bounds, each) {
+            continue;
+        }
+        let touched = (0..side)
+            .zip(&tile.rows)
+            .filter(|&(_, &aabb)| touches(aabb, each));
         let mut reached = false;
         let mut edits = false;
         for (j, _) in touched {
@@ -387,7 +565,7 @@ fn tile_edits(
                 break;
             }
             let first = usize::try_from(j).unwrap_or(0) * width;
-            let Some(row) = positions.get(first..first + width) else {
+            let Some(row) = tile.positions.get(first..first + width) else {
                 continue;
             };
             deltas.fill(0.0);
@@ -425,13 +603,46 @@ impl<'a> Futures<'a> {
     /// this order; `stroke` is the session's one stroke state. The oldest's pen-down shapes are
     /// the store's: its op is the store's current op, or the store keeps no shape of a tile it
     /// reaches.
-    #[must_use]
-    pub fn new(store: &TileStore, stroke: &'a Stroke, chain: &[&'a StrokeEdits]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Future`] with [`FutureError::Chain`] unless the oldest follows no open
+    /// stroke and each later one follows the stroke before it ([`StrokeEdits::after`]).
+    pub fn new(
+        store: &TileStore,
+        stroke: &'a Stroke,
+        chain: &[&'a StrokeEdits],
+    ) -> Result<Self, SculptError> {
+        let befores = std::iter::once(None).chain(chain.iter().map(|edits| Some(edits.op)));
+        let mut links = chain.iter().zip(befores);
+        if !links.all(|(edits, before)| edits.after == before) {
+            return Err(FutureError::Chain.into());
+        }
         let strokes = chain
             .iter()
             .map(|&edits| (edits, edits.plan(store, stroke)))
             .collect();
-        Self { stroke, strokes }
+        Ok(Self { stroke, strokes })
+    }
+
+    /// The op of the newest stroke of the chain; `None` for none.
+    fn newest(&self) -> Option<OpId> {
+        self.strokes.last().map(|(edits, _)| edits.op)
+    }
+
+    /// Whether every stroke of the chain is sealed: its futures are final.
+    fn sealed(&self) -> bool {
+        self.strokes.iter().all(|(edits, _)| edits.sealed)
+    }
+
+    /// For each stroke of the chain, whether its decisions took the fast path
+    /// ([`crate::apply::Plan::Continuous`]): for the tests.
+    #[cfg(test)]
+    pub(crate) fn continuous(&self) -> Vec<bool> {
+        self.strokes
+            .iter()
+            .map(|(_, plan)| *plan == Plan::Continuous)
+            .collect()
     }
 
     /// Tile `key` once every stroke of the chain has landed its remaining dabs, made without

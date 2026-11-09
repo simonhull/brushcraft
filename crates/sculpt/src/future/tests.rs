@@ -179,17 +179,21 @@ fn place_chain(
         let pen_down = if placed.is_empty() {
             PenDownTiles::of_oldest(store, open.op, open.reach).unwrap()
         } else {
+            for earlier in &mut placed {
+                earlier.seal();
+            }
             let earlier: Vec<&StrokeEdits> = placed.iter().collect();
-            let before = Futures::new(store, state, &earlier);
+            let before = Futures::new(store, state, &earlier).unwrap();
             PenDownTiles::of_futures(store, &before, open.reach).unwrap()
         };
-        let mut edits = StrokeEdits::new(open.op);
+        let after = placed.last().map(StrokeEdits::op);
+        let mut edits = StrokeEdits::new(open.op, after);
         let mut rest = open.dabs;
         while !rest.is_empty() {
             let size = usize::try_from(1 + rng.below(8)).unwrap().min(rest.len());
-            let (batch, after) = rest.split_at(size);
+            let (batch, later) = rest.split_at(size);
             edits.place(store, batch, &pen_down).unwrap();
-            rest = after;
+            rest = later;
         }
         placed.push(edits);
     }
@@ -203,7 +207,7 @@ fn futures(
     edits: &[StrokeEdits],
 ) -> BTreeMap<TileKey, CorrectionTile> {
     let chain: Vec<&StrokeEdits> = edits.iter().collect();
-    let futures = Futures::new(store, state, &chain);
+    let futures = Futures::new(store, state, &chain).unwrap();
     let keys = tiles(store.mesh(), level());
     keys.into_iter()
         .map(|key| (key, futures.future_of(store, key).unwrap()))
@@ -472,7 +476,7 @@ fn a_future_without_kept_predictions_is_the_landed_tile() {
     let later = place_chain_after(
         project.store(),
         &state,
-        &edits,
+        &mut edits,
         op.next().unwrap(),
         &b,
         &all,
@@ -493,22 +497,26 @@ fn a_future_without_kept_predictions_is_the_landed_tile() {
 fn place_chain_after(
     store: &mut TileStore,
     state: &Stroke,
-    earlier: &[StrokeEdits],
+    earlier: &mut [StrokeEdits],
     op: OpId,
     dabs: &[Dab],
     reach: &BTreeSet<TileKey>,
     rng: &mut Rng,
 ) -> StrokeEdits {
+    for each in &mut *earlier {
+        each.seal();
+    }
+    let after = earlier.last().map(StrokeEdits::op);
     let chain: Vec<&StrokeEdits> = earlier.iter().collect();
-    let before = Futures::new(store, state, &chain);
+    let before = Futures::new(store, state, &chain).unwrap();
     let pen_down = PenDownTiles::of_futures(store, &before, reach).unwrap();
-    let mut edits = StrokeEdits::new(op);
+    let mut edits = StrokeEdits::new(op, after);
     let mut rest = dabs;
     while !rest.is_empty() {
         let size = usize::try_from(1 + rng.below(8)).unwrap().min(rest.len());
-        let (batch, after) = rest.split_at(size);
+        let (batch, later) = rest.split_at(size);
         edits.place(store, batch, &pen_down).unwrap();
-        rest = after;
+        rest = later;
     }
     edits
 }
@@ -543,10 +551,10 @@ fn a_tile_no_remaining_dab_touches_is_its_stored_self() {
         .collect();
     assert!(!untouched.is_empty(), "the stroke keeps to faces 0 to 2");
     let chain: Vec<&StrokeEdits> = edits.iter().collect();
-    let some = Futures::new(project.store(), &state, &chain);
-    let empty_edits = StrokeEdits::new(op);
-    let empty = Futures::new(project.store(), &state, &[&empty_edits]);
-    let no_chain = Futures::new(project.store(), &state, &[]);
+    let some = Futures::new(project.store(), &state, &chain).unwrap();
+    let empty_edits = StrokeEdits::new(op, None);
+    let empty = Futures::new(project.store(), &state, &[&empty_edits]).unwrap();
+    let no_chain = Futures::new(project.store(), &state, &[]).unwrap();
     for &key in &untouched {
         let as_stored = bits(&stored(project.store(), key));
         let far = some.future_of(project.store(), key).unwrap();
@@ -603,7 +611,7 @@ fn a_future_of_a_chain_is_the_tile_once_both_land() {
         let later = place_chain_after(
             project.store(),
             &state,
-            &edits,
+            &mut edits,
             op_b,
             &b,
             &b_reach,
@@ -659,7 +667,7 @@ fn taking_a_future_writes_nothing() {
     let later = place_chain_after(
         project.store(),
         &state,
-        &edits,
+        &mut edits,
         op.next().unwrap(),
         rest,
         &all,
@@ -726,6 +734,162 @@ fn another_strokes_pen_down_shapes_are_refused() {
     project.end_unrecorded_stroke().unwrap();
 }
 
+/// Asserts `edits`, the oldest open stroke's, counts exactly the tiles its remaining dabs edit.
+///
+/// And that its futures take the fast path exactly when those tiles holding no state fit the
+/// stroke state's free buffers.
+fn assert_fast_path(store: &TileStore, state: &Stroke, edits: &StrokeEdits, case: &str) {
+    let edited: BTreeSet<TileKey> = edits
+        .dabs
+        .iter()
+        .flat_map(|dab| dab.edits.iter().copied())
+        .collect();
+    let counted: BTreeSet<TileKey> = edits.edited.keys().copied().collect();
+    assert_eq!(counted, edited, "{case}: the tiles counted as edited");
+    let (unheld, free) = if state.continued(store, edits.op()).is_some() {
+        let unheld = edited.iter().filter(|key| !state.holds(key)).count();
+        (unheld, state.buffers() - state.tiles_held())
+    } else {
+        (edited.len(), store.stroke_tiles())
+    };
+    let futures = Futures::new(store, state, &[edits]).unwrap();
+    assert_eq!(
+        futures.continuous(),
+        vec![unheld <= free],
+        "{case}: {unheld} tiles to take, {free} free"
+    );
+}
+
+/// One interleaved case, of `seed`, over 2 to 13 tiles of stroke state.
+///
+/// A stroke is placed in batches, each read at its pen-down after the dabs landed so far (tiles
+/// changed already read from their shapes), random counts landed between batches. Every tile's
+/// future is taken, more dabs land, and the futures taken again are the same; the rest land, and
+/// each future is the tile, bit for bit.
+fn interleaved_case(seed: u64) {
+    let mut rng = Rng::new(seed);
+    let stroke_tiles = 2 + usize::try_from(rng.below(12)).unwrap();
+    let case = format!("seed {seed}, {stroke_tiles} tiles of state");
+    let dir = TestDir::new();
+    let (mut project, mut index) = project(&dir, |config| config.with_stroke_tiles(stroke_tiles));
+    let mut state = Stroke::new(project.store());
+    let dabs = random_stroke(project.store(), &mut rng, 30, 0);
+    let op = project.begin_stroke_and_wait().unwrap();
+    let mut edits = StrokeEdits::new(op, None);
+    let (mut placed, mut landed) = (0, 0);
+    while placed < dabs.len() {
+        let size = usize::try_from(1 + rng.below(6))
+            .unwrap()
+            .min(dabs.len() - placed);
+        let batch = &dabs[placed..placed + size];
+        let pen_down = PenDownTiles::of_oldest(project.store(), op, &reach(&index, batch)).unwrap();
+        edits.place(project.store(), batch, &pen_down).unwrap();
+        placed += size;
+        let count =
+            usize::try_from(rng.below(u32::try_from(placed - landed).unwrap() + 1)).unwrap();
+        let landing = &dabs[landed..landed + count];
+        land_some(
+            project.store(),
+            &mut index,
+            &mut state,
+            &mut edits,
+            landing,
+            &mut rng,
+        );
+        landed += count;
+        assert_fast_path(project.store(), &state, &edits, &case);
+    }
+
+    let first = futures(project.store(), &state, std::slice::from_ref(&edits));
+    let more = usize::try_from(rng.below(u32::try_from(dabs.len() - landed).unwrap() + 1)).unwrap();
+    let landing = &dabs[landed..landed + more];
+    land_some(
+        project.store(),
+        &mut index,
+        &mut state,
+        &mut edits,
+        landing,
+        &mut rng,
+    );
+    landed += more;
+    assert_fast_path(project.store(), &state, &edits, &case);
+    let again = futures(project.store(), &state, std::slice::from_ref(&edits));
+    let unchanged = first.iter().zip(&again);
+    for ((key, before), (_, after)) in unchanged {
+        assert_eq!(
+            bits(before),
+            bits(after),
+            "{case}: tile {key:?}'s future moved"
+        );
+    }
+
+    land(
+        project.store(),
+        &mut index,
+        &mut state,
+        &dabs[landed..],
+        &mut rng,
+    );
+    assert_landed(project.store(), &first, &case);
+    project.end_unrecorded_stroke().unwrap();
+}
+
+#[test]
+fn a_future_holds_while_dabs_are_placed_and_land_in_turn() {
+    for seed in 200..216 {
+        interleaved_case(seed);
+    }
+}
+
+#[test]
+fn strokes_out_of_chain_are_refused() {
+    let mut rng = Rng::new(71);
+    let dir = TestDir::new();
+    let (mut project, index) = project(&dir, |config| config);
+    let dabs = random_stroke(project.store(), &mut rng, 6, 0);
+    let state = Stroke::new(project.store());
+    let op_a = project.begin_stroke_and_wait().unwrap();
+    let op_b = op_a.next().unwrap();
+    let reach = reach(&index, &dabs);
+    let is = |result: &Result<(), SculptError>, error: FutureError| matches!(result, Err(SculptError::Future(found)) if *found == error);
+
+    let mut a = StrokeEdits::new(op_a, None);
+    let oldest = PenDownTiles::of_oldest(project.store(), op_a, &reach).unwrap();
+    a.place(project.store(), &dabs, &oldest).unwrap();
+    let b = StrokeEdits::new(op_b, Some(op_a));
+    // Out of order, or a later stroke alone, as if the one it follows had landed.
+    let swapped = Futures::new(project.store(), &state, &[&b, &a]).map(|_| ());
+    assert!(is(&swapped, FutureError::Chain), "{swapped:?}");
+    let alone = Futures::new(project.store(), &state, &[&b]).map(|_| ());
+    assert!(is(&alone, FutureError::Chain), "{alone:?}");
+
+    // A's pen is still down: B's pen-down can't be read on its futures.
+    let open = Futures::new(project.store(), &state, &[&a]).unwrap();
+    let unsealed = PenDownTiles::of_futures(project.store(), &open, &reach).map(|_| ());
+    assert!(is(&unsealed, FutureError::Unsealed), "{unsealed:?}");
+
+    a.seal();
+    let sealed = a.place(project.store(), &dabs, &oldest);
+    assert!(is(&sealed, FutureError::Sealed), "{sealed:?}");
+    let before = Futures::new(project.store(), &state, &[&a]).unwrap();
+    let later = PenDownTiles::of_futures(project.store(), &before, &reach).unwrap();
+    assert_eq!(later.after(), Some(op_a));
+    // B placed on A's own pen-down, or a third stroke on B's: not where they are in the chain.
+    let mut b = b;
+    let wrong = b.place(project.store(), &dabs, &oldest);
+    assert!(is(&wrong, FutureError::Chain), "{wrong:?}");
+    let mut c = StrokeEdits::new(op_b.next().unwrap(), Some(op_b));
+    let skipped = c.place(project.store(), &dabs, &later);
+    assert!(is(&skipped, FutureError::Chain), "{skipped:?}");
+    b.place(project.store(), &dabs, &later).unwrap();
+    Futures::new(project.store(), &state, &[&a, &b]).unwrap();
+    // Once A has landed, B is the oldest.
+    b.earlier_landed();
+    assert_eq!(b.after(), None);
+    Futures::new(project.store(), &state, &[&b]).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+}
+
 /// How long placing, deciding and a future take for `count` remaining dabs over the cube, with
 /// `stroke_tiles` tiles of state, against landing them.
 fn time_case(count: u32, stroke_tiles: usize) {
@@ -741,12 +905,12 @@ fn time_case(count: u32, stroke_tiles: usize) {
     land(project.store(), &mut index, &mut state, first, &mut rng);
     let reach = reach(&index, rest);
     let pen_down = PenDownTiles::of_oldest(project.store(), op, &reach).unwrap();
-    let mut edits = StrokeEdits::new(op);
+    let mut edits = StrokeEdits::new(op, None);
     let placing = Instant::now();
     edits.place(project.store(), rest, &pen_down).unwrap();
     let place = placing.elapsed();
     let deciding = Instant::now();
-    let futures = Futures::new(project.store(), &state, &[&edits]);
+    let futures = Futures::new(project.store(), &state, &[&edits]).unwrap();
     let decide = deciding.elapsed();
     let keys = tiles(project.store().mesh(), level());
     let taking = Instant::now();

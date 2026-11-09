@@ -426,6 +426,11 @@ struct Owner {
 /// The one per-tile arithmetic of a run's dabs: a run lands its tiles' outcomes, and a tile's
 /// future ([`crate::Futures`]) is its outcome over the dabs not landed yet, kept apart.
 pub(crate) fn replay_tile(run: Run<'_>, input: TileInput<'_>) -> TileOutcome {
+    debug_assert!(
+        run.numbers
+            .is_none_or(|numbers| numbers.len() == run.imprints.len()),
+        "a dab number for each imprint"
+    );
     let mut tile = Replay::new(run, input);
     let stopped = tile.dabs().err();
     tile.finish(stopped)
