@@ -708,6 +708,87 @@ fn taking_a_future_writes_nothing() {
 }
 
 #[test]
+fn a_reserved_stroke_reads_its_own_pen_down_once_it_is_the_oldest() {
+    let mut rng = Rng::new(81);
+    let dir = TestDir::new();
+    let (mut project, mut index) = project(&dir, |config| config);
+    let a = random_stroke(project.store(), &mut rng, 16, 0);
+    let b = random_stroke(project.store(), &mut rng, 10, 16);
+    let (first, rest) = a.split_at(8);
+    let mut state = Stroke::new(project.store());
+    let op_a = project.begin_stroke_and_wait().unwrap();
+    let a_reach = reach(&index, &a);
+    let open = Open {
+        op: op_a,
+        dabs: &a,
+        reach: &a_reach,
+    };
+    let mut edits = place_chain(project.store(), &state, &[open], &mut rng);
+    let [a_edits] = edits.as_mut_slice() else {
+        panic!("one stroke placed");
+    };
+    land_some(
+        project.store(),
+        &mut index,
+        &mut state,
+        a_edits,
+        first,
+        &mut rng,
+    );
+
+    // B is reserved while A lands: its pen-down is A's futures.
+    let token = project.store().reserve_op().unwrap();
+    let op_b = token.op();
+    let all: BTreeSet<TileKey> = tiles(project.store().mesh(), level()).into_iter().collect();
+    // Outside a reading of B, the store reads A's shapes: not B's own.
+    let foreign = PenDownTiles::of_oldest(project.store(), op_b, &all);
+    assert!(
+        matches!(
+            foreign,
+            Err(SculptError::Future(FutureError::ForeignPenDown))
+        ),
+        "{foreign:?}"
+    );
+    let mut placed_b = place_chain_after(
+        project.store(),
+        &state,
+        &mut edits,
+        op_b,
+        &b,
+        &all,
+        &mut rng,
+    );
+    placed_b.seal();
+    edits.push(placed_b);
+    let chained = futures(project.store(), &state, &edits);
+
+    // A lands and ends: B is the oldest, reserved, and reads its own set.
+    land(project.store(), &mut index, &mut state, rest, &mut rng);
+    project.end_unrecorded_stroke().unwrap();
+    let mut b_edits = edits.pop().unwrap();
+    b_edits.earlier_landed();
+    let alone: BTreeMap<TileKey, CorrectionTile> = {
+        let mut reading = project.store().read_pen_down_of(&token).unwrap();
+        assert_eq!(reading.reading_op(), Some(op_b));
+        let futures = Futures::new(&reading, &state, &[&b_edits]).unwrap();
+        let keys = tiles(reading.mesh(), level());
+        keys.into_iter()
+            .map(|key| (key, futures.future_of(&mut reading, key).unwrap()))
+            .collect()
+    };
+    // The store's op isn't ended at a stroke's end yet (the project's chained strokes, a later
+    // task), so B's reserved op can't begin: B lands in an op of its own instead, the same
+    // arithmetic (the stroke state starts afresh at either).
+    let dropped = project.store().drop_reserved_op(token);
+    assert_eq!(dropped, vec![op_b]);
+    project.begin_stroke_and_wait().unwrap();
+    land(project.store(), &mut index, &mut state, &b, &mut rng);
+    project.end_unrecorded_stroke().unwrap();
+    assert_landed(project.store(), &chained, "B's futures over A's");
+    assert_landed(project.store(), &alone, "B's futures once the oldest");
+}
+
+#[test]
 fn another_strokes_pen_down_shapes_are_refused() {
     let mut rng = Rng::new(51);
     let dir = TestDir::new();

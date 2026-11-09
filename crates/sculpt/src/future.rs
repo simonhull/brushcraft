@@ -34,11 +34,12 @@
 //!   decisions line up ([`crate::apply::Run::numbers`]). A dab touching none of its rows moves none
 //!   of its vertices, its own or its copies of a neighbour's: the replay would skip it.
 //! - **The stroke's pen-down shape of the tile**, its dabs' distances measured there. For the
-//!   oldest stroke of the chain, the store's ([`TileStore::pen_down_positions`]), which must be its
-//!   own ([`FutureError::ForeignPenDown`]); for a later one, the future the strokes before it
-//!   leave, whose positions are the tile's prediction with those corrections applied, the bits the
-//!   store's evaluation of them gives, and so the pen-down shape that stroke reads (it is its
-//!   surface) and lands on.
+//!   oldest stroke of the chain, the store's ([`TileStore::pen_down_positions`]) of the shapes it
+//!   reads now, which must be that stroke's own ([`FutureError::ForeignPenDown`]): the current
+//!   stroke's set, or a reserved op's in a reading of it ([`TileStore::read_pen_down_of`]); for a
+//!   later one, the future the strokes before it leave, whose positions are the tile's prediction
+//!   with those corrections applied, the bits the store's evaluation of them gives, and so the
+//!   pen-down shape that stroke reads (it is its surface) and lands on.
 //! - **The tile's frames**, from its prediction: the level below, which no brush edits.
 //! - **The stroke's state** ([`Stroke`]): each touched vertex's correction built unrounded across
 //!   the stroke's dabs and rounded on write. For the stroke whose op is the store's current op and
@@ -103,9 +104,11 @@ use crate::state::Stroke;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum FutureError {
-    /// The store keeps a pen-down shape of a tile the oldest stroke reaches, and its op isn't the
-    /// oldest stroke's: the shape is another stroke's, not the surface the oldest one reads. (The
-    /// store keeps one stroke's shapes, the current op's, until shapes are kept per op.)
+    /// The store reads another op's pen-down shapes than the oldest stroke's: a reading of
+    /// another reserved op is under way ([`TileStore::reading_op`]), or none is, the oldest
+    /// stroke's op isn't current, and the current stroke's set holds a shape of the tile. Read
+    /// the oldest stroke's own: outside any reading when its op is current, in a reading of it
+    /// ([`TileStore::read_pen_down_of`]) while it is reserved.
     #[error("the store's pen-down shapes aren't the oldest stroke's")]
     ForeignPenDown,
     /// A dab of the stroke writes a value the tile can't hold: its landing will fail at that
@@ -230,8 +233,8 @@ impl PenDownTiles {
     /// # Errors
     ///
     /// [`SculptError::Future`] with [`FutureError::Chain`] if these are a later stroke's tiles
-    /// ([`PenDownTiles::after`] isn't `None`), or [`FutureError::ForeignPenDown`] if the store
-    /// keeps a shape of one and `op` isn't its current op, whose shapes it keeps; as
+    /// ([`PenDownTiles::after`] isn't `None`), or [`FutureError::ForeignPenDown`] if the shapes the
+    /// store reads now aren't `op`'s (see [`FutureError::ForeignPenDown`]); as
     /// [`TileStore::pen_down_positions`]. The tiles added before the failing one stay.
     pub fn extend_oldest(
         &mut self,
@@ -740,16 +743,25 @@ fn imprints_of(dabs: &[Dab]) -> Result<Vec<Imprint>, SculptError> {
         .collect()
 }
 
-/// Tile `key`'s pen-down positions as the oldest open stroke, of op `op`, reads them: the
-/// store's ([`TileStore::pen_down_positions`]), its shape if it keeps one, else its positions as
-/// stored.
+/// Tile `key`'s pen-down positions as the oldest open stroke, of op `op`, reads them.
+///
+/// The store's ([`TileStore::pen_down_positions`]) from the pen-down set it reads now: its shape
+/// if the set keeps one, else its positions as stored. The set read must be `op`'s: a reserved op's
+/// in a reading of it ([`TileStore::read_pen_down_of`], [`TileStore::reading_op`] naming `op`), or,
+/// outside any reading of a reserved op, the current stroke's, `op` being current. With another op
+/// current (or none), the current set may still be read if it keeps no shape of the tile: the tile
+/// is then as stored, which is what an op not yet begun reads of it.
 ///
 /// # Errors
 ///
-/// [`FutureError::ForeignPenDown`] if the store keeps a shape of the tile and `op` isn't its
-/// current op, whose shapes it keeps; as [`TileStore::pen_down_positions`].
+/// [`FutureError::ForeignPenDown`] if the set read is another op's (see there); as
+/// [`TileStore::pen_down_positions`].
 fn own_pen_down(store: &mut TileStore, op: OpId, key: TileKey) -> Result<Vec<Vec3>, SculptError> {
-    if store.current_op() != Some(op) && store.pen_down_shape(&key).is_some() {
+    let own = match store.reading_op() {
+        Some(reading) => reading == op,
+        None => store.current_op() == Some(op) || store.pen_down_shape(&key).is_none(),
+    };
+    if !own {
         return Err(FutureError::ForeignPenDown.into());
     }
     Ok(store.pen_down_positions(key)?.to_vec())
