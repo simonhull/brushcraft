@@ -2120,3 +2120,47 @@ fn a_refused_install_stops_the_making_of_futures() {
         "the making stopped: {refused} made of the {wanted} the Down reads"
     );
 }
+
+#[test]
+fn futures_made_ahead_are_read_only_over_their_own_store_with_the_oldest_strokes_op_current() {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.hover((150.0, 80.0));
+    assert!(!run.brush.ahead.tiles.is_empty(), "futures made ahead");
+    let ours = run.project.store().id();
+    assert_eq!(run.brush.ahead.store, Some(ours), "tagged with their store");
+    let read =
+        |ahead: &Ahead, store: &TileStore, strokes: &[Pending]| ahead.of(store, strokes).is_some();
+    assert!(
+        read(&run.brush.ahead, run.project.store(), &run.brush.strokes),
+        "read by a stroke begun over the first, on its store"
+    );
+    // Another store: not theirs, whatever its ops.
+    let mut other = Chain::new(Instant::now(), None);
+    let theirs = other.project.store().id();
+    assert_ne!(ours, theirs);
+    assert!(
+        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
+        "not over another store"
+    );
+    // The tag forged to that store's: its current op isn't the oldest stroke's.
+    run.brush.ahead.store = Some(theirs);
+    assert!(
+        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
+        "not where the store's current op isn't the oldest stroke's"
+    );
+    run.brush.ahead.store = Some(ours);
+    // No strokes, or others than those they were made up to.
+    assert!(!read(&run.brush.ahead, run.project.store(), &[]));
+    // A save, a flush and a close let them go outright.
+    run.brush.begin_saving(Instant::now());
+    assert!(run.brush.ahead.tiles.is_empty(), "let go by a save");
+    run.brush.end_saving();
+    run.hover((150.0, 80.0));
+    assert!(!run.brush.ahead.tiles.is_empty(), "made again");
+    run.cut();
+    run.land_all();
+    assert!(run.brush.ahead.tiles.is_empty(), "let go by a flush");
+    other.close();
+    run.close();
+}

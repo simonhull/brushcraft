@@ -1411,7 +1411,7 @@ fn on_futures<T>(
     installed: &mut BTreeSet<TileKey>,
     mut call: impl FnMut(&mut Recorded<'_, StoreSurface<'_>>) -> T,
 ) -> Result<T, OnFutures> {
-    let ahead = ahead.of(earlier);
+    let ahead = ahead.of(scene.project.store(), earlier);
     let mut futures: Option<Futures<'_>> = None;
     for _ in 0..FUTURE_ROUNDS {
         let (made, reads) = {
@@ -1477,32 +1477,63 @@ const AHEAD_MOST: usize = 128;
 /// ([`install`]), and knows each tile's box exactly ([`needed`]). They are kept beside the
 /// strokes, not in the store: no op is reserved for a pen that only hovers.
 ///
-/// **They stay right** while the stroke `after` is under way: a future is what the strokes'
-/// landing leaves, which their landing doesn't change (a stroke before `after` that ends has
-/// landed just that), and none of them places a dab more (they are made only with every pen
-/// up, the strokes sealed). A stroke that drops dabs ends in that call, and every stroke after
-/// it with it, `after` among them. So they are read only by a stroke begun right after `after`
-/// ([`Ahead::of`]), and let go once `after` is no longer under way ([`Sculpting::keep_ahead`]).
+/// **They stay right** while the stroke `after` is under way and nothing but the strokes' own
+/// landing writes the store. What that rests on, all of it:
+///
+/// - **A future doesn't change as its strokes land:** it is what their landing leaves, however far
+///   the landing has got (a stroke before `after` that ends has landed just that), bit for bit
+///   ([`sculpt::Futures`], "Bit for bit").
+/// - **None of the strokes places a dab more:** they are made only with every pen up, the strokes
+///   sealed ([`Sculpting::warm_futures`]).
+/// - **The strokes under way change in four ways only:** a stroke begins, the newest (it reads
+///   them, if it begins right after `after`); the oldest ends, every dab landed (its futures are
+///   the tiles then); the oldest drops dabs, and ends in that call with every stroke after it
+///   ([`Sculpting::take_later`]), `after` among them; or all go (an abandon). An op is never handed
+///   out twice, so `after` names one stroke for good.
+/// - **Nothing but landing writes corrections while strokes are under way,** and the store's
+///   current op is the oldest stroke's the whole time: every edit of it is that stroke's, and no
+///   other op begins before the strokes' own. A restore's strokes resume before any `Down`, and no
+///   future is made while one waits to resume.
+///
+/// **They fail closed** where one of those doesn't hold. They are read only by a stroke begun
+/// right after `after`, over a store that is the one they were made over and whose current op is
+/// still the oldest stroke's ([`Ahead::of`]): anything that began or ended an op behind the
+/// brush's back (a save moving the op off, another writer) leaves them unread. They are let go
+/// once `after` is no longer under way ([`Sculpting::keep_ahead`]), and outright by every path
+/// of the brush that isn't a stroke's own placing and landing: a restore's strokes taken on, a
+/// save, a close, a flush, an abandon. **A path added later that writes corrections outside a
+/// stroke's landing (undo and redo, above all) must let them go too** ([`Ahead::clear`]): no
+/// tag of the store's says such a write happened.
 #[derive(Debug, Default)]
 struct Ahead {
     /// The op of the newest stroke under way as they were made; `None` with none made.
     after: Option<OpId>,
+    /// The store they were made over; `None` with none made.
+    store: Option<store::StoreId>,
     /// Each tile's future, with its box.
     tiles: BTreeMap<TileKey, Future>,
     /// What they were listed for: where the pen hovered, the view, and the brush's radius in
-    /// pixels then. A still pen's are listed once.
+    /// pixels then.
     target: Option<(Pixel, View, f32)>,
     /// The tiles still to make for `target`, the next to make last.
     todo: Vec<TileKey>,
 }
 
 impl Ahead {
-    /// The futures made ahead that a stroke begun over `earlier` reads: those of exactly these
-    /// strokes, the newest of them the one they were made up to. `None` if they are of another
-    /// chain (or none is made).
-    fn of(&self, earlier: &[Pending]) -> Option<&BTreeMap<TileKey, Future>> {
+    /// The futures made ahead that a stroke begun over `earlier` reads from `store`: those of
+    /// exactly these strokes, the newest of them the one they were made up to, over this very
+    /// store, its current op still the oldest stroke's (see [`Ahead`], "They fail closed").
+    /// `None` otherwise, or if none is made: the stroke makes its own.
+    fn of(&self, store: &TileStore, earlier: &[Pending]) -> Option<&BTreeMap<TileKey, Future>> {
         let newest = earlier.last().map(|stroke| stroke.op.id());
-        (newest.is_some() && newest == self.after).then_some(&self.tiles)
+        let oldest = earlier.first().and_then(|stroke| match &stroke.op {
+            StrokeOp::Begun(op) => Some(*op),
+            StrokeOp::Reserved { .. } => None,
+        });
+        let theirs = newest.is_some() && newest == self.after;
+        let unchanged =
+            self.store == Some(store.id()) && oldest.is_some() && store.current_op() == oldest;
+        (theirs && unchanged).then_some(&self.tiles)
     }
 
     /// Lets every future go, and what was listed.
@@ -1628,7 +1659,7 @@ impl OpenStrokes for Open<'_> {
         });
         let reads: Vec<Read> = balls.collect();
         let store = self.project.store();
-        let ahead = self.ahead.of(earlier);
+        let ahead = self.ahead.of(store, earlier);
         let Ok(mut wanted) = needed(store, self.index, earlier, &reads, ahead) else {
             return false;
         };
@@ -3883,9 +3914,11 @@ impl Sculpting {
         if !over || !sealed || self.pen_on_stroke() {
             return false;
         }
-        if self.ahead.after != newest {
+        let theirs = Some(scene.project.store().id());
+        if self.ahead.after != newest || self.ahead.store != theirs {
             self.ahead.clear();
             self.ahead.after = newest;
+            self.ahead.store = theirs;
         }
         let target = (at, view, self.settings.radius().get());
         if self.ahead.target != Some(target) {
@@ -3968,7 +4001,7 @@ impl Sculpting {
             from.map_or(0.0, |(point, bounds)| bounds.aabb.distance_squared(point))
         };
 
-        let made = self.ahead.of(&self.strokes);
+        let made = self.ahead.of(store, &self.strokes);
         let mut listed: Vec<TileKey> = Vec::new();
         let mut seen: BTreeSet<TileKey> = BTreeSet::new();
         for read in &reads {
@@ -4023,8 +4056,8 @@ impl Sculpting {
             center,
             radius: rounded_up(center, reach),
         };
-        let ahead = self.ahead.of(earlier);
         let store = scene.project.store();
+        let ahead = self.ahead.of(store, earlier);
         let Ok(wanted) = needed(store, scene.index, earlier, &[read], ahead) else {
             return;
         };
@@ -4368,6 +4401,7 @@ impl Brush for Sculpting {
         context: BrushContext<'_>,
         strokes: Vec<OpenStroke>,
     ) -> Result<(), NotTakenOn> {
+        self.ahead.clear();
         self.take_on(context, strokes)
     }
 
@@ -4376,6 +4410,7 @@ impl Brush for Sculpting {
     }
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
+        self.ahead.clear();
         self.landing = Landing::InSteps;
         // Nothing waits for a save any more: a close lands every stroke there is, and the save
         // holds them all.
@@ -4412,6 +4447,7 @@ impl Brush for Sculpting {
     }
 
     fn begin_saving(&mut self, asked: Instant) {
+        self.ahead.clear();
         self.save_asked = Some(asked);
     }
 
@@ -4485,6 +4521,7 @@ impl Brush for Sculpting {
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
         self.installing = Installing::new();
+        self.ahead.clear();
         let errors = self.errors_kept();
         self.landing = Landing::InFrames;
         self.save_asked = None;
