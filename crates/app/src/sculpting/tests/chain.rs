@@ -1660,7 +1660,8 @@ fn reads_across(camera: &Camera) -> Vec<Read> {
     let rays: Vec<Ray> = rays.collect();
     assert!(rays.len() > 50, "rays through the view");
     let mut reads: Vec<Read> = Vec::new();
-    for (n, ray) in rays.iter().enumerate() {
+    let numbered = rays.iter().enumerate();
+    for (n, ray) in numbered {
         let until = [1.9, 2.3, f64::INFINITY][n % 3];
         reads.push(Read::Ray { ray: *ray, until });
         let center = ray.origin() + ray.direction() * 2.0;
@@ -1698,7 +1699,8 @@ fn assert_grown_holds_futures(run: &mut Chain, case: &str) -> usize {
     let made = futures.futures_of(store, &changed);
     let index = run.picker.index_mut();
     let mut boxed = 0;
-    for (key, future) in changed.iter().zip(made) {
+    let futures_made = changed.iter().zip(made);
+    for (key, future) in futures_made {
         let Some(bounds) = future.expect("a future").bounds() else {
             continue;
         };
@@ -1794,7 +1796,8 @@ fn with_futures_at_hand_the_tiles_asked_for_lie_between_those_a_read_reaches_and
             read_meets(read, stored[key]) || future.is_some_and(|bounds| read_meets(read, bounds))
         };
         let mut reached = BTreeSet::new();
-        for key in tiles.iter().filter(|key| met(key)) {
+        let met_tiles = tiles.iter().filter(|key| met(key));
+        for key in met_tiles {
             if all.contains_key(key) {
                 reached.insert(*key);
             }
@@ -2391,5 +2394,49 @@ fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
     run.prepare_out();
     assert_ne!(run.brush.ahead.target, walked_at, "listed where it rests");
     run.brush.abandon();
+    run.close();
+}
+
+#[test]
+fn landing_refits_a_tile_without_losing_the_box_of_a_future_installed_for_it() {
+    // A stroke over one still landing has futures installed; the first lands on, refitting the
+    // tiles it writes: each tile's box in the index still holds the future the later stroke
+    // reads there, so its raycasts find it.
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.frame(&crossing());
+    assert_eq!(run.ops().len(), 2, "both under way");
+    let installed = run.installed();
+    assert!(!installed.is_empty(), "futures installed");
+    run.cut();
+    run.land_some(8);
+    assert_eq!(run.ops().len(), 2, "the first still lands");
+    let newest = run.brush.strokes.last().expect("the second");
+    let StrokeOp::Reserved { token, .. } = &newest.op else {
+        panic!("the second's op is reserved");
+    };
+    let shapes: Vec<(TileKey, store::Aabb)> = {
+        let reading = run
+            .project
+            .store()
+            .read_pen_down_of(token)
+            .expect("reserved");
+        let boxed = installed.iter().filter_map(|key| {
+            let bounds = reading.pen_down_shape(key)?.bounds()?;
+            Some((*key, bounds))
+        });
+        boxed.collect()
+    };
+    assert_eq!(shapes.len(), installed.len(), "a shape a future");
+    let index = run.picker.index_mut();
+    for (key, shape) in shapes {
+        let kept = index.bvh().bounds(&key).expect("a tile of the index").aabb;
+        assert_eq!(
+            kept.union(shape),
+            kept,
+            "tile {key:?}: its box in the index holds the future installed"
+        );
+    }
+    run.land_all();
     run.close();
 }

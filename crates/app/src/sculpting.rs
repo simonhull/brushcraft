@@ -1704,12 +1704,8 @@ impl OpenStrokes for Open<'_> {
         };
         // The tiles the strokes before still change, as they land: a future of one landed is
         // the tile itself, so none is installed.
-        let changed = |key: &TileKey| {
-            let mut kept = earlier
-                .iter()
-                .filter_map(|before| before.remaining.as_ref());
-            kept.any(|remaining| remaining.reach.contains_key(key))
-        };
+        let moves = Moves::of(earlier);
+        let changed = |key: &TileKey| moves.changed(key);
         if !displays.is_empty() {
             let under = stroke
                 .display_reads
@@ -1757,7 +1753,8 @@ fn install_in_time(
     let Ok(futures) = Futures::new(project.store(), state, &chain) else {
         return false;
     };
-    for some in missing.chunks(sculpt::futures_together()) {
+    let batches = missing.chunks(sculpt::futures_together());
+    for some in batches {
         if !installing.more() {
             return false;
         }
@@ -4052,8 +4049,9 @@ impl Sculpting {
         };
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let hit = surface.raycast(&ray);
-        if let Err(error) = surface.finish() {
-            self.fail("warming the surface under the pen", &error);
+        // Work ahead of a `Down` that may never come: a raycast that fails lists nothing and
+        // says nothing. The `Down` itself reports what it meets.
+        if surface.finish().is_err() {
             return;
         }
         let along = Read::Ray {

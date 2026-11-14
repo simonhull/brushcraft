@@ -549,7 +549,8 @@ fn together_case(seed: u64, config: impl FnOnce(StoreConfig) -> StoreConfig) {
     for order in [&keys, &backwards] {
         let together = made.futures_of(project.store(), order);
         assert_eq!(together.len(), order.len(), "{case}: a future a tile");
-        for (key, future) in order.iter().zip(together) {
+        let made_together = order.iter().zip(together);
+        for (key, future) in made_together {
             let future = future.unwrap();
             let one = &alone[key];
             assert_eq!(bits(future.tile()), bits(one), "{case}, tile {key:?}");
@@ -678,7 +679,8 @@ fn futures_made_together_fail_tile_by_tile() {
     keys.insert(1, stranger);
     let together = made.futures_of(project.store(), &keys);
     assert_eq!(together.len(), keys.len());
-    for (key, future) in keys.iter().zip(together) {
+    let made_together = keys.iter().zip(together);
+    for (key, future) in made_together {
         if *key == stranger {
             assert!(
                 matches!(future, Err(SculptError::Cache(_))),
