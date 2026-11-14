@@ -39,6 +39,14 @@ impl TileStore {
         self.id
     }
 
+    /// How many evaluation workers the store has
+    /// ([`StoreConfig::workers`](super::config::StoreConfig::workers)): how many items
+    /// [`TileStore::par_map`] computes at once, so how much work is worth handing it together.
+    #[must_use]
+    pub fn workers(&self) -> usize {
+        self.workers.current_num_threads()
+    }
+
     /// What the store has done since it opened: tiles loaded and evaluated, and evicted to make
     /// room (see [`Activity`]). Two counts around a call, through [`Activity::since`], give what
     /// that call did.

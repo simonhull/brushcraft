@@ -75,6 +75,11 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     ] {
         let config = roomy().with_workers(fixed(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
+        assert_eq!(
+            store.workers(),
+            threads,
+            "the store says its workers' count"
+        );
         brush_rounds(&mut store, &keys, &around, true);
         assert_eq!(
             store.hooks.log.in_place.len(),
