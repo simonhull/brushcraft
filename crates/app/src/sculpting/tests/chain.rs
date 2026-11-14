@@ -1232,70 +1232,263 @@ fn a_second_down_routed_gives_the_firsts_op_back_and_a_close_or_an_abandon_the_l
     abandoned.close();
 }
 
-/// How many times `a_down_over_a_heavy_stroke_is_timed` draws its case: the median is said.
+/// How many times each timed case is drawn ([`time_downs`]): the median and the spread are said.
 const TIMED_RUNS: usize = 7;
 
-/// The median of `times`.
-fn median(mut times: Vec<Duration>) -> Duration {
-    times.sort_unstable();
-    times.get(times.len() / 2).copied().unwrap_or_default()
+/// The most hover frames a warmed case is given before its `Down` ([`Timed::run`]).
+const HOVER_FRAMES: usize = 2000;
+
+/// The brush's radius in the ordinary timed cases, in pixels: about a tile of the 4 × 4 a face,
+/// so a pass across the sphere places some eighty dabs.
+const ORDINARY_RADIUS: f32 = 8.0;
+
+/// The median of `times`, with the least and the most.
+fn spread(times: &[Duration]) -> String {
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    let at = |place: usize| sorted.get(place).copied().unwrap_or_default();
+    let last = sorted.len().saturating_sub(1);
+    format!(
+        "{:.2?} ({:.2?} to {:.2?})",
+        at(sorted.len() / 2),
+        at(0),
+        at(last)
+    )
+}
+
+/// The machine's load averages as it says them, for a measurement's record.
+fn load() -> String {
+    let said = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let averages: Vec<&str> = said.split_whitespace().take(3).collect();
+    averages.join(" ")
+}
+
+/// How the surface under a timed `Down` stands as it comes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Before {
+    /// The earlier stroke still lands, and the pen comes down with no hover before: every
+    /// future the `Down` reads is made in it.
+    Cold,
+    /// The earlier stroke still lands, and the pen hovered where it comes down until the
+    /// brush's warming had nothing left.
+    Warmed,
+    /// The earlier stroke has landed and ended: the `Down` of a stroke alone, what the same
+    /// samples cost with nothing to read of another stroke.
+    Landed,
+}
+
+/// A `Down` timed over an earlier stroke ([`Timed::run`]).
+#[derive(Debug, Clone)]
+struct Timed {
+    /// The brush's radius, in pixels, for both strokes; `None` for the default.
+    radius: Option<f32>,
+    /// The earlier stroke's samples, `Down` to `Up`.
+    earlier: Vec<PenSample>,
+    /// Whether half the earlier stroke's dabs land before the `Down`.
+    half_landed: bool,
+    /// Where the pen comes down, and its first drag.
+    pen: ((f64, f64), (f64, f64)),
+}
+
+/// What one run of a timed `Down` took ([`Timed::run`]).
+#[derive(Debug, Clone, Copy)]
+struct Took {
+    /// Routing the `Down`.
+    route: Duration,
+    /// The step that takes the `Down` and its first drag, and shows its first dab.
+    step: Duration,
+    /// The futures installed for the stroke by the end of that step.
+    installed: usize,
+    /// The earlier stroke's dabs still to land as the pen came down.
+    backlog: usize,
+    /// The tiles those dabs reach.
+    reach: usize,
+    /// The hover frames before the `Down`, and what their warming took in all.
+    hover: (usize, Duration),
+}
+
+impl Timed {
+    /// The heavy case: a stroke to and fro over the sphere's middle, 64 passes, none of it
+    /// landed, and a `Down` on its middle.
+    fn heavy() -> Self {
+        let mut earlier = to_and_fro(64);
+        earlier.push(sample(Phase::Up, ACROSS.0, 0.0));
+        Self {
+            radius: None,
+            earlier,
+            half_landed: false,
+            pen: ((160.0, 105.0), (163.0, 105.5)),
+        }
+    }
+
+    /// An ordinary case: one pass across the sphere with a brush about a tile wide
+    /// ([`ORDINARY_RADIUS`]), half of it landed, and a `Down` at `pen`.
+    fn ordinary(pen: ((f64, f64), (f64, f64))) -> Self {
+        Self {
+            radius: Some(ORDINARY_RADIUS),
+            earlier: stroke(((110.0, 100.0), (210.0, 110.0)), 60),
+            half_landed: true,
+            pen,
+        }
+    }
+
+    /// Draws the case once, on a face of 4 × 4 tiles, and times its `Down`: routed, then
+    /// stepped with its first drag, as a frame does.
+    ///
+    /// `prepare` has kept up what a later stroke reads of the earlier one, as the frames after
+    /// it would. A warmed `Down` comes after hover frames at its pixel, each a step and a
+    /// `prepare` with a 4 ms deadline, until `prepare` has no more to do; the catch-up is held
+    /// meanwhile (as during a close), so a warmed `Down` is over the same dabs as a cold one.
+    fn run(&self, before: Before) -> Took {
+        let level = Level::new(BACKLOG_LEVEL).expect("a level");
+        let config = StoreConfig::new(256 << 20, 1).with_display(level);
+        let mut run = Chain::new(Instant::now(), Some(config));
+        run.build_display();
+        if let Some(radius) = self.radius {
+            run.brush.set_radius(radius);
+        }
+        run.frame(&self.earlier);
+        let placed = run.rows().first().map_or(0, Vec::len);
+        if self.half_landed {
+            run.cut();
+            for _ in 0..placed / 2 {
+                assert_eq!(run.land_one().dabs_applied, 1, "a dab lands");
+            }
+        }
+        if before == Before::Landed {
+            run.cut();
+            run.land_all();
+        }
+        let kept_up = context(&mut run.project, run.picker.index_mut(), &run.camera);
+        run.brush
+            .prepare(kept_up, Instant::now())
+            .expect("prepared");
+        let backlog = run.rows().first().map_or(0, Vec::len);
+        let reach = run.brush.strokes.first().map_or(0, |earlier| {
+            let remaining = earlier.remaining.as_ref();
+            remaining.map_or(0, |remaining| remaining.reach.len())
+        });
+        let (at, then) = self.pen;
+        let mut hover = (0, Duration::ZERO);
+        if before == Before::Warmed {
+            run.brush.landing = Landing::InSteps;
+            let mut pen = PenFrame::default();
+            pen.push(sample(Phase::Hover, at, 0.0), None);
+            let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
+            for _ in 0..HOVER_FRAMES {
+                let stepped = context(&mut run.project, run.picker.index_mut(), &run.camera);
+                run.brush.step(stepped, &pen, &budget).expect("a step");
+                let prepared = context(&mut run.project, run.picker.index_mut(), &run.camera);
+                let began = Instant::now();
+                let more = run
+                    .brush
+                    .prepare(prepared, began + Duration::from_millis(4))
+                    .expect("prepared");
+                hover = (hover.0 + 1, hover.1 + began.elapsed());
+                if !more {
+                    break;
+                }
+            }
+            run.brush.landing = Landing::InFrames;
+        }
+        let down = sample(Phase::Down, at, 0.8);
+        let drag = sample(Phase::Drag, then, 0.8);
+        let began = Instant::now();
+        let routed = run.route(&down);
+        let route = began.elapsed();
+        assert_eq!(routed, Route::Brush, "on the surface");
+        let stepped = Instant::now();
+        let first = run.frame(&[down, drag]);
+        let step = stepped.elapsed();
+        assert!(first.dabs_shown > 0, "its first dab is shown: {first:?}");
+        let over = if before == Before::Landed { 1 } else { 2 };
+        assert_eq!(run.ops().len(), over, "it began, over the earlier stroke");
+        let installed = run
+            .brush
+            .strokes
+            .last()
+            .map_or(0, |newest| match &newest.op {
+                StrokeOp::Reserved { installed, .. } => installed.len(),
+                StrokeOp::Begun(_) => 0,
+            });
+        run.brush.abandon();
+        run.close();
+        Took {
+            route,
+            step,
+            installed,
+            backlog,
+            reach,
+            hover,
+        }
+    }
+}
+
+/// Times `case`'s `Down` with the surface under it as each of `befores` says, [`TIMED_RUNS`]
+/// times each, and prints the medians with their spread and the machine's load: a measurement,
+/// asserting nothing of time.
+fn time_downs(name: &str, case: &Timed, befores: &[Before]) {
+    println!("{name} (load {})", load());
+    for &before in befores {
+        let runs: Vec<Took> = (0..TIMED_RUNS).map(|_| case.run(before)).collect();
+        let of = |part: fn(&Took) -> Duration| -> Vec<Duration> { runs.iter().map(part).collect() };
+        let Some(last) = runs.last() else {
+            return;
+        };
+        println!(
+            "  {before:?}: over {} dabs still to land on {} tiles, {} futures installed; routed \
+             in {}, stepped to its first dab in {}, {} in all; {} hover frames warming {:.2?}",
+            last.backlog,
+            last.reach,
+            last.installed,
+            spread(&of(|took| took.route)),
+            spread(&of(|took| took.step)),
+            spread(&of(|took| took.route + took.step)),
+            last.hover.0,
+            last.hover.1,
+        );
+    }
+    println!(
+        "  (load {} after; medians of {TIMED_RUNS}, least to most)",
+        load()
+    );
 }
 
 /// A measurement, printed and asserting nothing of time: a heavy stroke, then at once a stroke
 /// over it, from its `Down`'s routing to the step that places and shows its first dab.
 ///
 /// The heavy stroke goes to and fro over the sphere's middle on a face of 4 × 4 tiles, none of it
-/// landed; `prepare` has kept up what a later stroke reads of it, as the frames after it would.
-/// The `Down` is routed and then stepped with its first drag, as a frame does: the time said is
-/// the routing's, the step's, and both.
+/// landed: its dabs dig far past the sphere's middle, so the `Down` on it, its radius frozen at
+/// that depth, reaches every tile the stroke changes.
 #[test]
 #[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
 fn a_down_over_a_heavy_stroke_is_timed() {
-    let mut routing = Vec::with_capacity(TIMED_RUNS);
-    let mut stepping = Vec::with_capacity(TIMED_RUNS);
-    let mut backlog = 0;
-    for _ in 0..TIMED_RUNS {
-        let level = Level::new(BACKLOG_LEVEL).expect("a level");
-        let config = StoreConfig::new(256 << 20, 1).with_display(level);
-        let mut run = Chain::new(Instant::now(), Some(config));
-        run.build_display();
-        let mut heavy = to_and_fro(64);
-        heavy.push(sample(Phase::Up, ACROSS.0, 0.0));
-        run.frame(&heavy);
-        backlog = run.rows().first().map_or(0, Vec::len);
-        let kept_up = context(&mut run.project, run.picker.index_mut(), &run.camera);
-        run.brush
-            .prepare(kept_up, Instant::now())
-            .expect("prepared");
-        let down = sample(Phase::Down, (160.0, 105.0), 0.8);
-        let drag = sample(Phase::Drag, (163.0, 105.5), 0.8);
-        let began = Instant::now();
-        let routed = run.brush.route(
-            context(&mut run.project, run.picker.index_mut(), &run.camera),
-            &down,
-        );
-        let routed_in = began.elapsed();
-        assert_eq!(routed, Route::Brush, "on the heavy stroke");
-        let stepped = Instant::now();
-        let first = run.frame(&[down, drag]);
-        let stepped_in = stepped.elapsed();
-        assert_eq!(run.ops().len(), 2, "it began over the heavy stroke");
-        assert!(first.dabs_shown > 0, "its first dab is shown: {first:?}");
-        routing.push(routed_in);
-        stepping.push(stepped_in);
-        run.brush.abandon();
-        run.close();
-    }
-    let both = routing
-        .iter()
-        .zip(&stepping)
-        .map(|(route, step)| *route + *step);
-    let both: Vec<Duration> = both.collect();
-    println!(
-        "a Down over {backlog} dabs still to land: routed in {:?}, stepped to its first dab in \
-         {:?}, {:?} in all (medians of {TIMED_RUNS})",
-        median(routing),
-        median(stepping),
-        median(both),
+    let befores = [Before::Cold, Before::Warmed];
+    time_downs("a Down over a heavy stroke", &Timed::heavy(), &befores);
+}
+
+/// The reference of `a_down_over_a_heavy_stroke_is_timed`: the same `Down` once the heavy stroke
+/// has landed, a stroke alone. Apart, as landing the heavy stroke each time takes long.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_down_once_a_heavy_stroke_has_landed_is_timed() {
+    let befores = [Before::Landed];
+    time_downs(
+        "a Down once a heavy stroke has landed",
+        &Timed::heavy(),
+        &befores,
     );
+}
+
+/// A measurement, printed and asserting nothing of time: an ordinary stroke across the sphere,
+/// half of it landed, then a stroke on the half still to land, and another beside it.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_down_over_an_ordinary_stroke_is_timed() {
+    let befores = [Before::Cold, Before::Warmed, Before::Landed];
+    let over = Timed::ordinary(((185.0, 107.5), (188.0, 107.8)));
+    let name = "a Down on an ordinary stroke's half still to land";
+    time_downs(name, &over, &befores);
+    let beside = Timed::ordinary(((185.0, 122.0), (188.0, 122.3)));
+    time_downs("a Down beside an ordinary stroke", &beside, &befores);
 }

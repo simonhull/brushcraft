@@ -1188,8 +1188,11 @@ fn install(
     let store = project.store();
     let mut added: Vec<TileKey> = Vec::with_capacity(fresh.len());
     let mut outcome = Ok(());
-    for key in fresh {
-        let Ok(tile) = futures.future_of(store, key) else {
+    // Made together, on the store's workers: about one tile's time for them all.
+    let made = futures.futures_of(store, &fresh);
+    let made = fresh.into_iter().zip(made);
+    for (key, tile) in made {
+        let Ok(tile) = tile else {
             outcome = Err(OnFutures::Futures);
             break;
         };

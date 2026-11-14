@@ -492,6 +492,129 @@ fn a_future_without_kept_predictions_is_the_landed_tile() {
     assert_landed(project.store(), &futures, "no kept predictions");
 }
 
+/// One case, of `seed`, of futures made together against the same made one at a time, over a
+/// store of `config`'s settings.
+///
+/// A stroke A partly landed and a stroke B placed over its futures, neither landed further: every
+/// tile's future made alone ([`Futures::future_of`]), then all together on the store's workers
+/// ([`Futures::futures_of`]), in key order and in reverse, are the same bits; and they are the
+/// tiles once both strokes have landed.
+fn together_case(seed: u64, config: impl FnOnce(StoreConfig) -> StoreConfig) {
+    let case = format!("seed {seed}");
+    let mut rng = Rng::new(seed);
+    let dir = TestDir::new();
+    let (mut project, mut index) = project(&dir, config);
+    let a = random_stroke(project.store(), &mut rng, 24, 0);
+    let b = random_stroke(project.store(), &mut rng, 12, 24);
+    let (first, rest) = a.split_at(usize::try_from(rng.below(12)).unwrap());
+    let mut state = Stroke::new(project.store());
+    let op = project.begin_stroke_and_wait().unwrap();
+    let a_reach = reach(&index, &a);
+    let keys = tiles(project.store().mesh(), level());
+    let all: BTreeSet<TileKey> = keys.iter().copied().collect();
+    let open = Open {
+        op,
+        dabs: &a,
+        reach: &a_reach,
+    };
+    let mut edits = place_chain(project.store(), &state, &[open], &mut rng);
+    let [a_edits] = edits.as_mut_slice() else {
+        panic!("one stroke placed");
+    };
+    land_some(
+        project.store(),
+        &mut index,
+        &mut state,
+        a_edits,
+        first,
+        &mut rng,
+    );
+    let later = place_chain_after(
+        project.store(),
+        &state,
+        &mut edits,
+        op.next().unwrap(),
+        &b,
+        &all,
+        &mut rng,
+    );
+    edits.push(later);
+
+    let alone = futures(project.store(), &state, &edits);
+    assert!(changed(project.store(), &alone) > 1, "{case}: tiles change");
+    let chain: Vec<&StrokeEdits> = edits.iter().collect();
+    let made = Futures::new(project.store(), &state, &chain).unwrap();
+    let backwards: Vec<TileKey> = keys.iter().rev().copied().collect();
+    for order in [&keys, &backwards] {
+        let together = made.futures_of(project.store(), order);
+        assert_eq!(together.len(), order.len(), "{case}: a future a tile");
+        for (key, future) in order.iter().zip(together) {
+            let future = future.unwrap();
+            let one = &alone[key];
+            assert_eq!(bits(&future), bits(one), "{case}, tile {key:?}");
+        }
+    }
+    drop(made);
+
+    land(project.store(), &mut index, &mut state, rest, &mut rng);
+    project.end_unrecorded_stroke().unwrap();
+    project.begin_stroke_and_wait().unwrap();
+    land(project.store(), &mut index, &mut state, &b, &mut rng);
+    project.end_unrecorded_stroke().unwrap();
+    assert_landed(project.store(), &alone, &case);
+}
+
+#[test]
+fn futures_made_together_are_those_made_one_at_a_time_bit_for_bit() {
+    for seed in 50..54 {
+        together_case(seed, |config| config);
+    }
+    // Past the stroke state's room (the decisions made), and with few or no predictions kept
+    // (made for the call).
+    together_case(54, |config| config.with_stroke_tiles(4));
+    together_case(55, |config| config.with_kept_predictions(0));
+    together_case(56, |config| config.with_kept_predictions(3));
+}
+
+#[test]
+fn futures_made_together_fail_tile_by_tile() {
+    // A tile that isn't the store's fails alone; the others are made all the same.
+    let mut rng = Rng::new(61);
+    let dir = TestDir::new();
+    let (mut project, index) = project(&dir, |config| config);
+    let dabs = random_stroke(project.store(), &mut rng, 12, 0);
+    let state = Stroke::new(project.store());
+    let op = project.begin_stroke_and_wait().unwrap();
+    let reach = reach(&index, &dabs);
+    let open = Open {
+        op,
+        dabs: &dabs,
+        reach: &reach,
+    };
+    let edits = place_chain(project.store(), &state, &[open], &mut rng);
+    let alone = futures(project.store(), &state, &edits);
+    let chain: Vec<&StrokeEdits> = edits.iter().collect();
+    let made = Futures::new(project.store(), &state, &chain).unwrap();
+    let stranger = TileKey::displacement(FaceId::new(999), level(), 0, 0).unwrap();
+    let mut keys = tiles(project.store().mesh(), level());
+    keys.insert(1, stranger);
+    let together = made.futures_of(project.store(), &keys);
+    assert_eq!(together.len(), keys.len());
+    for (key, future) in keys.iter().zip(together) {
+        if *key == stranger {
+            assert!(
+                matches!(future, Err(SculptError::Cache(_))),
+                "not a tile of the store's: {future:?}"
+            );
+        } else {
+            let one = &alone[key];
+            assert_eq!(bits(&future.unwrap()), bits(one), "tile {key:?}");
+        }
+    }
+    drop(made);
+    project.end_unrecorded_stroke().unwrap();
+}
+
 /// The edits of a stroke of op `op` opened after the chain `earlier`, its `dabs` placed whole at
 /// the futures of `earlier` over `reach`.
 fn place_chain_after(

@@ -75,6 +75,17 @@
 //! - **A future**: one tile replayed over the dabs of each stroke that touch it: about what landing
 //!   that tile costs.
 //!
+//! # Together
+//!
+//! A tile's future depends on no other tile's: it reads its own corrections, pen-down positions
+//! and prediction, the chain's dabs and decisions, and the stroke state, none of which a replay
+//! changes. So many are made together ([`Futures::futures_of`]): what the store's caches must
+//! give (each tile's corrections and pen-down positions, the tiles pinned, their predictions
+//! kept or made) is read first, on the calling thread, one tile after another as before, and the
+//! replays then run on the store's workers, a tile each, reading that alone. Each future is the
+//! bits it has made alone; a stroke of hundreds of dabs over tens of tiles costs a `Down` over it
+//! about its dearest tile's replay, not their sum, on a machine with the cores.
+//!
 //! # What it writes
 //!
 //! Nothing a reader of the surface sees: no correction, no op, no change or stale-tile feed, no
@@ -276,11 +287,12 @@ impl PenDownTiles {
         if !before.sealed() {
             return Err(FutureError::Unsealed.into());
         }
-        for &key in keys {
-            if self.tiles.contains_key(&key) {
-                continue;
-            }
-            let tile = before.future_of(store, key)?;
+        let missing = keys.iter().filter(|key| !self.tiles.contains_key(key));
+        let missing: Vec<TileKey> = missing.copied().collect();
+        let futures = before.futures_of(store, &missing);
+        let left = missing.into_iter().zip(futures);
+        for (key, tile) in left {
+            let tile = tile?;
             let _pins = store.pin(&[key])?;
             let made = ensure_prediction(store, key)?;
             let prediction = prediction_of(store, key, made)?;
@@ -651,6 +663,8 @@ impl<'a> Futures<'a> {
     /// Tile `key` once every stroke of the chain has landed its remaining dabs, made without
     /// writing. A chain with no dabs touching it gives the tile as stored.
     ///
+    /// One of [`Futures::futures_of`], which makes many together.
+    ///
     /// # Errors
     ///
     /// [`SculptError::Cache`] if the store can't read or pin the tile, or keep its prediction;
@@ -662,15 +676,68 @@ impl<'a> Futures<'a> {
         store: &mut TileStore,
         key: TileKey,
     ) -> Result<CorrectionTile, SculptError> {
+        let mut made = self.futures_of(store, &[key]);
+        made.pop()
+            .unwrap_or_else(|| Err(FutureError::Unreadable.into()))
+    }
+
+    /// The future of each tile of `keys` ([`Futures::future_of`]), in their order, each tile's
+    /// replay on one of `store`'s workers: the tiles' futures don't depend on each other, so many
+    /// cost about the dearest's time on a machine with the cores (see "Together" in the module
+    /// notes).
+    ///
+    /// Each is the bits [`Futures::future_of`] gives of that tile alone, whichever worker made
+    /// it and whatever else was made with it.
+    ///
+    /// # Errors
+    ///
+    /// Each tile's own, as [`Futures::future_of`]: one that fails leaves the others as they
+    /// are.
+    pub fn futures_of(
+        &self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+    ) -> Vec<Result<CorrectionTile, SculptError>> {
+        // Each tile's start, read one after another; a tile no dab touches is done with it.
+        let mut touched: Vec<Start> = Vec::new();
+        let started = keys.iter().map(|&key| match self.start(store, key) {
+            Ok(start) if start.touched() => {
+                touched.push(start);
+                None
+            }
+            Ok(start) => Some(Ok(start.tile)),
+            Err(error) => Some(Err(error)),
+        });
+        let started: Vec<Option<Result<CorrectionTile, SculptError>>> = started.collect();
+        let most = store.kept_predictions().max(TOGETHER);
+        let batches = touched.chunks(most);
+        let replayed: Vec<Result<CorrectionTile, SculptError>> = batches
+            .flat_map(|batch| self.replay_together(store, batch))
+            .collect();
+        let mut replayed = replayed.into_iter();
+        started
+            .into_iter()
+            .map(|done| {
+                done.or_else(|| replayed.next())
+                    .unwrap_or_else(|| Err(FutureError::Unreadable.into()))
+            })
+            .collect()
+    }
+
+    /// What tile `key`'s future starts from, read from `store` (see [`Start`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if the store can't read the tile; [`SculptError::Future`] with
+    /// [`FutureError::ForeignPenDown`] if the oldest stroke touches the tile and the store's
+    /// shape of it isn't that stroke's.
+    fn start(&self, store: &mut TileStore, key: TileKey) -> Result<Start, SculptError> {
         let touching: Vec<(Vec<Imprint>, Vec<usize>)> = self
             .strokes
             .iter()
             .map(|(edits, _)| edits.touching(&key))
             .collect();
-        let mut tile: CorrectionTile = store.correction(key)?.to_tile();
-        if touching.iter().all(|(imprints, _)| imprints.is_empty()) {
-            return Ok(tile);
-        }
+        let tile: CorrectionTile = store.correction(key)?.to_tile();
         // The oldest stroke's pen-down positions, as its landing reads them.
         let first_pen_down: Option<Vec<Vec3>> = match (self.strokes.first(), touching.first()) {
             (Some((edits, _)), Some((imprints, _))) if !imprints.is_empty() => {
@@ -678,31 +745,99 @@ impl<'a> Futures<'a> {
             }
             _ => None,
         };
-        let _pins = store.pin(&[key])?;
-        let made = ensure_prediction(store, key)?;
+        Ok(Start {
+            key,
+            tile,
+            touching,
+            first_pen_down,
+        })
+    }
 
+    /// The futures of the tiles `batch` starts, in order, each replayed on one of `store`'s
+    /// workers: the tiles pinned together and their predictions kept (or made) first, on the
+    /// calling thread, as the store's caches need.
+    ///
+    /// A batch whose tiles can't be pinned or predicted together (the pins past the budget,
+    /// say) is made in two halves, down to a tile alone, whose error is its own.
+    fn replay_together(
+        &self,
+        store: &mut TileStore,
+        batch: &[Start],
+    ) -> Vec<Result<CorrectionTile, SculptError>> {
+        let keys: Vec<TileKey> = batch.iter().map(|start| start.key).collect();
+        let ready = store
+            .pin(&keys)
+            .map_err(SculptError::from)
+            .and_then(|pins| Ok((pins, ensure_predictions(store, &keys)?)));
+        let (_pins, made) = match (ready, batch) {
+            (Ok(ready), _) => ready,
+            (Err(_), []) => return Vec::new(),
+            (Err(error), [_]) => return vec![Err(error)],
+            (Err(_), _) => {
+                let (first, second) = batch.split_at(batch.len() / 2);
+                let mut futures = self.replay_together(store, first);
+                futures.extend(self.replay_together(store, second));
+                return futures;
+            }
+        };
         let store: &TileStore = store;
-        let prediction = prediction_of(store, key, made)?;
-        let landing = self.strokes.iter().zip(&touching).enumerate();
-        for (n, ((edits, plan), (imprints, numbers))) in landing {
+        let jobs = batch.iter().zip(made).map(|(start, made)| {
+            let prediction = prediction_of(store, start.key, made);
+            prediction.map(|prediction| (start, prediction))
+        });
+        let jobs: Vec<Result<(&Start, Cow<'_, Prediction>), FutureError>> = jobs.collect();
+        let continued: Vec<Option<&Stroke>> = self
+            .strokes
+            .iter()
+            .map(|(edits, _)| self.stroke.continued(store, edits.op))
+            .collect();
+        let topology = store.mesh().topology();
+        store.par_map(&jobs, |job| {
+            let (start, prediction) = job.as_ref().map_err(|error| *error)?;
+            Ok(self.replay(topology, &continued, start, prediction)?)
+        })
+    }
+
+    /// The future of the tile `start` starts, its prediction `prediction`: every stroke of the
+    /// chain's dabs touching it replayed on its corrections in turn. `continued` is, for each
+    /// stroke of the chain, the stroke state its next dab goes on from
+    /// ([`Stroke::continued`]). It reads nothing of the store, so the workers run it, a tile
+    /// each.
+    ///
+    /// # Errors
+    ///
+    /// [`FutureError::Refused`] for a value the tile can't hold, or [`FutureError::Unreadable`].
+    fn replay(
+        &self,
+        topology: &Topology,
+        continued: &[Option<&Stroke>],
+        start: &Start,
+        prediction: &Prediction,
+    ) -> Result<CorrectionTile, FutureError> {
+        let key = start.key;
+        let mut tile = start.tile.clone();
+        let first_pen_down = &start.first_pen_down;
+        let landing = self.strokes.iter().zip(&start.touching).zip(continued);
+        let landing = landing.enumerate();
+        for (n, (((_, plan), (imprints, numbers)), &stroke)) in landing {
             if imprints.is_empty() {
                 continue;
             }
             // A later stroke's pen-down shape of the tile is the future the strokes before it
             // leave.
             let pen_down: Cow<'_, [Vec3]> = if n == 0
-                && let Some(positions) = &first_pen_down
+                && let Some(positions) = first_pen_down
             {
                 Cow::Borrowed(positions)
             } else {
-                Cow::Owned(positions_of(&prediction, &tile)?)
+                Cow::Owned(positions_of(prediction, &tile)?)
             };
             let run = Run {
                 imprints,
                 numbers: Some(numbers),
                 plan,
-                stroke: self.stroke.continued(store, edits.op),
-                topology: store.mesh().topology(),
+                stroke,
+                topology,
                 #[cfg(test)]
                 break_twins: false,
             };
@@ -710,17 +845,17 @@ impl<'a> Futures<'a> {
                 key,
                 pen_down: PenDownTile::Positions(Some(&pen_down)),
                 corrections: tile.view(),
-                prediction: Some(&prediction),
+                prediction: Some(prediction),
                 frames: None,
             };
             let outcome = replay_tile(run, input);
             match outcome.stopped {
                 None => {}
                 Some(Stopped::Refused(error)) => {
-                    return Err(FutureError::Refused { stroke: n, error }.into());
+                    return Err(FutureError::Refused { stroke: n, error });
                 }
                 Some(Stopped::NoBorder | Stopped::Inconsistent) => {
-                    return Err(FutureError::Unreadable.into());
+                    return Err(FutureError::Unreadable);
                 }
             }
             if let Some(written) = outcome.written {
@@ -728,6 +863,38 @@ impl<'a> Futures<'a> {
             }
         }
         Ok(tile)
+    }
+}
+
+/// The fewest futures [`Futures::futures_of`] makes together, however few predictions the store
+/// keeps.
+///
+/// Enough for the workers of most machines to have a tile each; those the store can't keep are
+/// predicted for the call alone.
+const TOGETHER: usize = 16;
+
+/// What one tile's future starts from, read from the store one tile after another before the
+/// workers replay ([`Futures::futures_of`]).
+#[derive(Debug)]
+struct Start {
+    /// The tile.
+    key: TileKey,
+    /// Its corrections as stored.
+    tile: CorrectionTile,
+    /// For each stroke of the chain, its dabs not landed that touch the tile, with their
+    /// numbers ([`StrokeEdits::touching`]).
+    touching: Vec<(Vec<Imprint>, Vec<usize>)>,
+    /// The oldest stroke's pen-down positions of the tile, as its landing reads them, if its
+    /// dabs touch it.
+    first_pen_down: Option<Vec<Vec3>>,
+}
+
+impl Start {
+    /// Whether a dab of the chain touches the tile: else its future is the tile as stored.
+    fn touched(&self) -> bool {
+        self.touching
+            .iter()
+            .any(|(imprints, _)| !imprints.is_empty())
     }
 }
 
@@ -797,13 +964,58 @@ fn ensure_prediction(
     if kept && store.kept_prediction(&key).is_some() {
         return Ok(None);
     }
+    Ok(Some(predict_afresh(store, key)?))
+}
+
+/// Tile `key`'s prediction made afresh from its parents, made current first, and not kept (see
+/// [`ensure_prediction`]).
+///
+/// # Errors
+///
+/// As [`TileStore::frames_many`]; [`FutureError::Unreadable`] if the parents aren't current to
+/// predict from (never, just after they were made so).
+fn predict_afresh(store: &mut TileStore, key: TileKey) -> Result<Prediction, SculptError> {
     store.frames_many(&[key])?;
     let parents = store.parent_slots(&key).ok_or(FutureError::Unreadable)?;
     let prediction = store
         .predictor()
         .predict(&key, &parents)
         .ok_or(FutureError::Unreadable)?;
-    Ok(Some(prediction))
+    Ok(prediction)
+}
+
+/// [`ensure_prediction`] for each of `keys`, pinned by the caller, in their order: every one
+/// kept by the store if it can keep them together, else each the store doesn't keep made afresh.
+///
+/// Making one afresh reads the tile's parents through the store's caches, which may let go of a
+/// prediction kept: those are looked for again until every tile has one, kept or made.
+///
+/// # Errors
+///
+/// As [`ensure_prediction`].
+fn ensure_predictions(
+    store: &mut TileStore,
+    keys: &[TileKey],
+) -> Result<Vec<Option<Prediction>>, SculptError> {
+    match store.keep_predictions_of(keys) {
+        Ok(_) | Err(CacheError::Full | CacheError::OverBudget { .. }) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut made: Vec<Option<Prediction>> = keys.iter().map(|_| None).collect();
+    loop {
+        let mut more = false;
+        let lacking = keys.iter().zip(&mut made);
+        for (key, slot) in lacking {
+            if slot.is_some() || store.kept_prediction(key).is_some() {
+                continue;
+            }
+            *slot = Some(predict_afresh(store, *key)?);
+            more = true;
+        }
+        if !more {
+            return Ok(made);
+        }
+    }
 }
 
 /// Tile `key`'s prediction: `made`, if [`ensure_prediction`] made one, else the store's.
