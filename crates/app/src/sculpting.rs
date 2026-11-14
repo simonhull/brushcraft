@@ -777,6 +777,12 @@ struct Reach {
     /// lowers only the count): how far they can move one of its vertices together, as draw moves
     /// a vertex at most its strength a dab.
     strength: f64,
+    /// How far they can move one of its vertices together along each axis, the least (at most 0)
+    /// and the most (at least 0): each dab's span ([`sculpt::draw_span`]) summed, over every dab
+    /// that ever counted here. Draw moves a vertex along its dab's normal, one way, so a stroke
+    /// raising a ridge moves its tiles outward and hardly sideways: their boxes grow that way
+    /// alone, and a read beside the ridge needs none of them.
+    span: ([f64; 3], [f64; 3]),
     /// The tile's correction scales as it was first reached: what its planes' rounding grows
     /// from ([`sculpt::rounding_bound`]).
     scales: [f32; 3],
@@ -784,11 +790,117 @@ struct Reach {
 
 impl Reach {
     /// How far the dabs counted here, landing, can move a vertex of the tile from where it is
-    /// now: their strengths, and the finest work's rounding as its planes grow by them
-    /// ([`sculpt::rounding_bound`]).
+    /// now, whichever way: their strengths, and the finest work's rounding as its planes grow by
+    /// them ([`sculpt::rounding_bound`]).
     fn growth(&self) -> f64 {
         self.strength + sculpt::rounding_bound(self.scales, self.strength)
     }
+
+    /// Counts `dab` here: one more not landed, its strength and its span added.
+    fn count(&mut self, dab: &Dab) {
+        self.dabs += 1;
+        self.strength += f64::from(dab.strength.abs());
+        let (least, most) = sculpt::draw_span(dab);
+        let (low, high) = &mut self.span;
+        for (sum, part) in low.iter_mut().zip(least) {
+            *sum += part;
+        }
+        for (sum, part) in high.iter_mut().zip(most) {
+            *sum += part;
+        }
+    }
+}
+
+/// How far the strokes still landing can move the tiles they reach, together: what a later
+/// stroke's reads are tested against ([`needed`]).
+#[derive(Debug)]
+struct Moves<'a> {
+    /// What a later stroke reads of each of them, oldest first.
+    kept: Vec<&'a Remaining>,
+}
+
+impl<'a> Moves<'a> {
+    /// Those of `earlier`, each with its [`Remaining`] (one without is passed over).
+    fn of(earlier: &'a [Pending]) -> Self {
+        let remaining = earlier
+            .iter()
+            .filter_map(|stroke| stroke.remaining.as_ref());
+        Self {
+            kept: remaining.collect(),
+        }
+    }
+
+    /// Whether a dab of theirs still to land reaches tile `key`.
+    fn changed(&self, key: &TileKey) -> bool {
+        self.kept.iter().any(|kept| kept.reach.contains_key(key))
+    }
+
+    /// The tiles their dabs still to land reach.
+    fn tiles(&self) -> impl Iterator<Item = &TileKey> {
+        self.kept.iter().flat_map(|kept| kept.reach.keys())
+    }
+
+    /// The farthest they can move a vertex of any tile, whichever way: a bound, never lowered.
+    fn most(&self) -> f64 {
+        self.kept.iter().map(|kept| kept.most).sum()
+    }
+
+    /// How far they can move a vertex of tile `key` along each axis, the least and the most,
+    /// their rounding included; `None` for a tile they don't reach.
+    ///
+    /// Each stroke's span of the tile ([`Reach`]) summed, the strokes landing one after another;
+    /// and the finest work's rounding as the tile's planes grow by their strengths together
+    /// ([`sculpt::rounding_bound`]), either way along every axis.
+    fn span(&self, key: &TileKey) -> Option<([f64; 3], [f64; 3])> {
+        let reaching = self.kept.iter().filter_map(|kept| kept.reach.get(key));
+        let reaching: Vec<&Reach> = reaching.collect();
+        let scales = reaching.iter().map(|reach| reach.scales).reduce(|a, b| {
+            let mut most = a;
+            for (m, s) in most.iter_mut().zip(b) {
+                *m = m.max(s);
+            }
+            most
+        })?;
+        let strength: f64 = reaching.iter().map(|reach| reach.strength).sum();
+        let rounding = sculpt::rounding_bound(scales, strength);
+        let mut span = ([-rounding; 3], [rounding; 3]);
+        for reach in reaching {
+            let (low, high) = &mut span;
+            for (sum, part) in low.iter_mut().zip(reach.span.0) {
+                *sum += part;
+            }
+            for (sum, part) in high.iter_mut().zip(reach.span.1) {
+                *sum += part;
+            }
+        }
+        Some(span)
+    }
+
+    /// The box every point of tile `key` lies in once they have landed: its box in `index`,
+    /// which holds it as stored, grown by their span of it ([`Moves::span`]; not at all for a
+    /// tile they don't reach), and by the rounding of its `f32` bits. `None` for a tile `index`
+    /// has no box of.
+    fn grown(&self, index: &SpatialIndex, key: &TileKey) -> Option<Corners> {
+        let stored = index.bvh().bounds(key)?.aabb;
+        let (least, most) = self.span(key).unwrap_or_default();
+        let [lx, ly, lz] = least;
+        let [hx, hy, hz] = most;
+        let (low, high) = widened(stored);
+        Some((low + DVec3::new(lx, ly, lz), high + DVec3::new(hx, hy, hz)))
+    }
+}
+
+/// `aabb`'s corners, a little apart: by the rounding of its `f32` bits.
+fn widened(aabb: store::Aabb) -> Corners {
+    let (low, high) = (aabb.min(), aabb.max());
+    let (low, high) = (
+        DVec3::new(f64::from(low.x), f64::from(low.y), f64::from(low.z)),
+        DVec3::new(f64::from(high.x), f64::from(high.y), f64::from(high.z)),
+    );
+    let size = 1.0 + low.length().max(high.length());
+    let slack = 1e-6 * size;
+    let by = DVec3::new(slack, slack, slack);
+    (low - by, high + by)
 }
 
 /// What a later stroke reads of an earlier one still landing (the stroke-while-landing spec,
@@ -877,8 +989,7 @@ impl Remaining {
                             })
                         }
                     };
-                    tile.dabs += 1;
-                    tile.strength += f64::from(dab.strength.abs());
+                    tile.count(dab);
                     self.most = self.most.max(tile.growth());
                 }
             }
@@ -1033,8 +1144,8 @@ impl<S: Surface> Surface for Recorded<'_, S> {
 /// The tiles `reads` may have read whose futures differ from the store's tiles.
 ///
 /// Of those the strokes `earlier` still change: each whose box in `index`, grown by how far their
-/// dabs can move it ([`Reach::growth`]), a read reaches, and those in the ring of any tile a ball
-/// reaches by its normals.
+/// dabs can move it along each axis ([`Moves::grown`]), a read reaches, and those in the ring of
+/// any tile a ball reaches by its normals.
 ///
 /// What a later stroke's surface must have installed before that read for it to read the surface
 /// those strokes leave (the store's "Ops reserved ahead"): a tile they don't change is read as it
@@ -1050,44 +1161,16 @@ fn needed(
     earlier: &[Pending],
     reads: &[Read],
 ) -> Result<BTreeSet<TileKey>, CacheError> {
-    let reaches = earlier
-        .iter()
-        .filter_map(|stroke| stroke.remaining.as_ref());
-    let kept: Vec<&Remaining> = reaches.collect();
-    // How far the earlier strokes' dabs can move tile `key`; `None` for one they don't reach.
-    let growth = |key: &TileKey| -> Option<f64> {
-        let reaching: Vec<&Reach> = kept.iter().filter_map(|kept| kept.reach.get(key)).collect();
-        let strength: f64 = reaching.iter().map(|reach| reach.strength).sum();
-        let scales = reaching.iter().map(|reach| reach.scales).reduce(|a, b| {
-            let mut most = a;
-            for (m, s) in most.iter_mut().zip(b) {
-                *m = m.max(s);
-            }
-            most
-        })?;
-        Some(strength + sculpt::rounding_bound(scales, strength))
-    };
-    let changed = |key: &TileKey| kept.iter().any(|kept| kept.reach.contains_key(key));
-    let most: f64 = kept.iter().map(|kept| kept.most).sum();
-    // The box of tile `key` grown by how far it can move, and by the rounding of its `f32` bits.
-    let grown = |key: &TileKey| -> Option<(DVec3, DVec3)> {
-        let aabb = index.bvh().bounds(key)?.aabb;
-        let (low, high) = (aabb.min(), aabb.max());
-        let (low, high) = (
-            DVec3::new(f64::from(low.x), f64::from(low.y), f64::from(low.z)),
-            DVec3::new(f64::from(high.x), f64::from(high.y), f64::from(high.z)),
-        );
-        let size = 1.0 + low.length().max(high.length());
-        let slack = growth(key).unwrap_or(0.0) + 1e-6 * size;
-        let by = DVec3::new(slack, slack, slack);
-        Some((low - by, high + by))
-    };
+    let moves = Moves::of(earlier);
+    let changed = |key: &TileKey| moves.changed(key);
+    let most = moves.most();
+    // The box of tile `key` grown by how far it can move, each way.
+    let grown = |key: &TileKey| moves.grown(index, key);
     let mut needed: BTreeSet<TileKey> = BTreeSet::new();
     for read in reads {
         match *read {
             Read::Ray { ray, until } => {
-                let tiles = kept.iter().flat_map(|kept| kept.reach.keys());
-                let crossed = tiles.filter(|key| {
+                let crossed = moves.tiles().filter(|key| {
                     !needed.contains(*key)
                         && grown(key)
                             .is_none_or(|(low, high)| ray_meets_box(&ray, until, low, high))
@@ -1121,6 +1204,9 @@ fn needed(
     }
     Ok(needed)
 }
+
+/// A box's corners, the least and the most: what a read is tested against ([`needed`]).
+type Corners = (DVec3, DVec3);
 
 /// Whether `ray`, from its origin up to parameter `until`, meets the box from `low` to `high`
 /// (the slab test, its boundary included).
@@ -1191,11 +1277,12 @@ fn install(
     // Made together, on the store's workers: about one tile's time for them all.
     let made = futures.futures_of(store, &fresh);
     let made = fresh.into_iter().zip(made);
-    for (key, tile) in made {
-        let Ok(tile) = tile else {
+    for (key, future) in made {
+        let Ok(future) = future else {
             outcome = Err(OnFutures::Futures);
             break;
         };
+        let tile = future.into_tile();
         let reaching = earlier.iter().rev().find(|stroke| {
             let remaining = stroke.remaining.as_ref();
             remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))

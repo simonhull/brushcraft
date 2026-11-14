@@ -4,10 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{CorrectionTile, FaceId, Level, TileKey, Vec3};
-use store::{OpId, Project, ProjectConfig, SpatialIndex, StoreConfig, TileStore};
+use store::{Aabb, OpId, Project, ProjectConfig, SpatialIndex, StoreConfig, TileStore};
 use stroke::Dab;
 
-use super::{FutureError, Futures, PenDownTiles, StrokeEdits};
+use super::{FutureError, Futures, PenDownTiles, StrokeEdits, draw_span};
 use crate::apply::SculptError;
 use crate::apply_dabs;
 use crate::state::Stroke;
@@ -545,16 +545,27 @@ fn together_case(seed: u64, config: impl FnOnce(StoreConfig) -> StoreConfig) {
     let chain: Vec<&StrokeEdits> = edits.iter().collect();
     let made = Futures::new(project.store(), &state, &chain).unwrap();
     let backwards: Vec<TileKey> = keys.iter().rev().copied().collect();
+    let mut boxes: BTreeMap<TileKey, Option<Aabb>> = BTreeMap::new();
     for order in [&keys, &backwards] {
         let together = made.futures_of(project.store(), order);
         assert_eq!(together.len(), order.len(), "{case}: a future a tile");
         for (key, future) in order.iter().zip(together) {
             let future = future.unwrap();
             let one = &alone[key];
-            assert_eq!(bits(&future), bits(one), "{case}, tile {key:?}");
+            assert_eq!(bits(future.tile()), bits(one), "{case}, tile {key:?}");
+            if future.bounds().is_none() {
+                // No dab touches it: the tile as stored.
+                let now = stored(project.store(), *key);
+                assert_eq!(bits(one), bits(&now), "{case}, tile {key:?}");
+            }
+            boxes.insert(*key, future.bounds());
         }
     }
     drop(made);
+    assert!(
+        boxes.values().filter(|bounds| bounds.is_some()).count() > 1,
+        "{case}: boxes of the tiles touched"
+    );
 
     land(project.store(), &mut index, &mut state, rest, &mut rng);
     project.end_unrecorded_stroke().unwrap();
@@ -562,6 +573,15 @@ fn together_case(seed: u64, config: impl FnOnce(StoreConfig) -> StoreConfig) {
     land(project.store(), &mut index, &mut state, &b, &mut rng);
     project.end_unrecorded_stroke().unwrap();
     assert_landed(project.store(), &alone, &case);
+    // A future's box is the box of the tile's positions once the strokes have landed.
+    for (key, bounds) in boxes {
+        let Some(bounds) = bounds else {
+            continue;
+        };
+        let landed = project.store().evaluate(key).unwrap();
+        let evaluated = Aabb::from_points(landed.iter().copied());
+        assert_eq!(Some(bounds), evaluated, "{case}, tile {key:?}");
+    }
 }
 
 #[test]
@@ -574,6 +594,55 @@ fn futures_made_together_are_those_made_one_at_a_time_bit_for_bit() {
     together_case(54, |config| config.with_stroke_tiles(4));
     together_case(55, |config| config.with_kept_predictions(0));
     together_case(56, |config| config.with_kept_predictions(3));
+}
+
+#[test]
+fn a_dabs_span_holds_every_move_draw_gives_with_it() {
+    let mut rng = Rng::new(77);
+    let mut moved = 0;
+    for n in 0..400 {
+        let mut signed = || 2.0 * rng.unit() - 1.0;
+        let centre = Vec3::new(signed(), signed(), signed());
+        // Any direction, of any length: the brush takes it at unit length.
+        let normal = [3.0 * signed(), 3.0 * signed(), 3.0 * signed()];
+        let strength = 0.2 * signed();
+        let radius = 0.05 + rng.unit();
+        let placed = Dab {
+            normal,
+            ..dab(centre, radius, strength, rng.unit(), n)
+        };
+        let (least, most) = draw_span(&placed);
+        let imprint = crate::apply::imprint_of(&placed).unwrap();
+        for _ in 0..40 {
+            let mut offset = || 1.1 * radius * (2.0 * rng.unit() - 1.0);
+            let p = [
+                centre.x + offset(),
+                centre.y + offset(),
+                centre.z + offset(),
+            ];
+            let Some(by) = brush::draw_imprint_move(&brush::Smoothstep, &imprint, p) else {
+                continue;
+            };
+            moved += 1;
+            let parts = by.iter().zip(least.iter().zip(&most));
+            for (part, (low, high)) in parts {
+                let part = f64::from(*part);
+                assert!(
+                    *low <= part && part <= *high && *low <= 0.0 && *high >= 0.0,
+                    "dab {n}: a move of {part} outside {low} to {high}"
+                );
+            }
+        }
+    }
+    assert!(moved > 2_000, "points inside the dabs: {moved}");
+    // A dab the brush can't apply spans its strength every way.
+    let flat = Dab {
+        normal: [0.0; 3],
+        ..dab(Vec3::new(1.0, 0.0, 0.0), 0.1, -0.03, 0.0, 0)
+    };
+    let (least, most) = draw_span(&flat);
+    let strength = f64::from(0.03_f32);
+    assert_eq!((least, most), ([-strength; 3], [strength; 3]));
 }
 
 #[test]
@@ -608,7 +677,7 @@ fn futures_made_together_fail_tile_by_tile() {
             );
         } else {
             let one = &alone[key];
-            assert_eq!(bits(&future.unwrap()), bits(one), "tile {key:?}");
+            assert_eq!(bits(future.unwrap().tile()), bits(one), "tile {key:?}");
         }
     }
     drop(made);

@@ -86,6 +86,18 @@
 //! bits it has made alone; a stroke of hundreds of dabs over tens of tiles costs a `Down` over it
 //! about its dearest tile's replay, not their sum, on a machine with the cores.
 //!
+//! # Where a future lies
+//!
+//! A reader that knows where a tile's future lies needn't make (or install) it for a read that
+//! goes elsewhere. Two answers, both exact:
+//!
+//! - **Made**, a future says the box of its positions ([`Future::bounds`]): the tile's prediction
+//!   with the future's corrections applied, the positions the store evaluates of it.
+//! - **Before it is made**, it lies within the tile as stored moved by at most each remaining dab's
+//!   span ([`draw_span`]): draw moves a vertex along its dab's normal, one way, by at most the
+//!   dab's strength, so the spans of the dabs touching a tile, summed axis by axis, bound how far
+//!   its vertices go, and which way (with the finest work's rounding, [`crate::rounding_bound`]).
+//!
 //! # What it writes
 //!
 //! Nothing a reader of the surface sees: no correction, no op, no change or stale-tile feed, no
@@ -291,8 +303,9 @@ impl PenDownTiles {
         let missing: Vec<TileKey> = missing.copied().collect();
         let futures = before.futures_of(store, &missing);
         let left = missing.into_iter().zip(futures);
-        for (key, tile) in left {
-            let tile = tile?;
+        for (key, future) in left {
+            let tile = future?.into_tile();
+
             let _pins = store.pin(&[key])?;
             let made = ensure_prediction(store, key)?;
             let prediction = prediction_of(store, key, made)?;
@@ -533,6 +546,37 @@ impl StrokeEdits {
     }
 }
 
+/// How far the draw action can move a vertex with `dab`, along each axis: the least (at most 0)
+/// and the most (at least 0) of the move's components.
+///
+/// Draw moves each vertex in the dab's sphere along the dab's normal by its strength times a
+/// weight between 0 and 1 ([`brush::draw_move`]): never against the strength's sign, and never
+/// off the normal. So a vertex's move by the dab lies between nothing and the dab's whole move,
+/// component by component; the bounds given are that, a little apart for the rounding of the
+/// weight and the products. A stroke's dabs still to land move a vertex by the sum of such moves:
+/// what a later stroke bounds a tile's future by, before it is made (the stroke-while-landing
+/// spec, "What a new stroke reads").
+///
+/// A dab the brush can't apply (its landing fails at it) spans its strength every way.
+#[must_use]
+pub fn draw_span(dab: &Dab) -> ([f64; 3], [f64; 3]) {
+    /// How far past the exact bound the `f32` arithmetic of a move may land, of the strength.
+    const ROUNDING: f64 = 1e-6;
+    let strength = f64::from(dab.strength.abs());
+    let strength = if strength.is_finite() { strength } else { 0.0 };
+    let Ok(imprint) = imprint_of(dab) else {
+        return ([-strength; 3], [strength; 3]);
+    };
+    let slack = ROUNDING * strength;
+    let whole = imprint
+        .normal
+        .map(|along| f64::from(imprint.strength) * f64::from(along));
+    (
+        whole.map(|part| part.min(0.0) - slack),
+        whole.map(|part| part.max(0.0) + slack),
+    )
+}
+
 /// `imprint`'s sphere: its centre and squared radius.
 fn sphere(imprint: &Imprint) -> (Vec3, f32) {
     let [x, y, z] = imprint.center;
@@ -677,8 +721,10 @@ impl<'a> Futures<'a> {
         key: TileKey,
     ) -> Result<CorrectionTile, SculptError> {
         let mut made = self.futures_of(store, &[key]);
-        made.pop()
-            .unwrap_or_else(|| Err(FutureError::Unreadable.into()))
+        let future = made
+            .pop()
+            .unwrap_or_else(|| Err(FutureError::Unreadable.into()))?;
+        Ok(future.into_tile())
     }
 
     /// The future of each tile of `keys` ([`Futures::future_of`]), in their order, each tile's
@@ -687,7 +733,7 @@ impl<'a> Futures<'a> {
     /// notes).
     ///
     /// Each is the bits [`Futures::future_of`] gives of that tile alone, whichever worker made
-    /// it and whatever else was made with it.
+    /// it and whatever else was made with it, with the box of its positions ([`Future`]).
     ///
     /// # Errors
     ///
@@ -697,7 +743,7 @@ impl<'a> Futures<'a> {
         &self,
         store: &mut TileStore,
         keys: &[TileKey],
-    ) -> Vec<Result<CorrectionTile, SculptError>> {
+    ) -> Vec<Result<Future, SculptError>> {
         // Each tile's start, read one after another; a tile no dab touches is done with it.
         let mut touched: Vec<Start> = Vec::new();
         let started = keys.iter().map(|&key| match self.start(store, key) {
@@ -705,13 +751,16 @@ impl<'a> Futures<'a> {
                 touched.push(start);
                 None
             }
-            Ok(start) => Some(Ok(start.tile)),
+            Ok(start) => Some(Ok(Future {
+                tile: start.tile,
+                bounds: None,
+            })),
             Err(error) => Some(Err(error)),
         });
-        let started: Vec<Option<Result<CorrectionTile, SculptError>>> = started.collect();
+        let started: Vec<Option<Result<Future, SculptError>>> = started.collect();
         let most = store.kept_predictions().max(TOGETHER);
         let batches = touched.chunks(most);
-        let replayed: Vec<Result<CorrectionTile, SculptError>> = batches
+        let replayed: Vec<Result<Future, SculptError>> = batches
             .flat_map(|batch| self.replay_together(store, batch))
             .collect();
         let mut replayed = replayed.into_iter();
@@ -763,7 +812,7 @@ impl<'a> Futures<'a> {
         &self,
         store: &mut TileStore,
         batch: &[Start],
-    ) -> Vec<Result<CorrectionTile, SculptError>> {
+    ) -> Vec<Result<Future, SculptError>> {
         let keys: Vec<TileKey> = batch.iter().map(|start| start.key).collect();
         let ready = store
             .pin(&keys)
@@ -802,7 +851,7 @@ impl<'a> Futures<'a> {
     /// chain's dabs touching it replayed on its corrections in turn. `continued` is, for each
     /// stroke of the chain, the stroke state its next dab goes on from
     /// ([`Stroke::continued`]). It reads nothing of the store, so the workers run it, a tile
-    /// each.
+    /// each, with the box of the positions it leaves the tile at.
     ///
     /// # Errors
     ///
@@ -813,7 +862,7 @@ impl<'a> Futures<'a> {
         continued: &[Option<&Stroke>],
         start: &Start,
         prediction: &Prediction,
-    ) -> Result<CorrectionTile, FutureError> {
+    ) -> Result<Future, FutureError> {
         let key = start.key;
         let mut tile = start.tile.clone();
         let first_pen_down = &start.first_pen_down;
@@ -862,7 +911,44 @@ impl<'a> Futures<'a> {
                 tile = written;
             }
         }
-        Ok(tile)
+        let positions = positions_of(prediction, &tile)?;
+        let bounds = Aabb::from_points(positions.iter().copied());
+        Ok(Future { tile, bounds })
+    }
+}
+
+/// One tile's future ([`Futures::futures_of`]): its corrections once every stroke of the chain
+/// has landed, and the box they put it in.
+#[derive(Debug, Clone)]
+pub struct Future {
+    /// The tile's corrections then.
+    tile: CorrectionTile,
+    /// The box of its positions then, if a dab of the chain touches it.
+    bounds: Option<Aabb>,
+}
+
+impl Future {
+    /// The tile's corrections once the chain has landed.
+    #[must_use]
+    pub const fn tile(&self) -> &CorrectionTile {
+        &self.tile
+    }
+
+    /// The tile's corrections once the chain has landed, taken.
+    #[must_use]
+    pub fn into_tile(self) -> CorrectionTile {
+        self.tile
+    }
+
+    /// The box of the tile's positions once the chain has landed: its prediction with the
+    /// future's corrections applied, the positions the store evaluates of the future installed
+    /// as a pen-down shape, so every point a read of it finds lies inside.
+    ///
+    /// `None` for a tile no dab of the chain touches, which is the tile as stored, in the box it
+    /// has there (and for one with no finite position).
+    #[must_use]
+    pub const fn bounds(&self) -> Option<Aabb> {
+        self.bounds
     }
 }
 

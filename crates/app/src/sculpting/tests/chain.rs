@@ -111,6 +111,17 @@ impl Chain {
             .expect("a step")
     }
 
+    /// Lands `count` dabs of the oldest stroke or a few more, a step at a time
+    /// ([`Chain::land_one`]: a step lands one, now and then another with it).
+    fn land_some(&mut self, count: usize) {
+        let mut landed = 0;
+        while landed < count {
+            let step = self.land_one().dabs_applied;
+            assert!(step > 0, "a dab lands");
+            landed += step;
+        }
+    }
+
     /// Lands every dab the brush holds, every stroke after another, as a flush does.
     fn land_all(&mut self) {
         let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
@@ -158,6 +169,16 @@ impl Chain {
             }
         }
         panic!("the display layer never finished");
+    }
+
+    /// A `prepare` of the brush with no time to spare, as after a frame's hand-off: what a later
+    /// stroke reads of those under way is kept up, and each piece of work off the pen's path gets
+    /// its one batch.
+    fn prepare(&mut self) {
+        let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush
+            .prepare(prepared, Instant::now())
+            .expect("prepared");
     }
 
     /// Every tile's evaluated positions, then closes the project (keeping no recovery file).
@@ -1232,6 +1253,91 @@ fn a_second_down_routed_gives_the_firsts_op_back_and_a_close_or_an_abandon_the_l
     abandoned.close();
 }
 
+/// A [`Chain`] on a face of 4 × 4 tiles with an ordinary stroke across the sphere under way.
+///
+/// At [`BACKLOG_LEVEL`], none of the stroke landed, drawn with a brush of `radius` pixels (the
+/// default with `None`): it changes many tiles, of which a later stroke reads a few.
+fn across_many_tiles(radius: Option<f32>) -> Chain {
+    let level = Level::new(BACKLOG_LEVEL).expect("a level");
+    let config = StoreConfig::new(256 << 20, 1).with_display(level);
+    let mut run = Chain::new(Instant::now(), Some(config));
+    if let Some(radius) = radius {
+        run.brush.set_radius(radius);
+    }
+    run.frame(&stroke(((110.0, 100.0), (210.0, 110.0)), 60));
+    run.prepare();
+    run
+}
+
+/// Asserts that the box each tile is grown to holds its future, made now.
+///
+/// For every tile the strokes under way change ([`Moves::grown`]): what a read not reaching the
+/// box relies on. Returns how many tiles' futures have a box (the tiles a dab touches).
+fn assert_grown_holds_futures(run: &mut Chain, case: &str) -> usize {
+    run.prepare();
+    let moves = Moves::of(&run.brush.strokes);
+    let changed: Vec<TileKey> = moves.tiles().copied().collect();
+    let store = run.project.store();
+    let chain = chain_of(&run.brush.strokes).expect("made by prepare");
+    let futures = Futures::new(store, &run.brush.state, &chain).expect("a chain");
+    let made = futures.futures_of(store, &changed);
+    let index = run.picker.index_mut();
+    let mut boxed = 0;
+    for (key, future) in changed.iter().zip(made) {
+        let Some(bounds) = future.expect("a future").bounds() else {
+            continue;
+        };
+        boxed += 1;
+        let (low, high) = moves.grown(index, key).expect("a tile of the index");
+        let (least, most) = (bounds.min(), bounds.max());
+        let inside = f64::from(least.x) >= low.x
+            && f64::from(least.y) >= low.y
+            && f64::from(least.z) >= low.z
+            && f64::from(most.x) <= high.x
+            && f64::from(most.y) <= high.y
+            && f64::from(most.z) <= high.z;
+        assert!(
+            inside,
+            "{case}, tile {key:?}: its future {bounds:?} isn't in its grown box {low:?} to {high:?}"
+        );
+    }
+    boxed
+}
+
+#[test]
+fn the_box_a_tile_is_grown_to_holds_its_future() {
+    // An ordinary stroke, none landed, then half; a big brush's; one to and fro, its dabs piled
+    // up; and a stroke over another, both still to land.
+    let mut ordinary = across_many_tiles(Some(ORDINARY_RADIUS));
+    assert!(assert_grown_holds_futures(&mut ordinary, "ordinary") > 4);
+    ordinary.cut();
+    ordinary.land_some(40);
+    assert!(assert_grown_holds_futures(&mut ordinary, "half landed") > 2);
+    ordinary.brush.abandon();
+    ordinary.close();
+
+    let mut big = across_many_tiles(None);
+    assert!(assert_grown_holds_futures(&mut big, "a big brush") > 10);
+    // A second stroke over it, placed on its futures: the two together.
+    big.brush.set_radius(ORDINARY_RADIUS);
+    big.frame(&stroke(((150.0, 80.0), (170.0, 125.0)), 30));
+    assert_eq!(big.ops().len(), 2, "begun over the first");
+    assert!(assert_grown_holds_futures(&mut big, "two strokes") > 10);
+    big.brush.abandon();
+    big.close();
+
+    let level = Level::new(BACKLOG_LEVEL).expect("a level");
+    let config = StoreConfig::new(256 << 20, 1).with_display(level);
+    let mut piled = Chain::new(Instant::now(), Some(config));
+    piled.brush.set_radius(ORDINARY_RADIUS);
+    let mut fro = to_and_fro(6);
+    fro.push(sample(Phase::Up, ACROSS.0, 0.0));
+    piled.frame(&fro);
+    assert!(assert_grown_holds_futures(&mut piled, "to and fro") > 4);
+    piled.brush.abandon();
+    piled.close();
+}
+
 /// How many times each timed case is drawn ([`time_downs`]): the median and the spread are said.
 const TIMED_RUNS: usize = 7;
 
@@ -1351,9 +1457,7 @@ impl Timed {
         let placed = run.rows().first().map_or(0, Vec::len);
         if self.half_landed {
             run.cut();
-            for _ in 0..placed / 2 {
-                assert_eq!(run.land_one().dabs_applied, 1, "a dab lands");
-            }
+            run.land_some(placed / 2);
         }
         if before == Before::Landed {
             run.cut();
