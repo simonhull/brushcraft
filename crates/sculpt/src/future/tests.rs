@@ -7,11 +7,11 @@ use geom::{CorrectionTile, FaceId, Level, TileKey, Vec3};
 use store::{Aabb, OpId, Project, ProjectConfig, SpatialIndex, StoreConfig, TileStore};
 use stroke::Dab;
 
-use super::{FutureError, Futures, PenDownTiles, StrokeEdits, draw_span};
+use super::{FutureError, Futures, PenDownTiles, StrokeEdits};
 use crate::apply::SculptError;
-use crate::apply_dabs;
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab, fixed, tiles, vertex};
+use crate::{apply_dabs, dab_span};
 
 /// The level the tests edit: 128 quads a face, four tiles of 64.
 fn level() -> Level {
@@ -611,7 +611,7 @@ fn a_dabs_span_holds_every_move_draw_gives_with_it() {
             normal,
             ..dab(centre, radius, strength, rng.unit(), n)
         };
-        let (least, most) = draw_span(&placed);
+        let (least, most) = dab_span(&placed);
         let imprint = crate::apply::imprint_of(&placed).unwrap();
         for _ in 0..40 {
             let mut offset = || 1.1 * radius * (2.0 * rng.unit() - 1.0);
@@ -640,9 +640,18 @@ fn a_dabs_span_holds_every_move_draw_gives_with_it() {
         normal: [0.0; 3],
         ..dab(Vec3::new(1.0, 0.0, 0.0), 0.1, -0.03, 0.0, 0)
     };
-    let (least, most) = draw_span(&flat);
+    let (least, most) = dab_span(&flat);
     let strength = f64::from(0.03_f32);
     assert_eq!((least, most), ([-strength; 3], [strength; 3]));
+    // One whose strength isn't a number spans everything: every tile it reaches is asked for.
+    for endless in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let wild = dab(Vec3::new(1.0, 0.0, 0.0), 0.1, endless, 0.0, 0);
+        assert_eq!(
+            dab_span(&wild),
+            ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]),
+            "strength {endless}"
+        );
+    }
 }
 
 #[test]

@@ -143,13 +143,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use brush::{Imprint, Smoothstep, draw_imprint_vertex, draw_move};
+use brush::{Imprint, Smoothstep, draw_imprint_vertex};
 use geom::{GatheredBlock, Level, TileKey, Vec3};
 use store::{
     Aabb, CacheError, DisplayPreview, Evaluation, OpId, PenDownReading, SpatialIndex, TileStore,
 };
 use stroke::Dab;
 
+use crate::action::{Action, Draw};
 use crate::apply::{SculptError, imprint_of};
 
 mod dabs;
@@ -2443,7 +2444,7 @@ fn move_by(block: &mut GatheredBlock, pen_down: &GatheredBlock, dab: &Imprint) -
         match draw_imprint_vertex(&Smoothstep, dab, [at.x, at.y, at.z]) {
             Some(w) if w != 0.0 => {
                 moved = true;
-                let [x, y, z] = draw_move(dab, w);
+                let [x, y, z] = Draw::moved(dab, w);
                 p + Vec3::new(x, y, z)
             }
             _ => p,

@@ -112,14 +112,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use brush::{
-    Falloff, Hardened, Imprint, Smoothstep, draw_imprint_gradient, draw_imprint_vertex, draw_move,
-};
+use brush::{Falloff, Hardened, Imprint, Smoothstep, draw_imprint_gradient, draw_imprint_vertex};
 use geom::{DisplayTile, GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, DisplayPreview, Evaluation, TileStore};
 
 use super::dabs::DabIndex;
 use super::{Tag, bounds_of_points, touches};
+use crate::action::{Action, Draw};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -836,7 +835,7 @@ impl DisplayState {
             match draw_imprint_vertex(&Smoothstep, dab, at) {
                 Some(w) if w != 0.0 => {
                     moved = true;
-                    let [x, y, z] = draw_move(dab, w);
+                    let [x, y, z] = Draw::moved(dab, w);
                     if drawn {
                         *out = *out + Vec3::new(x, y, z);
                     }
@@ -898,7 +897,7 @@ impl DisplayState {
                         draw_imprint_vertex(&Smoothstep, dab, [start.x, start.y, start.z])
                         && w != 0.0
                     {
-                        let [x, y, z] = draw_move(dab, w);
+                        let [x, y, z] = Draw::moved(dab, w);
                         at = at + Vec3::new(x, y, z);
                     }
                 }

@@ -94,9 +94,10 @@
 //! - **Made**, a future says the box of its positions ([`Future::bounds`]): the tile's prediction
 //!   with the future's corrections applied, the positions the store evaluates of it.
 //! - **Before it is made**, it lies within the tile as stored moved by at most each remaining dab's
-//!   span ([`draw_span`]): draw moves a vertex along its dab's normal, one way, by at most the
-//!   dab's strength, so the spans of the dabs touching a tile, summed axis by axis, bound how far
-//!   its vertices go, and which way (with the finest work's rounding, [`crate::rounding_bound`]).
+//!   span ([`crate::dab_span`]): draw moves a vertex along its dab's normal, one way, by at most
+//!   the dab's strength, so the spans of the dabs touching a tile, summed axis by axis, bound how
+//!   far its vertices go, and which way (with the finest work's rounding,
+//!   [`crate::rounding_bound`]).
 //!
 //! # What it writes
 //!
@@ -544,37 +545,6 @@ impl StrokeEdits {
             })
             .unzip()
     }
-}
-
-/// How far the draw action can move a vertex with `dab`, along each axis: the least (at most 0)
-/// and the most (at least 0) of the move's components.
-///
-/// Draw moves each vertex in the dab's sphere along the dab's normal by its strength times a
-/// weight between 0 and 1 ([`brush::draw_move`]): never against the strength's sign, and never
-/// off the normal. So a vertex's move by the dab lies between nothing and the dab's whole move,
-/// component by component; the bounds given are that, a little apart for the rounding of the
-/// weight and the products. A stroke's dabs still to land move a vertex by the sum of such moves:
-/// what a later stroke bounds a tile's future by, before it is made (the stroke-while-landing
-/// spec, "What a new stroke reads").
-///
-/// A dab the brush can't apply (its landing fails at it) spans its strength every way.
-#[must_use]
-pub fn draw_span(dab: &Dab) -> ([f64; 3], [f64; 3]) {
-    /// How far past the exact bound the `f32` arithmetic of a move may land, of the strength.
-    const ROUNDING: f64 = 1e-6;
-    let strength = f64::from(dab.strength.abs());
-    let strength = if strength.is_finite() { strength } else { 0.0 };
-    let Ok(imprint) = imprint_of(dab) else {
-        return ([-strength; 3], [strength; 3]);
-    };
-    let slack = ROUNDING * strength;
-    let whole = imprint
-        .normal
-        .map(|along| f64::from(imprint.strength) * f64::from(along));
-    (
-        whole.map(|part| part.min(0.0) - slack),
-        whole.map(|part| part.max(0.0) + slack),
-    )
 }
 
 /// `imprint`'s sphere: its centre and squared radius.

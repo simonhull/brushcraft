@@ -144,7 +144,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
-use brush::{Imprint, Smoothstep, draw_imprint, draw_move};
+use brush::{Imprint, Smoothstep, draw_imprint};
 use geom::{Prediction, TileKey, Vec3};
 use store::{
     CacheError, Evaluation, IndexError, MadePenDown, ParentSlots, PenDownMaker, PenDownShape,
@@ -155,6 +155,7 @@ use thiserror::Error;
 
 use self::replay::TileOutcome;
 pub(crate) use self::replay::{Plan, Run, Stopped, TileInput, replay_tile};
+use crate::action::{Action, Draw};
 use crate::draw::{DrawParamsError, check_dab};
 use crate::future::FutureError;
 use crate::state::{Book, Stroke, TileStroke};
@@ -1267,7 +1268,7 @@ pub(crate) fn brush_tile(
 /// the same bits; and a vertex shared by several tiles has the same frame in each, so every copy
 /// gets the same delta.
 pub(crate) fn frame_delta(frame: &geom::Frame, imprint: &Imprint, w: f32) -> Vec3 {
-    let [x, y, z] = draw_move(imprint, w);
+    let [x, y, z] = Draw::moved(imprint, w);
     let moved = Vec3::new(x, y, z);
     Vec3::new(
         frame.t().dot(moved),

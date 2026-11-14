@@ -38,6 +38,7 @@
 //!
 //! No GPU or windowing code: everything here runs headless.
 
+mod action;
 mod apply;
 mod draw;
 mod footprint;
@@ -49,10 +50,11 @@ mod surface;
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod testing;
 
+pub use action::{Span, add_span, dab_span};
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
 pub use footprint::radius_covering;
-pub use future::{Future, FutureError, Futures, PenDownTiles, StrokeEdits, draw_span};
+pub use future::{Future, FutureError, Futures, PenDownTiles, StrokeEdits};
 pub use preview::{
     Drawn, DrawsAll, OpenStrokes, Preview, PreviewStats, WAITING_A_CALL, display_ancestors,
     rounding_bound,

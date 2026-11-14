@@ -2063,3 +2063,22 @@ fn a_down_over_an_ordinary_stroke_is_timed() {
     let beside_it = "a Down beside an ordinary stroke";
     time_downs(beside_it, &beside, &befores, TIMED_RUNS);
 }
+
+#[test]
+fn a_dab_whose_strength_is_no_number_reaches_every_way() {
+    // No bound can be said of it, so none is: its tile's box grows without end, and every read
+    // asks for the tile.
+    for strength in [f32::NAN, f32::INFINITY] {
+        let mut reach = Reach::default();
+        let wild = Dab {
+            strength,
+            normal: [0.0, 0.0, 1.0],
+            radius: 0.1,
+            ..Dab::default()
+        };
+        reach.count(&wild);
+        assert_eq!(reach.dabs, 1);
+        assert!(reach.strength.is_infinite() && reach.growth().is_infinite());
+        assert_eq!(reach.span, ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]));
+    }
+}

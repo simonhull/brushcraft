@@ -178,7 +178,7 @@
 //!   three things keep that off the pen's path. The futures a call lacks are **made together** on
 //!   the store's workers ([`Futures::futures_of`]), about the dearest tile's time for them all.
 //!   **Fewer are asked for:** a tile's box grows only the way its dabs move it, each along its
-//!   normal and one way ([`Moves::grown`], [`sculpt::draw_span`]), not by their strengths every
+//!   normal and one way ([`Moves::grown`], [`sculpt::dab_span`]), not by their strengths every
 //!   way; and a tile whose future is at hand is tested in its future's own box. And they are **made
 //!   ahead**, while the pen hovers and ahead of a drawing pen ("Warming under a hovering pen"
 //!   below), so a `Down` where the pen hovered installs them and makes none.
@@ -815,11 +815,11 @@ struct Reach {
     /// a vertex at most its strength a dab.
     strength: f64,
     /// How far they can move one of its vertices together along each axis, the least (at most 0)
-    /// and the most (at least 0): each dab's span ([`sculpt::draw_span`]) summed, over every dab
-    /// that ever counted here. Draw moves a vertex along its dab's normal, one way, so a stroke
-    /// raising a ridge moves its tiles outward and hardly sideways: their boxes grow that way
-    /// alone, and a read beside the ridge needs none of them.
-    span: ([f64; 3], [f64; 3]),
+    /// and the most (at least 0): each dab's span, its action's ([`sculpt::dab_span`]), summed
+    /// over every dab that ever counted here. Draw moves a vertex along its dab's normal, one
+    /// way, so a stroke raising a ridge moves its tiles outward and hardly sideways: their boxes
+    /// grow that way alone, and a read beside the ridge needs none of them.
+    span: sculpt::Span,
     /// The tile's correction scales as it was first reached: what its planes' rounding grows
     /// from ([`sculpt::rounding_bound`]).
     scales: [f32; 3],
@@ -833,18 +833,18 @@ impl Reach {
         self.strength + sculpt::rounding_bound(self.scales, self.strength)
     }
 
-    /// Counts `dab` here: one more not landed, its strength and its span added.
+    /// Counts `dab` here: one more not landed, its strength and its span added. A strength that
+    /// isn't a number counts as endless, as its span does: the tile is then asked for by every
+    /// read.
     fn count(&mut self, dab: &Dab) {
         self.dabs += 1;
-        self.strength += f64::from(dab.strength.abs());
-        let (least, most) = sculpt::draw_span(dab);
-        let (low, high) = &mut self.span;
-        for (sum, part) in low.iter_mut().zip(least) {
-            *sum += part;
-        }
-        for (sum, part) in high.iter_mut().zip(most) {
-            *sum += part;
-        }
+        let strength = f64::from(dab.strength.abs());
+        self.strength += if strength.is_finite() {
+            strength
+        } else {
+            f64::INFINITY
+        };
+        sculpt::add_span(&mut self.span, sculpt::dab_span(dab));
     }
 }
 
@@ -885,31 +885,31 @@ impl<'a> Moves<'a> {
     /// How far they can move a vertex of tile `key` along each axis, the least and the most,
     /// their rounding included; `None` for a tile they don't reach.
     ///
-    /// Each stroke's span of the tile ([`Reach`]) summed, the strokes landing one after another;
-    /// and the finest work's rounding as the tile's planes grow by their strengths together
-    /// ([`sculpt::rounding_bound`]), either way along every axis.
-    fn span(&self, key: &TileKey) -> Option<([f64; 3], [f64; 3])> {
+    /// Each stroke's span of the tile ([`Reach`]) summed, the strokes landing one after another.
+    /// And the finest work's rounding, either way along every axis, once for each stroke
+    /// reaching the tile: each stroke builds its vertices unrounded and rounds them as it writes,
+    /// so each adds an error of its own, on planes grown by then by at most all the strokes'
+    /// strengths together ([`sculpt::rounding_bound`] of the largest scales any of them found
+    /// and that sum, which bounds every stroke's). Sideways of a ridge this rounding is all the
+    /// margin there is, so it is the sum, not one stroke's.
+    fn span(&self, key: &TileKey) -> Option<sculpt::Span> {
         let reaching = self.kept.iter().filter_map(|kept| kept.reach.get(key));
-        let reaching: Vec<&Reach> = reaching.collect();
-        let scales = reaching.iter().map(|reach| reach.scales).reduce(|a, b| {
-            let mut most = a;
-            for (m, s) in most.iter_mut().zip(b) {
-                *m = m.max(s);
-            }
-            most
-        })?;
-        let strength: f64 = reaching.iter().map(|reach| reach.strength).sum();
-        let rounding = sculpt::rounding_bound(scales, strength);
-        let mut span = ([-rounding; 3], [rounding; 3]);
+        let mut span = sculpt::Span::default();
+        let (mut scales, mut strength, mut strokes) = ([0.0_f32; 3], 0.0_f64, 0.0_f64);
         for reach in reaching {
-            let (low, high) = &mut span;
-            for (sum, part) in low.iter_mut().zip(reach.span.0) {
-                *sum += part;
+            sculpt::add_span(&mut span, reach.span);
+            let found = scales.iter_mut().zip(reach.scales);
+            for (most, scale) in found {
+                *most = most.max(scale);
             }
-            for (sum, part) in high.iter_mut().zip(reach.span.1) {
-                *sum += part;
-            }
+            strength += reach.strength;
+            strokes += 1.0;
         }
+        if strokes == 0.0 {
+            return None;
+        }
+        let rounding = strokes * sculpt::rounding_bound(scales, strength);
+        sculpt::add_span(&mut span, ([-rounding; 3], [rounding; 3]));
         Some(span)
     }
 
