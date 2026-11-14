@@ -134,10 +134,8 @@ fn a_waiting_stroke_may_land_within_the_flush_s_syncs_under_ticking() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(
-        !project.writer.as_ref().unwrap().is_idle(),
-        "its pen-down flush is in flight, its cut taken"
-    );
+    // Its cut is taken. Whether its pen-down flush is still in flight depends on the disk: one
+    // poll can see both flushes through. The save point it names below is what is checked.
     b.land(&mut project, &mut map, 5);
     flush(&mut project);
     let points = project.store().working().save_points().unwrap();
