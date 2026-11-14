@@ -13,7 +13,7 @@
 //! A shown dab moves the finest tiles its sphere reaches as the store holds them, each gathered
 //! with its ring ([`TileStore::cached_positions_with_ring_many`]), as the finest work moves them:
 //! every point within its radius **at pen-down** moves by the draw action's own move
-//! ([`brush::draw_imprint_vertex`] at the point's pen-down position, and [`brush::draw_move`], the
+//! ([`brush::draw_imprint_vertex`] at the point's pen-down position, and [`Draw::moved`], the
 //! code `apply_dabs` runs): its displacement along the dab's normal, the dab's area normal, one
 //! direction for every point. The finest work writes that move into the vertex's correction, in
 //! its tangent frame, weighed at the same pen-down position. So a preview differs from what lands
@@ -2433,7 +2433,7 @@ fn gather(store: &mut TileStore, keys: &[TileKey], base: Base) -> Result<Vec<Mov
 /// Moves every point of `block` within `dab`'s radius at pen-down by the draw action's move.
 ///
 /// A point is weighed at its counterpart in `pen_down`, and moves by its displacement along the
-/// dab's normal ([`brush::draw_move`]). Returns whether it moved any, or `None` if `pen_down`
+/// dab's normal ([`Draw::moved`]). Returns whether it moved any, or `None` if `pen_down`
 /// isn't gathered over `block`'s region and nothing moved.
 ///
 /// A point with no displacement (on the rim, or of none at the falloff's edge) keeps its bits:

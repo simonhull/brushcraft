@@ -189,14 +189,15 @@
 //!   they hold the earlier strokes' work exactly and stay as it lands. The futures they read are
 //!   installed first ([`Open`], [`sculpt::OpenStrokes::ready`]): those about each dab's sphere and
 //!   in the rings there ([`over::needed`]), and for a display preview every tile the earlier
-//!   strokes change under it and around those ([`over::display_reads`]), at most [`FUTURES_TIME`]
-//!   of them a call, the rest in the calls after (one budget for a step, or a `prepare`). A dab
-//!   whose own finest futures can't be had stays unshown until they can be, or its op begins, and
-//!   nothing else holds it back: where its previews meet an earlier stroke's, both draw its bits
-//!   (the previews' "Seams"). A display preview whose futures aren't in yet stays the earlier
-//!   stroke's, the new dabs pending in its bound, and is made the later stroke's off the pen's path
-//!   ([`Brush::prepare`], [`Preview::take_over_displays`]). The previews end with the last stroke;
-//!   a later stroke dropped unlanded has its display previews let go ([`Sculpting::let_go`]).
+//!   strokes change under it and around those ([`over::display_reads`]), at most
+//!   [`over::FUTURES_TIME`] of them a call, the rest in the calls after (one budget for a step, or
+//!   a `prepare`). A dab whose own finest futures can't be had stays unshown until they can be, or
+//!   its op begins, and nothing else holds it back: where its previews meet an earlier stroke's,
+//!   both draw its bits (the previews' "Seams"). A display preview whose futures aren't in yet
+//!   stays the earlier stroke's, the new dabs pending in its bound, and is made the later stroke's
+//!   off the pen's path ([`Brush::prepare`], [`Preview::take_over_displays`]). The previews end
+//!   with the last stroke; a later stroke dropped unlanded has its display previews let go
+//!   ([`Sculpting::let_go`]).
 //! - **Landing in order:** the catch-up lands the oldest stroke only. As it ends, the next's op
 //!   begins ([`Project::begin_reserved_stroke`]), its futures its own pen-down shapes now, and its
 //!   first landing waits for its pen-down cut as any stroke's ([`Project::may_land`]). A close, a
@@ -293,11 +294,11 @@
 //! - **Made, not installed** ([`Ahead`], [`Sculpting::list_to_warm`]): the futures of the tiles a
 //!   `Down` at the hover would read (along the pen's ray, then about its hit: the hit's normals,
 //!   the brush's radius, the stroke's reach; [`Sculpting::list_ahead`]) are made on the store's
-//!   workers, a tile each ([`sculpt::futures_together`]), and kept beside the strokes, each with
-//!   its box. The catch-up comes first: they are made in the time it leaves a call, a call's
-//!   futures time at most ([`FUTURES_TIME`]), and where it leaves none for long ([`AHEAD_STARVED`])
-//!   a batch is made in a call of its own, so no call is held by both. A hover that moves keeps the
-//!   futures still near and lists only what is new, once it has moved a quarter of a radius
+//!   workers, a tile each ([`TileStore::workers`]), and kept beside the strokes, each with its box.
+//!   The catch-up comes first: they are made in the time it leaves a call, a call's futures time at
+//!   most ([`over::FUTURES_TIME`]), and where it leaves none for long ([`AHEAD_STARVED`]) a batch
+//!   is made in a call of its own, so no call is held by both. A hover that moves keeps the futures
+//!   still near and lists only what is new, once it has moved a quarter of a radius
 //!   ([`ahead::RELIST_RADII`]); one moving fast ([`HOVER_FAST`]) makes none. Nothing is reserved
 //!   for a pen that only hovers: an op reserved must be given back on every path, opens a journal,
 //!   and stands in the way of a stroke beginning alone; a future kept apart needs none of that, and
@@ -355,10 +356,8 @@ use stroke::{
     StrengthMode, Stroke, StrokeId, StrokeSettings, Surface, Tilt, Twist, Unit,
 };
 
-use self::ahead::{AHEAD_STARVED, Ahead, HOVER_FAST, Warming};
-use self::over::{
-    DisplayReads, FUTURES_TIME, Installing, OnFutures, Open, Recorded, Remaining, on_futures,
-};
+use self::ahead::{AHEAD_STARVED, Ahead, HOVER_FAST, HOVER_SETTLED, Warming};
+use self::over::{DisplayReads, Installing, OnFutures, Open, Recorded, Remaining, on_futures};
 pub(crate) use self::resume::{finish_restored, unseen_view};
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
@@ -1219,8 +1218,8 @@ pub(crate) struct Sculpting {
     /// while it is to end so.
     dropping_later: Option<Vec<ReservedOp>>,
     /// What the step under way (or `prepare`, or a landing step) may still spend installing a
-    /// later stroke's futures for its previews ([`FUTURES_TIME`]): one budget for all its calls,
-    /// set afresh as each begins.
+    /// later stroke's futures for its previews ([`over::FUTURES_TIME`]): one budget for all its
+    /// calls, set afresh as each begins.
     installing: Installing,
     /// The futures made ahead of a `Down` over the strokes under way, while the pen hovers.
     ahead: Ahead,
@@ -2883,8 +2882,10 @@ impl Sculpting {
     /// Notes where the pen hovers in this frame's view, for [`Brush::prepare`] to warm.
     fn note_hover(&mut self, pen: &PenFrame, view: Option<&View>) {
         let open = self.pen_on_stroke();
-        // Its speed, from the last place its tablet reported: a hover carried over from the
-        // frame before (the same report) is a pen holding still.
+        // Its speed, from the last place its tablet reported. A hover carried over from the
+        // frame before (the same report: frames may come faster than the tablet reports) is as
+        // fast as it was, until the tablet has said nothing more for long enough that the pen
+        // holds still ([`HOVER_SETTLED`]).
         let radius = f64::from(self.settings.radius().get());
         let hovered = pen.hover().map(|hover| (hover.at, hover.timestamp));
         self.warm.fast = match (self.warm.hovered, hovered) {
@@ -2892,6 +2893,9 @@ impl Sculpting {
                 let gone = (at.x - was.x).hypot(at.y - was.y);
                 let took = now.saturating_duration_since(then).as_secs_f64();
                 gone > HOVER_FAST * radius * took
+            }
+            (Some((_, then)), Some((_, now))) if now == then => {
+                self.warm.fast && then.elapsed() < HOVER_SETTLED
             }
             _ => false,
         };
@@ -3292,20 +3296,12 @@ impl Brush for Sculpting {
                 self.unframed |= progress;
                 self.caught_up = std::mem::take(&mut self.caught_up).then(report);
             }
-            if listed && !ahead_first {
-                let until = deadline.min(Instant::now() + FUTURES_TIME);
-                self.make_ahead(&mut scene, Some(until));
-            }
-            let more_ahead = warming == Warming::Later || (listed && !self.ahead.todo.is_empty());
+            let more_ahead = listed && self.make_ahead_in_time(&mut scene, ahead_first, deadline);
             // More of the catch-up wanted only while it moves on: a pen drawing takes only dabs
             // that fit, and the next frame (wanted while dabs are queued) tries again.
             return Ok((progress && self.queued() > 0) || more_ahead);
         }
-        if listed && !ahead_first {
-            let until = deadline.min(Instant::now() + FUTURES_TIME);
-            self.make_ahead(&mut scene, Some(until));
-        }
-        let more_ahead = warming == Warming::Later || (listed && !self.ahead.todo.is_empty());
+        let more_ahead = listed && self.make_ahead_in_time(&mut scene, ahead_first, deadline);
         // At least one piece of work each call, so warming finishes even in frames that overrun.
         let mut worked = false;
         if self.warm.wanted != self.warm.target {

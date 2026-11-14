@@ -21,7 +21,7 @@
 //! # Moves
 //!
 //! A dab moves `v` by the draw action's own move ([`brush::draw_imprint_vertex`],
-//! [`brush::draw_move`]) weighed at `P0(v)`, as the finest work weighs `u` at its pen-down
+//! [`Draw::moved`]) weighed at `P0(v)`, as the finest work weighs `u` at its pen-down
 //! position. What is drawn is `D(v) = base(v) + Σ m_d(P0(v))` over the dabs not yet in the base,
 //! in order: a vertex the store has moved since (inside a finest tile a landed dab changed) is
 //! **rebased** on the store's bits and takes the dabs still to land; any other takes every dab

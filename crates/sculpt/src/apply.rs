@@ -31,13 +31,13 @@
 //!    run is applied tile by tile (see "Tile by tile"):
 //!    - **Brush and edit**: each of the run's tiles, on the store's workers, takes every dab of the
 //!      run that reaches it, in order, on a copy of its own corrections: `brush`'s draw action
-//!      ([`brush::draw_imprint`], [`brush::draw_move`]) gives each vertex within the radius at
-//!      pen-down its move, its displacement along the dab's normal (its area normal: one direction
-//!      for every vertex), and the move is written in the vertex's tangent frame ([`frame_delta`],
-//!      the frames of the prediction the store keeps of it, [`TileStore::kept_prediction`]) as its
-//!      delta; the vertex's correction is set to the value the stroke builds for it, the correction
-//!      it first found there plus every delta since (see [`Stroke`]), so the stored value is
-//!      rounded to the tile's quantization once per stroke, not once per dab.
+//!      ([`brush::draw_imprint`], [`Draw::moved`]) gives each vertex within the radius at pen-down
+//!      its move, its displacement along the dab's normal (its area normal: one direction for every
+//!      vertex), and the move is written in the vertex's tangent frame ([`frame_delta`], the frames
+//!      of the prediction the store keeps of it, [`TileStore::kept_prediction`]) as its delta; the
+//!      vertex's correction is set to the value the stroke builds for it, the correction it first
+//!      found there plus every delta since (see [`Stroke`]), so the stored value is rounded to the
+//!      tile's quantization once per stroke, not once per dab.
 //!    - **Write**: the pen-down shapes of the tiles reached for the first time are kept; the tiles
 //!      are written back whole, together ([`TileStore::replace_corrections`]); the stroke's state
 //!      takes what the run did ([`Stroke::end_frame`]).
@@ -289,7 +289,7 @@ impl AddAssign for ApplyStats {
 /// module notes), the falloff [`Smoothstep`] made as hard as the dab's hardness
 /// ([`brush::Hardened`]), and `index` is brought up to date once for the frame (see the module
 /// notes for the phases). The normal is the dab's area normal, as placement takes it: one
-/// direction for every vertex the dab moves ([`brush::draw_move`]).
+/// direction for every vertex the dab moves (the draw action's move, `Draw::moved`).
 ///
 /// Each dab's values are taken as final: `strength` is the displacement at its centre in model
 /// units, `hardness` in `0..=1` (`0`, the plain falloff), the normal any finite, non-zero vector
@@ -1259,7 +1259,7 @@ pub(crate) fn brush_tile(
     }
 }
 
-/// `imprint`'s move of a vertex whose displacement is `w` ([`brush::draw_move`]: `w` along the
+/// `imprint`'s move of a vertex whose displacement is `w` ([`Draw::moved`]: `w` along the
 /// dab's normal), written in the vertex's tangent `frame`: the delta its correction takes.
 ///
 /// The frame is orthonormal, so the components are the move's along its axes, and the corrected

@@ -15,7 +15,7 @@ use sculpt::{Future, Futures, StoreSurface};
 use store::{OpId, TileStore};
 use stroke::{DVec3, Dab, Projector, REACH_RADII, Radius, ScreenPoint, Surface};
 
-use super::over::{Read, chain_of, install_in_time, needed, rounded_up};
+use super::over::{FUTURES_TIME, Read, chain_of, install_in_time, needed, rounded_up};
 use super::{AHEAD_DABS, CATCH_UP_STARVED, Pending, Scene, Sculpting, StrokeOp};
 use crate::camera::Pixel;
 
@@ -40,6 +40,13 @@ pub(super) const RELIST_RADII: f64 = 0.25;
 /// list was made a tenth of a second on.
 pub(super) const HOVER_FAST: f64 = 10.0 * REACH_RADII;
 
+/// How long a tablet says nothing more of a hovering pen before the pen is taken to hold still,
+/// however fast its last reports had it ([`HOVER_FAST`]).
+///
+/// A moving pen is reported every few milliseconds; a frame that finds the last report unchanged
+/// may only have come sooner than the next one.
+pub(super) const HOVER_SETTLED: Duration = Duration::from_millis(50);
+
 /// The most futures kept made ahead of a `Down` ([`Ahead`]): those nearest the hovering pen.
 ///
 /// A future is a tile's corrections, some tens of kilobytes, held beside the store's budget, so
@@ -52,7 +59,9 @@ pub(super) const AHEAD_MOST: usize = 128;
 pub(super) enum Warming {
     /// Nothing: no pen hovers over strokes still landing, or every future listed is made.
     Nothing,
-    /// Nothing now, the pen moving fast: the frame after is asked for, when it may have slowed.
+    /// Nothing now, the pen moving fast: the frame after looks again, when it may have slowed.
+    /// It is no work a `prepare` has left (nothing is to be called again for it): frames come
+    /// while the pen moves, and while the strokes' dabs are queued.
     Later,
     /// Futures are listed to make.
     Now,
@@ -155,7 +164,7 @@ impl Sculpting {
     /// Only where a `Down` would begin over the strokes under way
     /// ([`Sculpting::route_on_futures`]) and what a later stroke reads of each is made, every pen
     /// up: their futures are final then. Not for a pen moving fast ([`HOVER_FAST`]): the list
-    /// stands as it is, and the frame after is asked for, when the pen may have slowed. The
+    /// stands as it is, and the frame after looks again, when the pen may have slowed. The
     /// list is made again only once the pen is a quarter of a radius from where it was made
     /// ([`RELIST_RADII`]), or the view or the radius changed; the futures made stay, those
     /// still near.
@@ -197,8 +206,25 @@ impl Sculpting {
         }
     }
 
+    /// Makes futures listed ahead in the time a `prepare` has left before `deadline`, a call's
+    /// futures time at most ([`FUTURES_TIME`]); none if this call made its batch first
+    /// (`made_first`, the futures having waited long: [`AHEAD_STARVED`]). Returns whether some
+    /// are still to make.
+    pub(super) fn make_ahead_in_time(
+        &mut self,
+        scene: &mut Scene<'_>,
+        made_first: bool,
+        deadline: Instant,
+    ) -> bool {
+        if !made_first {
+            let until = deadline.min(Instant::now() + FUTURES_TIME);
+            self.make_ahead(scene, Some(until));
+        }
+        !self.ahead.todo.is_empty()
+    }
+
     /// Makes the futures listed ahead ([`Sculpting::list_to_warm`]), a workers' batch together
-    /// ([`sculpt::futures_together`]) on the store's workers: batches while the clock is before
+    /// ([`TileStore::workers`]) on the store's workers: batches while the clock is before
     /// `until`, or with `None` exactly one, whatever the time.
     pub(super) fn make_ahead(&mut self, scene: &mut Scene<'_>, until: Option<Instant>) {
         if self.ahead.todo.is_empty() {
@@ -215,7 +241,7 @@ impl Sculpting {
             && (owed || until.is_some_and(|until| Instant::now() < until))
         {
             owed = false;
-            let most = sculpt::futures_together();
+            let most = store.workers().max(1);
             let split = self.ahead.todo.len().saturating_sub(most);
             let batch = self.ahead.todo.split_off(split);
             #[cfg(test)]

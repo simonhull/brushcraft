@@ -33,6 +33,8 @@ struct Chain {
     camera: Camera,
     /// When the last cut was ticked at ([`Chain::cut`]).
     ticked: Instant,
+    /// When the pen's last hover ([`Chain::hover`]) was reported.
+    hovered: Instant,
 }
 
 impl Chain {
@@ -64,6 +66,7 @@ impl Chain {
             brush,
             camera: Camera::default(),
             ticked: Instant::now(),
+            hovered: Instant::now(),
         }
     }
 
@@ -180,11 +183,16 @@ impl Chain {
     /// frames it took, and their `prepare`s' time in all.
     ///
     /// The catch-up is held meanwhile (as during a close), so nothing lands: the `Down` after it
-    /// is over the same dabs as one with no hover before.
+    /// is over the same dabs as one with no hover before. The hover is reported a second after
+    /// the one before it, wherever that was: a pen come there at its leisure, never fast.
     fn hover(&mut self, at: (f64, f64)) -> (usize, Duration) {
         let landing = std::mem::replace(&mut self.brush.landing, Landing::InSteps);
+        self.hovered = self.hovered.max(Instant::now()) + Duration::from_secs(1);
+        let mut hover = sample(Phase::Hover, at, 0.0);
+        hover.timestamp = self.hovered;
+        hover.received = self.hovered;
         let mut pen = PenFrame::default();
-        pen.push(sample(Phase::Hover, at, 0.0), None);
+        pen.push(hover, None);
         let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
         let mut took = (0, Duration::ZERO);
         loop {
@@ -1397,16 +1405,29 @@ fn futures_made_ahead_hold_as_their_stroke_lands_on_before_the_down() {
         run.hover(pixel_of(down));
         let ahead: BTreeSet<TileKey> = run.brush.ahead.tiles.keys().copied().collect();
         assert!(!ahead.is_empty(), "futures are made as the pen hovers");
+        // Each tile's dabs still to land, before and after some land.
+        let to_land = |chain: &Chain| -> BTreeMap<TileKey, usize> {
+            let earlier = chain.brush.strokes.first().expect("the first");
+            let remaining = earlier.remaining.as_ref().expect("made as the pen hovered");
+            let counts = remaining
+                .reach
+                .iter()
+                .map(|(key, reach)| (*key, reach.dabs));
+            counts.collect()
+        };
+        let before = to_land(run);
         run.cut();
         run.land_some(5);
-        let still: BTreeSet<TileKey> = {
-            let earlier = run.brush.strokes.first().expect("the first");
-            let remaining = earlier.remaining.as_ref().expect("made as the pen hovered");
-            remaining.reach.keys().copied().collect()
-        };
+        let after = to_land(run);
+        // Tiles whose futures are made, some of their dabs landed since, the rest still to land.
+        let part_landed = ahead.iter().filter(|key| {
+            let (was, is) = (before.get(key).copied(), after.get(key).copied());
+            was.zip(is).is_some_and(|(was, is)| is < was && is > 0)
+        });
+        let part_landed: BTreeSet<TileKey> = part_landed.copied().collect();
         assert!(
-            ahead.intersection(&still).next().is_some(),
-            "tiles with futures made, part of their dabs landed since"
+            !part_landed.is_empty(),
+            "tiles with futures made, part of their dabs landed since: {before:?} then {after:?}"
         );
         take_made();
         assert_eq!(run.route(down), Route::Brush);
@@ -1414,8 +1435,8 @@ fn futures_made_ahead_hold_as_their_stroke_lands_on_before_the_down() {
         assert_eq!(run.ops().len(), 2, "begun over the first");
         let installed = run.installed();
         assert!(
-            installed.intersection(&ahead).next().is_some(),
-            "futures made before the landing are installed"
+            installed.intersection(&part_landed).next().is_some(),
+            "a future made before the landing, of a tile part landed since, is installed"
         );
         assert_eq!(
             take_made(),
@@ -2124,13 +2145,25 @@ fn a_dab_whose_strength_is_no_number_reaches_every_way() {
     }
 }
 
+/// How many workers the store of `a_refused_install_stops_the_making_of_futures` has: a batch
+/// of futures is this many, far fewer than its `Down` reads.
+const FEW_WORKERS: usize = 2;
+
 #[test]
 fn a_refused_install_stops_the_making_of_futures() {
     // The store refuses the second future (as past the open strokes' share): the batch it was
     // made in is the last made, however many the `Down` reads.
     let down = sample(Phase::Down, (160.0, 105.0), 0.8);
     let made_by_a_down = |refused_after: Option<usize>| {
-        let mut run = across_many_tiles(None);
+        let level = Level::new(BACKLOG_LEVEL).expect("a level");
+        let workers = std::num::NonZeroUsize::new(FEW_WORKERS).expect("some");
+        let config = StoreConfig::new(256 << 20, 1)
+            .with_display(level)
+            .with_workers(store::Workers::Fixed(workers));
+        let mut run = Chain::new(Instant::now(), Some(config));
+        assert_eq!(run.project.store().workers(), FEW_WORKERS);
+        run.frame(&stroke(((110.0, 100.0), (210.0, 110.0)), 60));
+        run.prepare();
         run.brush.ahead.clear();
         take_made();
         installs_left(refused_after);
@@ -2150,60 +2183,14 @@ fn a_refused_install_stops_the_making_of_futures() {
     };
     let wanted = made_by_a_down(None);
     let refused = made_by_a_down(Some(1));
-    let batch = sculpt::futures_together();
-    assert!(wanted > 1, "the Down reads futures: {wanted}");
     assert!(
-        (1..=batch).contains(&refused),
-        "one batch made at most: {refused} of a batch of {batch}"
+        wanted > 2 * FEW_WORKERS,
+        "the Down reads more futures than a batch: {wanted}"
     );
-    assert!(
-        wanted <= batch || refused < wanted,
-        "the making stopped: {refused} made of the {wanted} the Down reads"
+    assert_eq!(
+        refused, FEW_WORKERS,
+        "the batch the refused future was made in is the last made, of the {wanted} it reads"
     );
-}
-
-#[test]
-fn futures_made_ahead_are_read_only_over_their_own_store_with_the_oldest_strokes_op_current() {
-    let mut run = Chain::new(Instant::now(), None);
-    run.frame(&stroke(ACROSS, 12));
-    run.hover((150.0, 80.0));
-    assert!(!run.brush.ahead.tiles.is_empty(), "futures made ahead");
-    let ours = run.project.store().id();
-    assert_eq!(run.brush.ahead.store, Some(ours), "tagged with their store");
-    let read =
-        |ahead: &Ahead, store: &TileStore, strokes: &[Pending]| ahead.of(store, strokes).is_some();
-    assert!(
-        read(&run.brush.ahead, run.project.store(), &run.brush.strokes),
-        "read by a stroke begun over the first, on its store"
-    );
-    // Another store: not theirs, whatever its ops.
-    let mut other = Chain::new(Instant::now(), None);
-    let theirs = other.project.store().id();
-    assert_ne!(ours, theirs);
-    assert!(
-        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
-        "not over another store"
-    );
-    // The tag forged to that store's: its current op isn't the oldest stroke's.
-    run.brush.ahead.store = Some(theirs);
-    assert!(
-        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
-        "not where the store's current op isn't the oldest stroke's"
-    );
-    run.brush.ahead.store = Some(ours);
-    // No strokes, or others than those they were made up to.
-    assert!(!read(&run.brush.ahead, run.project.store(), &[]));
-    // A save, a flush and a close let them go outright.
-    run.brush.begin_saving(Instant::now());
-    assert!(run.brush.ahead.tiles.is_empty(), "let go by a save");
-    run.brush.end_saving();
-    run.hover((150.0, 80.0));
-    assert!(!run.brush.ahead.tiles.is_empty(), "made again");
-    run.cut();
-    run.land_all();
-    assert!(run.brush.ahead.tiles.is_empty(), "let go by a flush");
-    other.close();
-    run.close();
 }
 
 /// How a pen hovers over a stroke still landing while its landing is timed
@@ -2321,7 +2308,7 @@ fn the_catch_up_comes_before_the_futures_made_ahead_and_no_prepare_is_held_by_bo
     assert!(run.prepare_late(), "more is wanted");
     let first = take_made();
     assert!(
-        (1..=sculpt::futures_together()).contains(&first),
+        (1..=run.project.store().workers()).contains(&first),
         "one batch made: {first}"
     );
     assert_eq!(
@@ -2351,10 +2338,11 @@ fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
     run.brush.ahead.clear();
     // Nothing lands meanwhile (held, as during a close): the futures alone are looked at.
     run.brush.landing = Landing::InSteps;
-    let began = Instant::now();
+    // Its tablet's reports, timed from well after the first stroke's lift: it comes to the
+    // stroke at its leisure.
+    let began = Instant::now() + Duration::from_secs(10);
     let at = |millis: u64| began + Duration::from_millis(millis);
-    // Warmed where it holds still (reported twice: it came there from the first stroke's lift).
-    run.hover_step((150.0, 104.0), at(0));
+    // Warmed where it holds still.
     run.hover_step((150.0, 104.0), at(0));
     take_made();
     run.prepare_out();
@@ -2384,7 +2372,10 @@ fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
     let walked_at = run.brush.ahead.target;
     run.hover_step((200.0, 109.0), at(601));
     assert!(run.brush.warm.fast, "moving fast");
-    assert!(run.prepare_late(), "the frame after is asked for");
+    assert!(
+        !run.prepare_late(),
+        "nothing more for this frame's prepare: it isn't called again for a pen moving fast"
+    );
     assert_eq!(take_made(), 0, "none made for a place it is leaving");
     assert_eq!(run.brush.ahead.target, walked_at, "not listed");
     assert_eq!(
@@ -2392,8 +2383,25 @@ fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
         walked.len(),
         "those made are kept"
     );
-    // Held there: the same report the frame after is a pen at rest, and its futures are made.
-    run.hover_step((200.0, 109.0), at(601));
+    // The same report carried over by the frame after (frames come faster than the tablet
+    // reports): as fast as it was.
+    let (_, reported) = run.brush.warm.hovered.expect("hovering");
+    run.hover_step((200.0, 109.0), reported);
+    assert!(
+        run.brush.warm.fast,
+        "still fast: the tablet has said nothing new yet"
+    );
+    assert!(!run.prepare_late(), "and still nothing to do");
+    assert_eq!(take_made(), 0, "none made");
+    // Nothing more from the tablet for long: the pen holds still, and its futures are made.
+    let long_ago = Instant::now()
+        .checked_sub(HOVER_SETTLED * 2)
+        .expect("after the epoch");
+    assert!(long_ago < reported, "an earlier time than the report's");
+    if let Some((_, then)) = &mut run.brush.warm.hovered {
+        *then = long_ago;
+    }
+    run.hover_step((200.0, 109.0), long_ago);
     assert!(!run.brush.warm.fast, "at rest");
     run.prepare_out();
     assert_ne!(run.brush.ahead.target, walked_at, "listed where it rests");
@@ -2442,5 +2450,49 @@ fn landing_refits_a_tile_without_losing_the_box_of_a_future_installed_for_it() {
         );
     }
     run.land_all();
+    run.close();
+}
+
+#[test]
+fn futures_made_ahead_are_read_only_over_their_own_store_with_the_oldest_strokes_op_current() {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.hover((150.0, 80.0));
+    assert!(!run.brush.ahead.tiles.is_empty(), "futures made ahead");
+    let ours = run.project.store().id();
+    assert_eq!(run.brush.ahead.store, Some(ours), "tagged with their store");
+    let read =
+        |ahead: &Ahead, store: &TileStore, strokes: &[Pending]| ahead.of(store, strokes).is_some();
+    assert!(
+        read(&run.brush.ahead, run.project.store(), &run.brush.strokes),
+        "read by a stroke begun over the first, on its store"
+    );
+    // Another store: not theirs, whatever its ops.
+    let mut other = Chain::new(Instant::now(), None);
+    let theirs = other.project.store().id();
+    assert_ne!(ours, theirs);
+    assert!(
+        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
+        "not over another store"
+    );
+    // The tag forged to that store's: its current op isn't the oldest stroke's.
+    run.brush.ahead.store = Some(theirs);
+    assert!(
+        !read(&run.brush.ahead, other.project.store(), &run.brush.strokes),
+        "not where the store's current op isn't the oldest stroke's"
+    );
+    run.brush.ahead.store = Some(ours);
+    // No strokes, or others than those they were made up to.
+    assert!(!read(&run.brush.ahead, run.project.store(), &[]));
+    // A save, a flush and a close let them go outright.
+    run.brush.begin_saving(Instant::now());
+    assert!(run.brush.ahead.tiles.is_empty(), "let go by a save");
+    run.brush.end_saving();
+    run.hover((150.0, 80.0));
+    assert!(!run.brush.ahead.tiles.is_empty(), "made again");
+    run.cut();
+    run.land_all();
+    assert!(run.brush.ahead.tiles.is_empty(), "let go by a flush");
+    other.close();
     run.close();
 }

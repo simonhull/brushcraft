@@ -49,6 +49,13 @@ pub(crate) trait Action {
     /// weight, each component of [`Action::moved`] lies within it, the rounding of the `f32`
     /// arithmetic included. Never too small: a later stroke skips the tiles it says a dab can't
     /// take into a read's way.
+    ///
+    /// **What it assumes of the weighing,** which is done outside the trait (each path weighs a
+    /// vertex itself, with [`brush::draw_imprint_vertex`] or [`brush::draw_imprint`], and hands
+    /// the displacement to [`Action::moved`]): the displacement `w` a vertex is given is never
+    /// larger in size than the dab's strength, nor of the other sign (`|w| ≤ |strength|`, up to
+    /// the rounding the span allows for). A weighing that could give more (a falloff above 1,
+    /// an alpha that amplifies) needs a span that says so.
     fn span(imprint: &Imprint) -> Span;
 }
 

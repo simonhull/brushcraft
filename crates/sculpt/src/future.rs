@@ -302,7 +302,7 @@ impl PenDownTiles {
         }
         let missing = keys.iter().filter(|key| !self.tiles.contains_key(key));
         let missing: Vec<TileKey> = missing.copied().collect();
-        let futures = before.made_of(store, &missing);
+        let futures = before.made_of(store, &missing, |made| made);
         let left = missing.into_iter().zip(futures);
         for (key, future) in left {
             let (future, positions) = future?;
@@ -719,21 +719,26 @@ impl<'a> Futures<'a> {
         store: &mut TileStore,
         keys: &[TileKey],
     ) -> Vec<Result<Future, SculptError>> {
-        let made = self.made_of(store, keys);
-        let futures = made.into_iter().map(|made| made.map(|(future, _)| future));
-        futures.collect()
+        self.made_of(store, keys, |(future, _)| future)
     }
 
-    /// [`Futures::futures_of`], each future a dab touches with the positions it leaves its tile
-    /// at (what its box is of), for a caller that keeps them ([`PenDownTiles::extend_futures`]).
+    /// [`Futures::futures_of`], each future as `keep` keeps it: a future a dab touches is made
+    /// with the positions it leaves its tile at (what its box is of), for a caller that keeps
+    /// them ([`PenDownTiles::extend_futures`]).
     ///
-    /// A batch at a time ([`futures_together`]): a batch's tiles are read, pinned, predicted and
-    /// replayed, and only its futures are kept past it, so what is held at once (the starts,
-    /// the pins, the predictions the store can't keep) is a batch's, however many tiles are
-    /// asked for.
-    fn made_of(&self, store: &mut TileStore, keys: &[TileKey]) -> Vec<Result<Made, SculptError>> {
-        let mut made: Vec<Result<Made, SculptError>> = Vec::with_capacity(keys.len());
-        let batches = keys.chunks(futures_together());
+    /// A batch at a time, a tile for each of the store's workers ([`TileStore::workers`]: more
+    /// would only queue behind them): a batch's tiles are read, pinned, predicted and replayed,
+    /// and only what `keep` keeps of its futures outlasts it. So what is held at once (the
+    /// starts, the pins, the predictions the store can't keep, the positions) is a batch's,
+    /// however many tiles are asked for.
+    fn made_of<T>(
+        &self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+        keep: impl Fn(Made) -> T,
+    ) -> Vec<Result<T, SculptError>> {
+        let mut made: Vec<Result<T, SculptError>> = Vec::with_capacity(keys.len());
+        let batches = keys.chunks(store.workers().max(1));
         for batch in batches {
             // Each tile's start, read one after another; a tile no dab touches is done with it.
             let mut touched: Vec<Start> = Vec::new();
@@ -756,8 +761,10 @@ impl<'a> Futures<'a> {
             }
             let mut replayed = self.replay_together(store, &touched).into_iter();
             let done = started.into_iter().map(|done| {
-                done.or_else(|| replayed.next())
-                    .unwrap_or_else(|| Err(FutureError::Unreadable.into()))
+                let done = done
+                    .or_else(|| replayed.next())
+                    .unwrap_or_else(|| Err(FutureError::Unreadable.into()));
+                done.map(&keep)
             });
             made.extend(done);
         }
@@ -948,23 +955,6 @@ impl Future {
 /// A future as it is made: with the positions it leaves its tile at, if a dab touches the tile
 /// (one no dab touches is the tile as stored, and is never predicted).
 type Made = (Future, Option<Vec<Vec3>>);
-
-/// How many futures are made together: a tile for each of the store's workers.
-///
-/// More would only queue behind them, holding their tiles' starts, pins and predictions
-/// meanwhile; fewer would leave cores idle. A caller that does something with each future (the
-/// app installs them, and stops at the first the store refuses) asks for this many at a time,
-/// so it holds no more made than it is about to use.
-///
-/// The count of the default workers on this machine ([`store::Workers`]), what a store has
-/// unless configured otherwise: the store doesn't say its own. One with fewer or more workers
-/// makes the same futures, in batches that fit its workers less well.
-#[must_use]
-pub fn futures_together() -> usize {
-    /// The count, found once: counting the cores reads the system.
-    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *COUNT.get_or_init(|| store::Workers::default().count().get())
-}
 
 /// What one tile's future starts from, read from the store one tile after another before the
 /// workers replay ([`Futures::futures_of`]).

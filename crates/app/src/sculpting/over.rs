@@ -536,7 +536,7 @@ pub(super) fn box_distance_squared(point: DVec3, low: DVec3, high: DVec3) -> f64
 /// Each is the one made ahead (`ahead`, the futures of the strokes `earlier` made under a
 /// hovering pen, [`Ahead::of`]) if there is one, else made now by `futures`, the futures of
 /// `earlier` (each with its [`Remaining`]), those together on the store's workers, a batch of
-/// them at a time ([`sculpt::futures_together`]), each batch installed before the next is made;
+/// them at a time ([`TileStore::workers`]), each batch installed before the next is made;
 /// each is labelled with the newest of the strokes whose dabs reach the tile, and refitted in
 /// `index` so the stroke's raycasts (and its previews' queries) find it there.
 ///
@@ -566,7 +566,7 @@ pub(super) fn install(
     // A workers' batch at a time: those of it not made ahead are made now, together, and the
     // batch installed before the next is made. So no more futures are held made than are about
     // to go in, and a refusal (past the open strokes' share) stops the making with it.
-    let batches = fresh.chunks(sculpt::futures_together());
+    let batches = fresh.chunks(store.workers().max(1));
     'batches: for batch in batches {
         let cold = batch.iter().filter(|key| at_hand(key).is_none());
         let cold: Vec<TileKey> = cold.copied().collect();
@@ -833,7 +833,7 @@ impl OpenStrokes for Open<'_> {
 /// Installs the futures of `missing` for the stroke reserved as `token` after the strokes
 /// `earlier`, as many as `installing` leaves time for. Returns whether every one is installed.
 ///
-/// A workers' batch ([`sculpt::futures_together`]) between looks at the clock
+/// A workers' batch ([`TileStore::workers`]) between looks at the clock
 /// ([`FUTURES_TIME`]); the rest are for
 /// the calls after. They are those made ahead (`ahead`) where there are, else made now from the
 /// session's stroke state `state` ([`install`]).
@@ -855,7 +855,8 @@ pub(super) fn install_in_time(
     let Ok(futures) = Futures::new(project.store(), state, &chain) else {
         return false;
     };
-    let batches = missing.chunks(sculpt::futures_together());
+    let together = project.store().workers().max(1);
+    let batches = missing.chunks(together);
     for some in batches {
         if !installing.more() {
             return false;
