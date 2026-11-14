@@ -290,15 +290,19 @@
 //! more than an evaluation, so those are made ahead too (the stroke-while-landing spec, "Cost and
 //! latency"), in the same `prepare`s, while the catch-up goes on:
 //!
-//! - **Made, not installed** ([`Ahead`], [`Sculpting::warm_futures`]): the futures of the tiles a
+//! - **Made, not installed** ([`Ahead`], [`Sculpting::list_to_warm`]): the futures of the tiles a
 //!   `Down` at the hover would read (along the pen's ray, then about its hit: the hit's normals,
 //!   the brush's radius, the stroke's reach; [`Sculpting::list_ahead`]) are made on the store's
-//!   workers, a tile each ([`sculpt::futures_together`]), a call's futures time at a time
-//!   ([`FUTURES_TIME`], at least a batch a call), and kept beside the strokes, each with its box.
-//!   Nothing is reserved for a pen that only hovers: an op reserved must be given back on every
-//!   path, opens a journal, and stands in the way of a stroke beginning alone; a future kept apart
-//!   needs none of that, and is right for as long as the stroke it was made up to is under way (see
-//!   [`Ahead`] for why, and when it goes).
+//!   workers, a tile each ([`sculpt::futures_together`]), and kept beside the strokes, each with
+//!   its box. The catch-up comes first: they are made in the time it leaves a call, a call's
+//!   futures time at most ([`FUTURES_TIME`]), and where it leaves none for long ([`AHEAD_STARVED`])
+//!   a batch is made in a call of its own, so no call is held by both. A hover that moves keeps the
+//!   futures still near and lists only what is new, once it has moved a quarter of a radius
+//!   ([`RELIST_RADII`]); one moving fast ([`HOVER_FAST`]) makes none. Nothing is reserved for a pen
+//!   that only hovers: an op reserved must be given back on every path, opens a journal, and stands
+//!   in the way of a stroke beginning alone; a future kept apart needs none of that, and is right
+//!   for as long as the stroke it was made up to is under way (see [`Ahead`] for why, and when it
+//!   goes).
 //! - **At the `Down`**, the futures it reads are installed from those ([`install`]), none made; and
 //!   a tile whose future is at hand is asked for only if the read reaches the box it has as stored
 //!   or its future's own ([`needed`]), so the `Down` installs the few it reads, not every tile the
@@ -1463,11 +1467,44 @@ type DisplayReads = BTreeMap<TileKey, BTreeSet<TileKey>>;
 /// dabs reach, several for one under many.
 const FUTURES_TIME: Duration = Duration::from_millis(2);
 
+/// How long the futures to make ahead wait for time the catch-up leaves before a batch of them
+/// is made all the same, ahead of it ([`Brush::prepare`]).
+///
+/// The catch-up comes first: landing is what ends the strokes. But a `prepare` whose catch-up
+/// takes all its time, call after call, still makes a batch of futures this often.
+const AHEAD_STARVED: Duration = CATCH_UP_STARVED;
+
+/// How far a hovering pen moves, in brush radii, before the futures to make ahead are listed
+/// again for where it is ([`Sculpting::list_to_warm`]).
+///
+/// Nearer than this, the list made for where it was stands: the futures kept and those still
+/// to make are about the same tiles.
+const RELIST_RADII: f64 = 0.25;
+
+/// How fast a hovering pen moves, in brush radii a second, past which no future is made ahead
+/// for where it is: it is leaving, and the futures would be of a place it has left.
+///
+/// Ten times the stroke's reach a second: slower, the pen is still within reach of where the
+/// list was made a tenth of a second on.
+const HOVER_FAST: f64 = 10.0 * REACH_RADII;
+
 /// The most futures kept made ahead of a `Down` ([`Ahead`]): those nearest the hovering pen.
 ///
 /// A future is a tile's corrections, some tens of kilobytes, held beside the store's budget, so
 /// they are few; a `Down` reading more makes the rest as it comes.
 const AHEAD_MOST: usize = 128;
+
+/// What is to be done of the futures made ahead, in one `prepare`
+/// ([`Sculpting::list_to_warm`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Warming {
+    /// Nothing: no pen hovers over strokes still landing, or every future listed is made.
+    Nothing,
+    /// Nothing now, the pen moving fast: the frame after is asked for, when it may have slowed.
+    Later,
+    /// Futures are listed to make.
+    Now,
+}
 
 /// The futures made ahead of a `Down`, under a hovering pen, off the pen's path (see "Warming
 /// under a hovering pen" in the module notes).
@@ -1484,7 +1521,7 @@ const AHEAD_MOST: usize = 128;
 ///   the landing has got (a stroke before `after` that ends has landed just that), bit for bit
 ///   ([`sculpt::Futures`], "Bit for bit").
 /// - **None of the strokes places a dab more:** they are made only with every pen up, the strokes
-///   sealed ([`Sculpting::warm_futures`]).
+///   sealed ([`Sculpting::list_to_warm`]).
 /// - **The strokes under way change in four ways only:** a stroke begins, the newest (it reads
 ///   them, if it begins right after `after`); the oldest ends, every dab landed (its futures are
 ///   the tiles then); the oldest drops dabs, and ends in that call with every stroke after it
@@ -1514,9 +1551,11 @@ struct Ahead {
     tiles: BTreeMap<TileKey, Future>,
     /// What they were listed for: where the pen hovered, the view, and the brush's radius in
     /// pixels then.
-    target: Option<(Pixel, View, f32)>,
+    target: Option<(Pixel, View, Radius)>,
     /// The tiles still to make for `target`, the next to make last.
     todo: Vec<TileKey>,
+    /// When a batch of them was last made; `None` if none was since they were let go.
+    made_at: Option<Instant>,
 }
 
 impl Ahead {
@@ -2010,6 +2049,11 @@ struct Warm {
     target: Option<(Pixel, View)>,
     /// Tiles still to evaluate for `target`.
     todo: Vec<TileKey>,
+    /// Where the pen last hovered, and when its tablet said so: what its speed is told from.
+    hovered: Option<(Pixel, Instant)>,
+    /// Whether the hovering pen moves fast ([`HOVER_FAST`]): no future is made ahead for a
+    /// place it is leaving.
+    fast: bool,
 }
 
 /// What the overlay's lines say: they are made again only when it changes.
@@ -3800,6 +3844,19 @@ impl Sculpting {
     /// Notes where the pen hovers in this frame's view, for [`Brush::prepare`] to warm.
     fn note_hover(&mut self, pen: &PenFrame, view: Option<&View>) {
         let open = self.pen_on_stroke();
+        // Its speed, from the last place its tablet reported: a hover carried over from the
+        // frame before (the same report) is a pen holding still.
+        let radius = f64::from(self.settings.radius().get());
+        let hovered = pen.hover().map(|hover| (hover.at, hover.timestamp));
+        self.warm.fast = match (self.warm.hovered, hovered) {
+            (Some((was, then)), Some((at, now))) if now > then => {
+                let gone = (at.x - was.x).hypot(at.y - was.y);
+                let took = now.saturating_duration_since(then).as_secs_f64();
+                gone > HOVER_FAST * radius * took
+            }
+            _ => false,
+        };
+        self.warm.hovered = hovered;
         self.warm.wanted = match (pen.hover(), view, open) {
             (Some(hover), Some(view), false) => Some((hover.at, *view)),
             _ => None,
@@ -3892,18 +3949,20 @@ impl Sculpting {
         }
     }
 
-    /// Makes futures ahead of a `Down` where the pen hovers over the strokes under way (see
-    /// "Warming under a hovering pen" in the module notes): those a `Down` there reads, listed
-    /// once per position, view and radius ([`Sculpting::list_ahead`]), and made
-    /// a workers' batch together ([`sculpt::futures_together`]) for as long as the call's futures
-    /// time lasts ([`FUTURES_TIME`], at least a batch a call). Returns whether more are left to
-    /// make.
+    /// Whether futures are to be made ahead of a `Down` where the pen hovers over the strokes
+    /// under way (see "Warming under a hovering pen" in the module notes), listing them first
+    /// where the pen has moved on ([`Sculpting::list_ahead`]).
     ///
-    /// Only where a `Down` would begin over the strokes under way ([`Sculpting::route_on_futures`])
-    /// and what a later stroke reads of each is made, every pen up: their futures are final then.
-    fn warm_futures(&mut self, scene: &mut Scene<'_>) -> bool {
+    /// Only where a `Down` would begin over the strokes under way
+    /// ([`Sculpting::route_on_futures`]) and what a later stroke reads of each is made, every pen
+    /// up: their futures are final then. Not for a pen moving fast ([`HOVER_FAST`]): the list
+    /// stands as it is, and the frame after is asked for, when the pen may have slowed. The
+    /// list is made again only once the pen is a quarter of a radius from where it was made
+    /// ([`RELIST_RADII`]), or the view or the radius changed; the futures made stay, those
+    /// still near.
+    fn list_to_warm(&mut self, scene: &mut Scene<'_>) -> Warming {
         let Some((at, view)) = self.warm.wanted else {
-            return false;
+            return Warming::Nothing;
         };
         let newest = self.strokes.last().map(|stroke| stroke.op.id());
         let over = newest.is_some() && self.restored.is_empty() && self.deferred.is_empty();
@@ -3912,7 +3971,10 @@ impl Sculpting {
             remaining.is_some_and(|remaining| remaining.edits.is_sealed())
         });
         if !over || !sealed || self.pen_on_stroke() {
-            return false;
+            return Warming::Nothing;
+        }
+        if self.warm.fast {
+            return Warming::Later;
         }
         let theirs = Some(scene.project.store().id());
         if self.ahead.after != newest || self.ahead.store != theirs {
@@ -3920,26 +3982,42 @@ impl Sculpting {
             self.ahead.after = newest;
             self.ahead.store = theirs;
         }
-        let target = (at, view, self.settings.radius().get());
-        if self.ahead.target != Some(target) {
-            self.ahead.target = Some(target);
+        let radius = self.settings.radius();
+        let stands = self.ahead.target.is_some_and(|(was, through, with)| {
+            let gone = (at.x - was.x).hypot(at.y - was.y);
+            through == view && with == radius && gone <= RELIST_RADII * f64::from(radius.get())
+        });
+        if !stands {
+            self.ahead.target = Some((at, view, radius));
             self.list_ahead(scene, at);
         }
         if self.ahead.todo.is_empty() {
-            return false;
+            Warming::Nothing
+        } else {
+            Warming::Now
+        }
+    }
+
+    /// Makes the futures listed ahead ([`Sculpting::list_to_warm`]), a workers' batch together
+    /// ([`sculpt::futures_together`]) on the store's workers: batches while the clock is before
+    /// `until`, or with `None` exactly one, whatever the time.
+    fn make_ahead(&mut self, scene: &mut Scene<'_>, until: Option<Instant>) {
+        if self.ahead.todo.is_empty() {
+            return;
         }
         let store = scene.project.store();
         let futures = chain_of(&self.strokes).map(|chain| Futures::new(store, &self.state, &chain));
         let Some(Ok(futures)) = futures else {
             self.ahead.todo.clear();
-            return false;
+            return;
         };
-        while !self.ahead.todo.is_empty() && self.installing.more() {
-            let split = self
-                .ahead
-                .todo
-                .len()
-                .saturating_sub(sculpt::futures_together());
+        let mut owed = until.is_none();
+        while !self.ahead.todo.is_empty()
+            && (owed || until.is_some_and(|until| Instant::now() < until))
+        {
+            owed = false;
+            let most = sculpt::futures_together();
+            let split = self.ahead.todo.len().saturating_sub(most);
             let batch = self.ahead.todo.split_off(split);
             #[cfg(test)]
             tests::count_made(batch.len());
@@ -3951,9 +4029,8 @@ impl Sculpting {
                     self.ahead.tiles.insert(key, future);
                 }
             }
-            self.installing.any = true;
+            self.ahead.made_at = Some(Instant::now());
         }
-        !self.ahead.todo.is_empty()
     }
 
     /// Lists the futures to make ahead for a pen hovering at `at`: those a `Down` there may read
@@ -4357,25 +4434,50 @@ impl Brush for Sculpting {
         if self.make_remaining(&mut scene).is_err() {
             // Let go by `make_remaining`: the next `Down` over it makes it again.
         }
-        // Under a pen hovering over them, the futures a `Down` there reads: made now, a call's
-        // time of them at a time, while the catch-up goes on.
-        let warming = self.warm_futures(&mut scene);
+        // Under a pen hovering over them, the futures a `Down` there reads are made ahead, in
+        // the time the catch-up leaves: after it, until the deadline, a call's futures time at
+        // most. Where it leaves none for long ([`AHEAD_STARVED`]), a batch is made first, and
+        // the catch-up has what is left of this call, all of the next: so a call is held by one
+        // of the two, not both.
+        let warming = self.list_to_warm(&mut scene);
+        let listed = warming == Warming::Now;
+        let starved = self
+            .ahead
+            .made_at
+            .is_none_or(|at| at.elapsed() >= AHEAD_STARVED);
+        let ahead_first = listed && starved;
+        if ahead_first {
+            self.make_ahead(&mut scene, None);
+        }
         if self.catching_up() > 0 {
             // The catch-up: finest work of the dabs shown, at least a dab a call, off the
-            // latency path. No warming under a hover meanwhile: the pen is down, or its stroke
-            // not landed.
-            let now = Instant::now();
-            let budget = BrushBudget::slice(now, deadline.saturating_duration_since(now));
-            let mut report = BrushReport::default();
-            self.apply(&mut scene, &mut report, Some(&budget));
-            self.note_kept(scene.project.store());
-            let progress = report.dabs_applied > 0;
-            self.unframed |= progress;
-            self.caught_up = std::mem::take(&mut self.caught_up).then(report);
-            // More of it wanted only while it moves on: a pen drawing takes only dabs that fit,
-            // and the next frame (wanted while dabs are queued) tries again.
-            return Ok((progress && self.queued() > 0) || warming);
+            // latency path. The surface under a hover isn't evaluated meanwhile (the pen is
+            // down, or its stroke not landed); its futures are, around the catch-up.
+            let mut progress = false;
+            if !ahead_first || Instant::now() < deadline {
+                let now = Instant::now();
+                let budget = BrushBudget::slice(now, deadline.saturating_duration_since(now));
+                let mut report = BrushReport::default();
+                self.apply(&mut scene, &mut report, Some(&budget));
+                self.note_kept(scene.project.store());
+                progress = report.dabs_applied > 0;
+                self.unframed |= progress;
+                self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+            }
+            if listed && !ahead_first {
+                let until = deadline.min(Instant::now() + FUTURES_TIME);
+                self.make_ahead(&mut scene, Some(until));
+            }
+            let more_ahead = warming == Warming::Later || (listed && !self.ahead.todo.is_empty());
+            // More of the catch-up wanted only while it moves on: a pen drawing takes only dabs
+            // that fit, and the next frame (wanted while dabs are queued) tries again.
+            return Ok((progress && self.queued() > 0) || more_ahead);
         }
+        if listed && !ahead_first {
+            let until = deadline.min(Instant::now() + FUTURES_TIME);
+            self.make_ahead(&mut scene, Some(until));
+        }
+        let more_ahead = warming == Warming::Later || (listed && !self.ahead.todo.is_empty());
         // At least one piece of work each call, so warming finishes even in frames that overrun.
         let mut worked = false;
         if self.warm.wanted != self.warm.target {
@@ -4389,7 +4491,7 @@ impl Brush for Sculpting {
             self.warm_batch(&mut scene);
             worked = true;
         }
-        Ok(!self.warm.todo.is_empty() || warming)
+        Ok(!self.warm.todo.is_empty() || more_ahead)
     }
 
     fn next_sample_due(&self) -> Option<Instant> {

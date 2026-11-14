@@ -228,6 +228,40 @@ impl Chain {
         })
     }
 
+    /// A frame's step with the pen hovering at `at`, as its tablet `reported` it then: the brush
+    /// notes where it hovers, and how fast it got there.
+    fn hover_step(&mut self, at: (f64, f64), reported: Instant) {
+        let mut hover = sample(Phase::Hover, at, 0.0);
+        hover.timestamp = reported;
+        hover.received = reported;
+        let mut pen = PenFrame::default();
+        pen.push(hover, None);
+        let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
+        let stepped = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush.step(stepped, &pen, &budget).expect("a step");
+    }
+
+    /// `prepare`s of the brush, each with a 4 ms deadline, until it wants no more.
+    fn prepare_out(&mut self) {
+        for _ in 0..HOVER_FRAMES {
+            let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
+            let by = Instant::now() + Duration::from_millis(4);
+            if !self.brush.prepare(prepared, by).expect("prepared") {
+                return;
+            }
+        }
+        panic!("the brush's prepare never ends");
+    }
+
+    /// A `prepare` of the brush whose deadline has passed, the catch-up free to land: whether
+    /// it wants more.
+    fn prepare_late(&mut self) -> bool {
+        let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush
+            .prepare(prepared, Instant::now())
+            .expect("prepared")
+    }
+
     /// Every tile's evaluated positions, then closes the project (keeping no recovery file).
     fn close(self) -> BTreeMap<TileKey, Vec<[u32; 3]>> {
         let Self {
@@ -2162,5 +2196,200 @@ fn futures_made_ahead_are_read_only_over_their_own_store_with_the_oldest_strokes
     run.land_all();
     assert!(run.brush.ahead.tiles.is_empty(), "let go by a flush");
     other.close();
+    run.close();
+}
+
+/// How a pen hovers over a stroke still landing while its landing is timed
+/// (`landing_under_a_hovering_pen_is_timed`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hovering {
+    /// Not at all: the pen is out of range.
+    Away,
+    /// Still, on the stroke's middle.
+    Still,
+    /// To and fro along the stroke, this many pixels a frame.
+    Moving(f64),
+}
+
+/// How long `landing_under_a_hovering_pen_is_timed` lands each of its cases for.
+const LANDING_TIMED: Duration = Duration::from_millis(1500);
+
+/// A measurement, printed and asserting nothing of time: landing under a hovering pen.
+///
+/// How fast the heavy stroke lands, and how long a `prepare` holds the loop (what a `Down`
+/// arriving in it waits), with the pen away, hovering still, and hovering in motion over it.
+///
+/// Frames of 8 ms: a step with the hover's sample, then `prepare`s until 6 ms into the frame or
+/// until none is wanted, as the frame loop calls them; the dabs land by the calibrated cost model,
+/// as the app's do.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn landing_under_a_hovering_pen_is_timed() {
+    println!("landing under a hovering pen (load {})", load());
+    let cases = [
+        Hovering::Away,
+        Hovering::Still,
+        Hovering::Moving(1.0),
+        Hovering::Moving(6.0),
+        Hovering::Moving(40.0),
+    ];
+    for hovering in cases {
+        let level = Level::new(BACKLOG_LEVEL).expect("a level");
+        let config = StoreConfig::new(256 << 20, 1).with_display(level);
+        let mut run = Chain::new(Instant::now(), Some(config));
+        run.build_display();
+        let timed = Timed::heavy();
+        run.frame(&timed.earlier);
+        run.cut();
+        run.brush.cost = DabCost::CALIBRATED;
+        let placed = run.rows().first().map_or(0, Vec::len);
+        take_made();
+        let began = Instant::now();
+        let (mut frames, mut calls) = (0_u32, Vec::new());
+        while began.elapsed() < LANDING_TIMED && !run.ops().is_empty() {
+            let frame = Instant::now();
+            let at = match hovering {
+                Hovering::Away => None,
+                Hovering::Still => Some((160.0, 105.0)),
+                Hovering::Moving(by) => {
+                    // To and fro along the stroke, 50 pixels each way.
+                    let gone = (f64::from(frames) * by) % 100.0;
+                    Some((135.0 + gone.min(100.0 - gone), 105.0))
+                }
+            };
+            let mut pen = PenFrame::default();
+            if let Some(at) = at {
+                pen.push(sample(Phase::Hover, at, 0.0), None);
+            }
+            let budget = BrushBudget::frame(frame, Duration::ZERO, setup().interval);
+            let stepped = context(&mut run.project, run.picker.index_mut(), &run.camera);
+            run.brush.step(stepped, &pen, &budget).expect("a step");
+            let by = frame + Duration::from_millis(6);
+            loop {
+                let prepared = context(&mut run.project, run.picker.index_mut(), &run.camera);
+                let call = Instant::now();
+                let more = run.brush.prepare(prepared, by).expect("prepared");
+                calls.push(call.elapsed());
+                if !more || Instant::now() >= by {
+                    break;
+                }
+            }
+            frames += 1;
+            let rest = (frame + Duration::from_millis(8)).saturating_duration_since(Instant::now());
+            std::thread::sleep(rest);
+        }
+        let took = began.elapsed();
+        let left = run.rows().first().map_or(0, Vec::len);
+        let landed = placed - left;
+        calls.sort_unstable();
+        let longest = calls.last().copied().unwrap_or_default();
+        let median = calls.get(calls.len() / 2).copied().unwrap_or_default();
+        #[expect(clippy::cast_precision_loss, reason = "a few hundred dabs, for a rate")]
+        let rate = landed as f64 / took.as_secs_f64();
+        println!(
+            "  {hovering:?}: {landed} of {placed} dabs landed in {took:.2?} ({rate:.0} a second) \
+             over {frames} frames; {} futures made ahead, {} kept; a prepare took {median:.2?} \
+             at the median, {longest:.2?} at the longest",
+            take_made(),
+            run.brush.ahead.tiles.len(),
+        );
+        run.brush.abandon();
+        run.close();
+    }
+    println!("  (load {} after)", load());
+}
+
+#[test]
+fn the_catch_up_comes_before_the_futures_made_ahead_and_no_prepare_is_held_by_both() {
+    let mut run = across_many_tiles(None);
+    run.brush.ahead.clear();
+    run.cut();
+    let queued = |chain: &Chain| chain.rows().first().map_or(0, Vec::len);
+    let before = queued(&run);
+    // Reported a second after the first stroke's lift: a pen that came there at its leisure.
+    run.hover_step((160.0, 105.0), Instant::now() + Duration::from_secs(1));
+    take_made();
+    // None made yet, so a batch is owed: it is made first, and with no time left the catch-up
+    // waits for the next call.
+    assert!(run.prepare_late(), "more is wanted");
+    let first = take_made();
+    assert!(
+        (1..=sculpt::futures_together()).contains(&first),
+        "one batch made: {first}"
+    );
+    assert_eq!(
+        queued(&run),
+        before,
+        "no dab landed in the call that made it"
+    );
+    // A batch was just made: the catch-up has this call, and with no time left no future is
+    // made after it.
+    run.prepare_late();
+    assert_eq!(take_made(), 0, "no future made in the catch-up's call");
+    assert_eq!(queued(&run), before - 1, "the catch-up landed its dab");
+    // Left alone for long, the futures get a call again.
+    if !run.brush.ahead.todo.is_empty() {
+        run.brush.ahead.made_at = Instant::now().checked_sub(AHEAD_STARVED * 2);
+        run.prepare_late();
+        assert!(take_made() > 0, "a batch made once they waited long");
+        assert_eq!(queued(&run), before - 1, "and no dab landed with it");
+    }
+    run.brush.abandon();
+    run.close();
+}
+
+#[test]
+fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
+    let mut run = across_many_tiles(Some(ORDINARY_RADIUS));
+    run.brush.ahead.clear();
+    // Nothing lands meanwhile (held, as during a close): the futures alone are looked at.
+    run.brush.landing = Landing::InSteps;
+    let began = Instant::now();
+    let at = |millis: u64| began + Duration::from_millis(millis);
+    // Warmed where it holds still (reported twice: it came there from the first stroke's lift).
+    run.hover_step((150.0, 104.0), at(0));
+    run.hover_step((150.0, 104.0), at(0));
+    take_made();
+    run.prepare_out();
+    let still: BTreeSet<TileKey> = run.brush.ahead.tiles.keys().copied().collect();
+    assert_eq!(take_made(), still.len(), "each made once");
+    assert!(!still.is_empty(), "futures made where it hovers");
+    let listed_at = run.brush.ahead.target;
+    // A pixel on, a tenth of a second later: the list stands, and nothing is made.
+    run.hover_step((151.0, 104.0), at(100));
+    run.prepare_out();
+    assert_eq!(take_made(), 0, "within a quarter radius the list stands");
+    assert_eq!(run.brush.ahead.target, listed_at, "not listed again");
+    // Along the stroke at a walk: listed again, the futures still near kept, only new ones made.
+    run.hover_step((166.0, 105.5), at(600));
+    run.prepare_out();
+    let walked: BTreeSet<TileKey> = run.brush.ahead.tiles.keys().copied().collect();
+    assert_ne!(run.brush.ahead.target, listed_at, "listed where it is now");
+    let kept = walked.intersection(&still).count();
+    assert!(kept > 0, "the futures still near are kept");
+    assert_eq!(
+        take_made(),
+        walked.len() - kept,
+        "only the new ones are made"
+    );
+    // Far along it in a millisecond: fast, so nothing is listed or made, and the frame after is
+    // asked for.
+    let walked_at = run.brush.ahead.target;
+    run.hover_step((200.0, 109.0), at(601));
+    assert!(run.brush.warm.fast, "moving fast");
+    assert!(run.prepare_late(), "the frame after is asked for");
+    assert_eq!(take_made(), 0, "none made for a place it is leaving");
+    assert_eq!(run.brush.ahead.target, walked_at, "not listed");
+    assert_eq!(
+        run.brush.ahead.tiles.len(),
+        walked.len(),
+        "those made are kept"
+    );
+    // Held there: the same report the frame after is a pen at rest, and its futures are made.
+    run.hover_step((200.0, 109.0), at(601));
+    assert!(!run.brush.warm.fast, "at rest");
+    run.prepare_out();
+    assert_ne!(run.brush.ahead.target, walked_at, "listed where it rests");
+    run.brush.abandon();
     run.close();
 }
