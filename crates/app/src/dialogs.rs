@@ -651,6 +651,14 @@ impl Dialogs {
         }
     }
 
+    /// Whether a note said now ([`Dialogs::note`]) would take nothing's place but a note's: the
+    /// bar is free or holds the restore note, or says a failure or that protection stopped, which
+    /// a note waits behind. A question or a progress bar in front would be lost to it.
+    pub(crate) fn takes_note(&self) -> bool {
+        let free = matches!(self.prompt, Prompt::None | Prompt::Restored { .. });
+        free || self.failing() || self.says_stopped()
+    }
+
     /// When the note goes by itself, if one showing does.
     const fn note_until(&self) -> Option<Instant> {
         match self.prompt {

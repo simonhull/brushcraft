@@ -10,6 +10,7 @@ use super::resume::{Corrections, corrections, resumed_in, steps_apart};
 use super::*;
 use crate::OpenNote;
 use crate::dialogs::UNFINISHED_STROKE;
+use crate::sculpting::tests::saving::finish_save;
 
 /// What a crash in the middle of a chain left in a recovery file: the first stroke partly landed,
 /// the second begun over it, placed and journalled, none of it landed.
@@ -68,16 +69,19 @@ fn chain_in(dir: TestDir, formats: Formats, landed: usize) -> (Journalling, OpId
     (run, first, second)
 }
 
-/// A crash with [`chain_in`]'s chain open, and the same chain landed whole, never crashed.
-fn crash_mid_chain(formats: Formats, landed: usize) -> CrashedChain {
-    let (mut whole_run, _, _) = chain_in(TestDir::new(), formats, landed);
+/// A crash with the chain `drawn` draws open, and the same chain landed whole, never crashed.
+///
+/// Returns the crash's directory, its recovery file in `recovery`, and every finest tile's
+/// corrections of the whole one.
+fn crash_with(drawn: impl Fn(TestDir) -> Journalling) -> (TestDir, BTreeMap<TileKey, Corrections>) {
+    let mut whole_run = drawn(TestDir::new());
     let flushing = context(
         &mut whole_run.project,
         whole_run.picker.index_mut(),
         &whole_run.camera,
     );
     whole_run.brush.flush(flushing).expect("flushed");
-    assert!(!whole_run.brush.stroking(), "both landed");
+    assert!(!whole_run.brush.stroking(), "every stroke landed");
     let whole = corrections(&mut whole_run.project);
     let Journalling {
         dir: whole_dir,
@@ -87,24 +91,40 @@ fn crash_mid_chain(formats: Formats, landed: usize) -> CrashedChain {
     whole_project.close(false).expect("closed");
     drop(whole_dir);
 
-    let (run, first, second) = chain_in(TestDir::new(), formats, landed);
     let Journalling {
         dir,
         project,
         mut brush,
         picker,
         ..
-    } = run;
-    // A crash: nothing closes the project, and the second's reserved op goes with its store.
+    } = drawn(TestDir::new());
+    // A crash: nothing closes the project, and the later strokes' reserved ops go with its store.
     brush.abandon();
     drop((brush, picker));
     drop(project);
+    (dir, whole)
+}
+
+/// A crash with [`chain_in`]'s chain open, and the same chain landed whole, never crashed.
+fn crash_mid_chain(formats: Formats, landed: usize) -> CrashedChain {
+    let ops = std::cell::Cell::new(None);
+    let (dir, whole) = crash_with(|dir| {
+        let (run, first, second) = chain_in(dir, formats, landed);
+        ops.set(Some((first, second)));
+        run
+    });
+    let (first, second) = ops.get().expect("drawn");
     CrashedChain {
         dir,
         first,
         second,
         whole,
     }
+}
+
+/// A third stroke, over both of [`chain_in`]'s: `Down` to `Up`.
+fn over_both() -> Vec<PenSample> {
+    stroke(((140.0, 95.0), (180.0, 135.0)), 10)
 }
 
 /// The ops of the strokes `owner`'s brush has under way, oldest first.
@@ -302,4 +322,149 @@ fn a_restored_first_that_drops_dabs_takes_the_rest_of_the_chain_with_it() {
         last.placed(),
         "closed in the file, every dab counted landed: a restore lands none"
     );
+}
+
+#[test]
+fn a_down_waiting_for_the_chain_begins_once_the_first_drops_it() {
+    let crashed = crash_mid_chain(BRUSH_FORMATS, 1);
+    let mut owner = resumed_in(&crashed.dir, |project| {
+        Sculpting::new(project).with_cost(DabCost::one_at_a_time())
+    });
+    queue(&mut owner, stroke(((140.0, 90.0), (180.0, 90.0)), 8));
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "the new stroke waits");
+    assert_eq!(
+        owner.brush().down_awaits,
+        DownAwaits::Resumed,
+        "for the second to resume, no longer"
+    );
+    owner.brush_mut().knob = Knob::LandingFails;
+    let began = Instant::now();
+    while under_way(&owner).contains(&crashed.first) {
+        run(&mut owner, 1);
+        assert!(began.elapsed() < Duration::from_secs(60), "the first ends");
+    }
+    owner.brush_mut().knob = Knob::None;
+    assert!(
+        owner.brush().restored.is_empty(),
+        "the second went with the first"
+    );
+    let seen = landed_frame_by_frame(&mut owner);
+    assert!(!seen.contains(&crashed.second), "and never resumes");
+    assert!(
+        owner.brush().deferred.is_empty(),
+        "the new stroke was taken"
+    );
+    assert_eq!(
+        owner.brush().down_awaits,
+        DownAwaits::Landed,
+        "nothing waits"
+    );
+    assert!(owner.brush().drops() >= 1, "the first's dabs dropped");
+    let records = saved_strokes(owner, &crashed.dir, "after.bcrf");
+    assert_eq!(records.len(), 1, "the new stroke began and ended");
+}
+
+/// How far a restored chain of three may land from the same chain never crashed.
+///
+/// In each tile's coarsest quantization step: [`CHAIN_BOUND`]'s 1.5 for the first, and one more
+/// for each stroke landing on what the one before left. Measured: 2.0.
+const CHAIN_OF_THREE_BOUND: f32 = 3.5;
+
+#[test]
+fn a_restored_chain_of_three_lands_each_on_what_the_one_before_left() {
+    let (dir, whole) = crash_with(|dir| {
+        let (mut run, _, _) = chain_in(dir, BRUSH_FORMATS, 3);
+        run.frame(&over_both());
+        assert_eq!(run.brush.strokes.len(), 3, "the third began over both");
+        run.cut();
+        run
+    });
+    let mut owner = resumed_in(&dir, |project| {
+        Sculpting::new(project).with_cost(DabCost::one_at_a_time())
+    });
+    assert_eq!(under_way(&owner).len(), 1, "the first taken on");
+    assert_eq!(owner.brush().restored.len(), 2, "two wait to resume");
+    let seen = landed_frame_by_frame(&mut owner);
+    assert_eq!(seen.len(), 3, "each resumed in turn: {seen:?}");
+    assert!(seen.is_sorted(), "in op order: {seen:?}");
+    assert_eq!(owner.brush().error(), None);
+    assert_eq!(owner.brush().drops(), 0, "nothing dropped");
+    let got = corrections(owner.project());
+    let apart = coarse_steps_apart(&got, &whole);
+    println!("a restored chain of three: {apart} coarse steps from the chain never crashed");
+    assert!(
+        apart <= CHAIN_OF_THREE_BOUND,
+        "{apart} coarse steps from the chain never crashed"
+    );
+    owner.close().expect("closed");
+}
+
+/// A crash with a stroke landing and a second journalled behind it whose last row is off the
+/// model: the crash's directory, and the first stroke's op.
+///
+/// The row's numbers are a dab's (finite, a radius), so the restore takes the stroke on; only
+/// against the model, as it resumes, is it seen to be none of its dabs.
+fn crash_with_a_later_row_off_the_model() -> (TestDir, OpId) {
+    let mut run = Journalling::new();
+    run.project.set_dab_format(stroke::DAB_FORMAT);
+    run.frame(&stroke(ACROSS, 12));
+    let first = run.stroke().op.id();
+    let good = *run.stroke().dabs.front().expect("a dab");
+    let far = Dab {
+        position: [50.0, 0.0, 0.0],
+        ..good
+    };
+    let later = run.project.begin_stroke_after().expect("reserved");
+    run.project
+        .journal_placed_after(&later, &[row_of(good), row_of(far)])
+        .expect("journalled");
+    run.cut();
+    let Journalling {
+        dir,
+        project,
+        mut brush,
+        picker,
+        ..
+    } = run;
+    // A crash: nothing closes the project, and the reserved op goes with its store.
+    later.abandon_with_store_gone();
+    brush.abandon();
+    drop((brush, picker));
+    drop(project);
+    (dir, first)
+}
+
+#[test]
+fn a_later_stroke_found_off_the_model_as_it_resumes_isnt_finished_and_the_note_says_so() {
+    let (dir, first) = crash_with_a_later_row_off_the_model();
+    let mut owner = resumed_in(&dir, Sculpting::new);
+    let details = note_of(&mut owner);
+    assert_eq!(
+        details.len(),
+        1,
+        "both taken on, as far as their numbers say: {details:?}"
+    );
+    let seen = landed_frame_by_frame(&mut owner);
+    assert_eq!(seen, [first], "the second isn't resumed");
+    assert_eq!(owner.brush().error(), None, "which is no error");
+    assert_eq!(
+        owner.brush().drops(),
+        0,
+        "and drops nothing a save must own"
+    );
+    owner.upkeep(Instant::now()).expect("upkeep");
+    let bar = owner.bar().expect("the note, said again");
+    assert_eq!(bar.title(), "Your unsaved work is back");
+    assert_eq!(
+        bar.details().last().map(String::as_str),
+        Some(UNFINISHED_STROKE),
+        "{:?}",
+        bar.details()
+    );
+    // The rest saves as ever.
+    owner.request_save(Instant::now());
+    finish_save(&mut owner);
+    assert_eq!(owner.saving_succeeded(), Some(true), "saved");
+    owner.close().expect("closed");
 }

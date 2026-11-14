@@ -34,8 +34,11 @@
 //!   all ended ([`Sculpting::admit`]). Whether such a `Down` brushes or navigates is decided as it
 //!   comes, on the surface the stroke would read, their futures, as a `Down` on a fresh ridge their
 //!   dabs still to land raise means to brush ([`Brush::route`], [`Sculpting::route_on_futures`]);
-//!   where those can't be had, on the surface as it is then (their dabs landed so far). A `Down`
-//!   after Ctrl+S waits for the save ([`crate::saving`]).
+//!   where those can't be had, on the surface as it is then (their dabs landed so far). Routing it
+//!   so begins the stroke itself, kept with its op reserved for the step that takes the `Down`
+//!   ([`Routed::Over`]), so the futures a `Down` reads are computed once; a `Down` that doesn't
+//!   begin after all (navigating, deferred, held, claimed elsewhere, a close) gives the op back
+//!   ([`Sculpting::unroute`]). A `Down` after Ctrl+S waits for the save ([`crate::saving`]).
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -235,8 +238,11 @@
 //!   begun behind another. So a later stroke is on screen from when it resumes, not from the first
 //!   frame: the simplest exact way, as its futures would need its op reserved, which a restored
 //!   stroke's isn't. A stroke that drops dabs takes those after it with it
-//!   ([`Project::end_stroke_dropping_later`]), and one the project won't resume ends the chain
-//!   there, both kept as an error that dropped dabs.
+//!   ([`Project::end_stroke_dropping_later`]), kept as an error that dropped dabs. One that turns
+//!   out not to be finishable as it resumes (a row off the model as it is then, a project that says
+//!   it isn't resumable) ends the chain there with no error: it and those after it are not taken on
+//!   after all, and the restore note is said again with its line for them
+//!   ([`Sculpting::resume_next`], [`Brush::take_untaken`]).
 //! - **A `Down` meanwhile:** with only the first, it begins over it, as over any landing. With
 //!   later strokes still waiting to resume it waits, deferred ([`Begin::Waits`]): its op, a fresh
 //!   one, would end them ([`Project::begin_stroke_after`]). It is taken as the last of them
@@ -1641,6 +1647,81 @@ enum Begin {
     Waits,
 }
 
+/// An engine stroke begun over the strokes under way, on their futures, its op reserved behind
+/// theirs ([`Sculpting::engine_over`]): what the stroke goes on from.
+#[derive(Debug)]
+struct BegunOver {
+    /// The engine's stroke, begun at the `Down`.
+    engine: Stroke,
+    /// Its op's token: given back as the op begins, or is let go.
+    token: ReservedOp,
+    /// The tiles whose futures are installed for it.
+    installed: BTreeSet<TileKey>,
+}
+
+/// What became of beginning an engine stroke over the strokes under way
+/// ([`Sculpting::engine_over`]). But for [`Over::Begun`], nothing reserved is kept.
+#[derive(Debug)]
+enum Over {
+    /// It began, on their futures.
+    Begun(Box<BegunOver>),
+    /// The engine found nothing under the `Down`: no stroke starts.
+    Nothing,
+    /// The surface met a store error.
+    Failed(SculptError),
+    /// Past the open strokes' share, or their futures can't be had: the stroke waits for them.
+    Waits,
+}
+
+/// What routing the last `Down` to the brush left for its stroke to begin with
+/// ([`Brush::route`]).
+#[derive(Debug)]
+enum Routed {
+    /// With no stroke under way: the `Down`'s ray and its hit on the surface, the stroke's first
+    /// raycast.
+    Hit(Ray, Hit),
+    /// Over strokes still landing: the stroke itself, begun on their futures as routing read them
+    /// ([`Sculpting::route_on_futures`]), so the `Down` pays for them once.
+    Over(Box<RoutedOver>),
+}
+
+/// A stroke routing began over the strokes under way, and what it was begun from: the stroke
+/// its `Down` begins is this one only if all of that is as it was ([`RoutedOver::is_for`]).
+#[derive(Debug)]
+struct RoutedOver {
+    /// The `Down` routed.
+    down: PenSample,
+    /// The stroke's number.
+    id: StrokeId,
+    /// The view it was cast through.
+    projector: ViewProjector,
+    /// The brush's settings then.
+    settings: StrokeSettings,
+    /// The stroke, its op reserved: to be begun with, or given back
+    /// ([`Sculpting::unroute`]).
+    begun: BegunOver,
+}
+
+impl RoutedOver {
+    /// Whether the stroke `down` begins, numbered `id`, seen through `projector` with the brush
+    /// set as `settings`, is the one routing began: the engine is deterministic, so beginning it
+    /// again would give this very stroke. The strokes it was begun over are those still under
+    /// way, less any that ended since (their futures are the tiles themselves then): no stroke
+    /// begins with one routed outstanding ([`Sculpting::begin`] takes it first).
+    fn is_for(
+        &self,
+        down: &PenSample,
+        id: StrokeId,
+        projector: &ViewProjector,
+        settings: &StrokeSettings,
+    ) -> bool {
+        self.down == *down
+            && self.id == id
+            && self.projector == *projector
+            && self.settings == *settings
+    }
+}
+
 /// What a `Down` deferred first waits for before it is taken ([`Sculpting::deferred_ready`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownAwaits {
@@ -1703,6 +1784,10 @@ pub(crate) struct Sculpting {
     /// resumes once the one before it has landed and ended ([`Sculpting::resume_next`]), and a
     /// `Down` waits until none is left (see "Strokes a restore found" in the module notes).
     restored: VecDeque<OpenStroke>,
+    /// How many strokes a restore found the brush couldn't finish when it came to them, and let
+    /// go ([`Sculpting::resume_next`]), until the frame loop takes the count for the restore note
+    /// ([`Brush::take_untaken`]).
+    untaken: usize,
     /// What a `Down` deferred first waits for: every stroke under way to end, or only `restored`
     /// to resume, when it is taken as the last of them resumes and begins over it.
     down_awaits: DownAwaits,
@@ -1723,9 +1808,11 @@ pub(crate) struct Sculpting {
     next_stroke: u32,
     /// The epoch sample times count from.
     epoch: Instant,
-    /// The ray and hit of the last `Down` routed to the brush, for its stroke's first raycast;
-    /// cleared at the end of each step.
-    routed: Option<(Ray, Hit)>,
+    /// What routing the last `Down` to the brush left for its stroke to begin with: its first
+    /// raycast, or, over strokes still landing, the stroke itself with its op reserved. Taken as
+    /// the stroke begins, and given back wherever it doesn't ([`Sculpting::unroute`]): at the end
+    /// of each step at the latest.
+    routed: Option<Routed>,
     /// Pen samples held over from a step with no scene (a degenerate view) while a stroke was
     /// under way or waited to begin, in order; `None` for a stroke started elsewhere.
     held: Vec<Option<PenSample>>,
@@ -1803,6 +1890,7 @@ impl Sculpting {
             state,
             strokes: Vec::new(),
             restored: VecDeque::new(),
+            untaken: 0,
             down_awaits: DownAwaits::Landed,
             kept: Kept::default(),
             cost: DabCost::CALIBRATED,
@@ -2032,9 +2120,9 @@ impl Sculpting {
             return;
         }
         if down {
-            // Cast on the surface an earlier stroke had at its pen-down: the stroke raycasts
-            // again once it begins.
-            self.routed = None;
+            // Routed on the surface as it would be read then: the stroke raycasts again once it
+            // begins.
+            self.unroute(scene.project);
         }
         self.deferred.push(event.copied());
     }
@@ -2067,10 +2155,17 @@ impl Sculpting {
             return;
         }
         let deferred = std::mem::take(&mut self.deferred);
+        // Its `Down` is taken with them: one deferred again says afresh what it waits for.
         self.down_awaits = DownAwaits::Landed;
         for event in &deferred {
             self.admit(scene, event.as_ref());
         }
+    }
+
+    /// Forgets the events deferred, and with them what a `Down` among them waited for.
+    fn forget_deferred(&mut self) {
+        self.deferred.clear();
+        self.down_awaits = DownAwaits::Landed;
     }
 
     /// Whether the events deferred may be taken now: a stroke's `Down` once every stroke before it
@@ -2106,13 +2201,13 @@ impl Sculpting {
                 self.lift(scene, None);
                 if !self.deferred.is_empty() {
                     // The lift waits for the strokes before to land: so does this.
-                    self.routed = None;
+                    self.unroute(scene.project);
                     self.deferred.push(Some(*sample));
                     return;
                 }
                 if self.begin(scene, sample) == Begin::Waits {
                     // It begins once the strokes before it have ended, raycasting again then.
-                    self.routed = None;
+                    self.unroute(scene.project);
                     self.deferred.push(Some(*sample));
                 }
             }
@@ -2138,24 +2233,49 @@ impl Sculpting {
             return Begin::Waits;
         }
         self.warm = Warm::default();
-        let routed = self.routed.take();
-        let Some(first) = self.engine_sample(down) else {
-            return Begin::Done;
+        let (hit, over) = match self.routed.take() {
+            Some(Routed::Hit(ray, hit)) => (Some((ray, hit)), None),
+            Some(Routed::Over(over)) => (None, Some(*over)),
+            None => (None, None),
         };
         let id = StrokeId::new(self.next_stroke);
-        if !self.strokes.is_empty() {
-            let begun = self.begin_after(scene, down, first, id);
-            if begun == Begin::Done {
-                self.next_stroke = self.next_stroke.wrapping_add(1);
+        let first = self.engine_sample(down);
+        let (Some(first), false) = (first, self.strokes.is_empty()) else {
+            // Not begun over strokes under way: what routing reserved behind them goes back
+            // first, before any op is handed out.
+            if let Some(stale) = over {
+                drop(scene.project.drop_stroke_after(stale.begun.token));
             }
-            return begun;
+            return match first {
+                Some(first) => self.begin_alone(scene, down, first, id, hit),
+                None => Begin::Done,
+            };
+        };
+        let begun = self.begin_after(scene, down, first, id, over);
+        if begun == Begin::Done {
+            self.next_stroke = self.next_stroke.wrapping_add(1);
         }
+        begun
+    }
+
+    /// Starts a stroke at `down`, numbered `id`, its first sample `first`, with no stroke under
+    /// way: on the surface as the store holds it, its first raycast the one routing cast (`hit`),
+    /// and its op begun ahead ([`Project::begin_stroke`]). Always [`Begin::Done`]: it begins, or
+    /// nothing is under it, or an error is kept.
+    fn begin_alone(
+        &mut self,
+        scene: &mut Scene<'_>,
+        down: &PenSample,
+        first: Sample,
+        id: StrokeId,
+        hit: Option<(Ray, Hit)>,
+    ) -> Begin {
         self.next_stroke = self.next_stroke.wrapping_add(1);
         let projector = scene.projector;
         let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let mut primed = Primed {
             surface: &mut surface,
-            first: routed,
+            first: hit,
         };
         let engine = Stroke::begin(&self.settings, id, &projector, &mut primed, first);
         if let Err(error) = surface.finish() {
@@ -2180,8 +2300,14 @@ impl Sculpting {
 
     /// Starts a stroke at `down`, numbered `id`, its first sample `first`, over the strokes still
     /// landing (see "Strokes over strokes still landing" in the module notes): its op reserved
-    /// behind theirs ([`Project::begin_stroke_after`]), it begins on their futures. `routed` is
-    /// left unused: it was cast on the pen-down surface of the oldest of them.
+    /// behind theirs ([`Project::begin_stroke_after`]), it begins on their futures.
+    ///
+    /// `routed` is the stroke routing began for a `Down` over them, if it did
+    /// ([`Sculpting::route_on_futures`]): if it is this stroke ([`RoutedOver::is_for`]) the stroke
+    /// goes on from it, its futures installed and its op reserved already, so the `Down` computes
+    /// them once. One that isn't (routed for another `Down`, or through another view or with
+    /// other settings) is given back first, and the stroke begun afresh
+    /// ([`Sculpting::engine_over`]).
     ///
     /// [`Begin::Waits`], with nothing reserved, past the open strokes' share, or if the futures
     /// can't be had.
@@ -2191,18 +2317,57 @@ impl Sculpting {
         down: &PenSample,
         first: Sample,
         id: StrokeId,
+        routed: Option<RoutedOver>,
     ) -> Begin {
+        let begun = match routed {
+            Some(over) if over.is_for(down, id, &scene.projector, &self.settings) => {
+                Over::Begun(Box::new(over.begun))
+            }
+            stale => {
+                if let Some(over) = stale {
+                    drop(scene.project.drop_stroke_after(over.begun.token));
+                }
+                self.engine_over(scene, first, id)
+            }
+        };
+        match begun {
+            Over::Begun(over) => {
+                let BegunOver {
+                    engine,
+                    token,
+                    installed,
+                } = *over;
+                let op = StrokeOp::Reserved { token, installed };
+                self.started(scene, down, first, engine, op);
+                Begin::Done
+            }
+            // Nothing under it: no stroke, as with none landing.
+            Over::Nothing => Begin::Done,
+            Over::Failed(error) => {
+                self.dropped("starting a stroke", &error);
+                Begin::Done
+            }
+            Over::Waits => Begin::Waits,
+        }
+    }
+
+    /// Begins an engine stroke numbered `id` at its first sample `first` over the strokes under
+    /// way: an op is reserved behind theirs ([`Project::begin_stroke_after`]), what it reads of
+    /// them brought up to date ([`Sculpting::make_remaining`]), and the engine begun on their
+    /// futures, those it reads installed for the op ([`on_futures`]). But for [`Over::Begun`],
+    /// which holds the op's token, the op is given back before this returns.
+    fn engine_over(&mut self, scene: &mut Scene<'_>, first: Sample, id: StrokeId) -> Over {
         #[cfg(test)]
-        if self.knob == Knob::WaitsOverLanding {
-            return Begin::Waits;
+        if matches!(self.knob, Knob::WaitsOverLanding) {
+            return Over::Waits;
         }
         let Ok(token) = scene.project.begin_stroke_after() else {
             // Past the share, typically: it begins once those before it have landed.
-            return Begin::Waits;
+            return Over::Waits;
         };
         if self.make_remaining(scene).is_err() {
             drop(scene.project.drop_stroke_after(token));
-            return Begin::Waits;
+            return Over::Waits;
         }
         let mut installed: BTreeSet<TileKey> = BTreeSet::new();
         let (settings, projector) = (&self.settings, scene.projector);
@@ -2217,67 +2382,81 @@ impl Sculpting {
         let engine = match begun {
             Ok(Some(engine)) => engine,
             Ok(None) => {
-                // Nothing under it: no stroke, as with none landing.
                 drop(scene.project.drop_stroke_after(token));
-                return Begin::Done;
+                return Over::Nothing;
             }
             Err(OnFutures::Surface(error)) => {
                 drop(scene.project.drop_stroke_after(token));
-                self.dropped("starting a stroke", &error);
-                return Begin::Done;
+                return Over::Failed(error);
             }
             Err(OnFutures::Futures) => {
                 drop(scene.project.drop_stroke_after(token));
-                return Begin::Waits;
+                return Over::Waits;
             }
         };
-        let op = StrokeOp::Reserved { token, installed };
-        self.started(scene, down, first, engine, op);
-        Begin::Done
+        Over::Begun(Box::new(BegunOver {
+            engine,
+            token,
+            installed,
+        }))
     }
 
-    /// Where `ray` meets the surface a stroke begun now over the strokes under way would read:
+    /// Whether `down` is on the surface a stroke begun now over the strokes under way would read:
     /// their futures (see "Strokes over strokes still landing" in the module notes), so a `Down`
     /// on a ridge their dabs still to land raise brushes, and one where their dabs carved the
     /// surface away navigates ([`Brush::route`]).
     ///
-    /// It is read as the stroke's own first raycast is ([`Sculpting::begin_after`]): an op is
-    /// reserved behind theirs, the futures the ray reads installed for it ([`on_futures`]), and
-    /// the op given back at once, its journal empty. Its futures go with it: the stroke the
-    /// `Down` begins installs its own.
+    /// It is decided by beginning the stroke itself ([`Sculpting::engine_over`]): the engine
+    /// begins a stroke exactly where something is under the `Down`. The stroke begun is kept,
+    /// with its op reserved and its futures installed ([`Routed::Over`]), for the `Down` to begin
+    /// with in the step that takes it ([`Sculpting::begin_after`]): the futures a `Down` reads,
+    /// the dearest part of it, are computed once, not once to route it and again to begin. Where
+    /// the `Down` doesn't begin after all, the op goes back ([`Sculpting::unroute`]).
     ///
-    /// `None` with no stroke under way, while strokes a restore found wait to resume (a fresh op
-    /// would end them), while the newest's pen is down (its `Up` lost: the `Down` lifts it first,
-    /// placing more), or if the futures can't be had (past the open strokes' share, say): the
-    /// caller decides on the surface as it is.
+    /// `None`, nothing kept, with no stroke under way; while strokes a restore found wait to
+    /// resume (a fresh op would end them) or events are deferred (the `Down` waits behind them,
+    /// for another surface); while the newest's pen is down (its `Up` lost: the `Down` lifts it
+    /// first, placing more); for a `Down` the engine can't read; or if the futures can't be had
+    /// (past the open strokes' share, say): the caller decides on the surface as it is.
     fn route_on_futures(
         &mut self,
         scene: &mut Scene<'_>,
-        ray: &Ray,
-    ) -> Option<Result<Option<Hit>, SculptError>> {
-        if self.strokes.is_empty() || !self.restored.is_empty() || self.pen_on_stroke() {
+        down: &PenSample,
+    ) -> Option<Result<bool, SculptError>> {
+        let over = !self.strokes.is_empty() && self.restored.is_empty() && self.deferred.is_empty();
+        if !over || self.pen_on_stroke() {
             return None;
         }
         #[cfg(test)]
-        if matches!(self.knob, Knob::WaitsOverLanding | Knob::FuturesFail) {
+        if matches!(self.knob, Knob::FuturesFail) {
             return None;
         }
-        self.make_remaining(scene).ok()?;
-        let token = scene.project.begin_stroke_after().ok()?;
-        let mut installed: BTreeSet<TileKey> = BTreeSet::new();
-        let cast = on_futures(
-            scene,
-            &self.state,
-            &self.strokes,
-            &token,
-            &mut installed,
-            |surface| surface.raycast(ray),
-        );
-        drop(scene.project.drop_stroke_after(token));
-        match cast {
-            Ok(hit) => Some(Ok(hit)),
-            Err(OnFutures::Surface(error)) => Some(Err(error)),
-            Err(OnFutures::Futures) => None,
+        let first = self.engine_sample(down)?;
+        let id = StrokeId::new(self.next_stroke);
+        match self.engine_over(scene, first, id) {
+            Over::Begun(begun) => {
+                self.routed = Some(Routed::Over(Box::new(RoutedOver {
+                    down: *down,
+                    id,
+                    projector: scene.projector,
+                    settings: self.settings.clone(),
+                    begun: *begun,
+                })));
+                Some(Ok(true))
+            }
+            Over::Nothing => Some(Ok(false)),
+            Over::Failed(error) => Some(Err(error)),
+            Over::Waits => None,
+        }
+    }
+
+    /// Gives back what routing left for a `Down` that doesn't begin with it: the op reserved for
+    /// a stroke begun over those under way ([`Routed::Over`]) is let go in `project`
+    /// ([`Project::drop_stroke_after`]), its futures with it and its journal empty. No stroke is
+    /// reserved behind it: none begins while it is outstanding.
+    fn unroute(&mut self, project: &mut Project) {
+        if let Some(Routed::Over(over)) = self.routed.take() {
+            drop(project.drop_stroke_after(over.begun.token));
         }
     }
 
@@ -3193,10 +3372,11 @@ impl Sculpting {
     fn landing_step(&mut self, context: BrushContext<'_>, lifting: bool) -> Result<bool> {
         self.installing = Installing::new();
         let errors = self.errors_kept();
+        self.unroute(&mut *context.project);
         let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
             // No scene ever: no stroke began, and what waits to begin can't.
             self.held.clear();
-            self.deferred.clear();
+            self.forget_deferred();
             return Ok(false);
         };
         let held = std::mem::take(&mut self.held);
@@ -3493,9 +3673,13 @@ impl<'a> Scene<'a> {
         })
     }
 
-    /// `context`'s scene; `None` with no index (nothing to brush) or no view (a degenerate
-    /// camera).
-    fn of(context: BrushContext<'a>) -> Option<Self> {
+    /// `context`'s scene.
+    ///
+    /// # Errors
+    ///
+    /// With no index (nothing to brush) or no view (a degenerate camera): the project, which a
+    /// call with no scene may still need (to give a reserved op back, [`Sculpting::unroute`]).
+    fn of(context: BrushContext<'a>) -> Result<Self, &'a mut Project> {
         let BrushContext {
             project,
             index,
@@ -3504,10 +3688,13 @@ impl<'a> Scene<'a> {
             drawn,
             waiting,
         } = context;
-        Some(Self {
+        let (Some(index), Some(view)) = (index, camera.view(size)) else {
+            return Err(project);
+        };
+        Ok(Self {
             project,
-            index: index?,
-            projector: ViewProjector::new(&camera.view(size)?),
+            index,
+            projector: ViewProjector::new(&view),
             camera,
             drawn,
             waiting,
@@ -3525,22 +3712,26 @@ impl Brush for Sculpting {
         self.installing = Installing::new();
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
-        let Some(mut scene) = Scene::of(context) else {
-            if !self.strokes.is_empty() || !self.deferred.is_empty() {
-                // Kept for a frame that can place them: the strokes they belong to go on, and so
-                // does a stroke that waits to begin.
-                let events = pen.brush_events().map(|event| match event {
-                    ForBrush::Sample(sample) => Some(*sample),
-                    ForBrush::StrokeElsewhere => None,
-                });
-                self.held.extend(events);
-                self.finish_report(&mut report);
-                report.busy = true;
+        let mut scene = match Scene::of(context) {
+            Ok(scene) => scene,
+            Err(project) => {
+                if !self.strokes.is_empty() || !self.deferred.is_empty() {
+                    // Kept for a frame that can place them: the strokes they belong to go on, and
+                    // so does a stroke that waits to begin.
+                    let events = pen.brush_events().map(|event| match event {
+                        ForBrush::Sample(sample) => Some(*sample),
+                        ForBrush::StrokeElsewhere => None,
+                    });
+                    self.held.extend(events);
+                    self.finish_report(&mut report);
+                    report.busy = true;
+                }
+                // A `Down` held begins afresh in the frame that can place it.
+                self.unroute(project);
+                self.note_hover(pen, None);
+                self.refresh_status();
+                return Ok(report);
             }
-            self.routed = None;
-            self.note_hover(pen, None);
-            self.refresh_status();
-            return Ok(report);
         };
         self.last_projector = Some(scene.projector);
         if self.index_stale {
@@ -3565,7 +3756,8 @@ impl Brush for Sculpting {
             self.work(&mut scene, &mut report, Some(budget));
         }
         self.note_kept(scene.project.store());
-        self.routed = None;
+        // A `Down` routed and not taken by this step (claimed elsewhere since) begins nothing.
+        self.unroute(scene.project);
         // A frame draws what the steps before it did; one between frames leaves it to the next.
         self.unframed = budget.forces_progress()
             && (self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0);
@@ -3580,9 +3772,10 @@ impl Brush for Sculpting {
     }
 
     fn route(&mut self, context: BrushContext<'_>, down: &PenSample) -> Route {
-        self.routed = None;
+        // What the last `Down` routed left, if no step took it: this one's stands from here.
+        self.unroute(&mut *context.project);
         self.route_missed = false;
-        let Some(mut scene) = Scene::of(context) else {
+        let Ok(mut scene) = Scene::of(context) else {
             return Route::Navigate;
         };
         let Some(ray) = ScreenPoint::new(down.at.x, down.at.y)
@@ -3591,9 +3784,9 @@ impl Brush for Sculpting {
         else {
             return Route::Navigate;
         };
-        match self.route_on_futures(&mut scene, &ray) {
-            Some(Ok(Some(_))) => return Route::Brush,
-            Some(Ok(None)) => {
+        match self.route_on_futures(&mut scene, down) {
+            Some(Ok(true)) => return Route::Brush,
+            Some(Ok(false)) => {
                 self.route_missed = true;
                 return Route::Navigate;
             }
@@ -3612,7 +3805,7 @@ impl Brush for Sculpting {
         }
         match hit {
             Some(hit) => {
-                self.routed = Some((ray, hit));
+                self.routed = Some(Routed::Hit(ray, hit));
                 Route::Brush
             }
             // A `Down` over strokes still landing whose futures can't be had waits for them, and
@@ -3644,7 +3837,7 @@ impl Brush for Sculpting {
 
     fn prepare(&mut self, context: BrushContext<'_>, deadline: Instant) -> Result<bool> {
         self.installing = Installing::new();
-        let Some(mut scene) = Scene::of(context) else {
+        let Ok(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
         // The previews the renderer waits for, a few a call, off the pen's path: it draws their
@@ -3736,11 +3929,16 @@ impl Brush for Sculpting {
         self.take_on(context, strokes)
     }
 
+    fn take_untaken(&mut self) -> usize {
+        std::mem::take(&mut self.untaken)
+    }
+
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
         self.landing = Landing::InSteps;
         // Nothing waits for a save any more: a close lands every stroke there is, and the save
         // holds them all.
         self.save_asked = None;
+        self.unroute(&mut *context.project);
         if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
@@ -3817,10 +4015,12 @@ impl Brush for Sculpting {
                 token.abandon_with_store_gone();
             }
         }
+        if let Some(Routed::Over(over)) = self.routed.take() {
+            over.begun.token.abandon_with_store_gone();
+        }
         self.restored.clear();
-        self.down_awaits = DownAwaits::Landed;
         self.held.clear();
-        self.deferred.clear();
+        self.forget_deferred();
         self.landing = Landing::InFrames;
         self.save_asked = None;
     }
@@ -3845,6 +4045,7 @@ impl Brush for Sculpting {
         let errors = self.errors_kept();
         self.landing = Landing::InFrames;
         self.save_asked = None;
+        self.unroute(&mut *context.project);
         if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {

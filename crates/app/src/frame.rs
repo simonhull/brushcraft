@@ -193,6 +193,21 @@ pub(crate) struct BrushContext<'a> {
     pub(crate) waiting: &'a [TileKey],
 }
 
+/// What the frame loop keeps of the strokes a restore found still landing that can't be finished.
+#[derive(Debug, Default)]
+struct UnfinishedStrokes {
+    /// How many: those the project couldn't use or the brush didn't take on
+    /// ([`Owner::resume_stroke`]), and those the brush gave up on since
+    /// ([`Owner::hear_unfinished`]). The restore note says if any can't be finished, and whether
+    /// one or several ([`LastStroke::of`]).
+    count: usize,
+    /// How many of them came after the restore note was last said: it is said again, with them,
+    /// once the bar can take a note.
+    untold: usize,
+    /// The note of a restore, as it was said ([`Owner::note`]): what is said again then.
+    note: Option<OpenNote>,
+}
+
 /// Strokes a restore found still landing that the brush didn't take on ([`Brush::resume`]): the
 /// last of those it was given, from the first it wouldn't take, and why it wouldn't.
 #[derive(Debug)]
@@ -564,6 +579,15 @@ pub(crate) trait Brush {
     /// How many dabs the brush still holds to land, those of strokes that wait among them: what
     /// a close waits for.
     fn landing(&self) -> usize {
+        0
+    }
+
+    /// How many of the strokes it took on ([`Brush::resume`]) the brush couldn't finish after all
+    /// when it came to them, since last asked: a later stroke of a chain is checked against the
+    /// model, and resumed in the project, only once the stroke before it has landed. Their dabs
+    /// not landed are lost, the rest of the work stands, and no error is kept: the restore note
+    /// says they couldn't be finished, as of those never taken on. None by default.
+    fn take_untaken(&mut self) -> usize {
         0
     }
 
@@ -1368,9 +1392,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// A recovery file set aside by Use last save: removed by a stroke or a save, which end the
     /// way back to it, and only then.
     kept_recovery: Option<PathBuf>,
-    /// What became of the strokes a restore found still landing ([`Owner::resume_stroke`]): the
-    /// restore note says if any can't be finished, and whether one or several.
-    last_stroke: LastStroke,
+    /// The strokes a restore found still landing that can't be finished, and the note that says
+    /// so.
+    unfinished: UnfinishedStrokes,
     /// What the UI shows.
     dialogs: Dialogs,
 }
@@ -1603,7 +1627,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             copying: None,
             since_opening: SinceOpening::Untouched,
             kept_recovery: None,
-            last_stroke: LastStroke::Whole,
+            unfinished: UnfinishedStrokes::default(),
             dialogs,
         }
     }
@@ -1855,8 +1879,37 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Says at `now` what opening found, and of a restore, whether its last strokes can be
     /// finished ([`Owner::resume_stroke`]).
     pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
-        self.dialogs.note(note, self.last_stroke, now);
+        self.dialogs
+            .note(note, LastStroke::of(self.unfinished.count), now);
+        if matches!(note, OpenNote::Restored { .. }) {
+            self.unfinished.note = Some(note.clone());
+        }
+        self.unfinished.untold = 0;
         self.scheduler.want(Reason::Overlay);
+    }
+
+    /// Hears of the strokes a restore found that the brush couldn't finish after all, once it
+    /// came to them ([`Brush::take_untaken`]): they count with those never taken on, and the
+    /// restore note, if one was said, is said again with its line for them, at `now`, as soon as
+    /// the bar can take a note ([`Dialogs::takes_note`]): the first said the work was whole.
+    fn hear_unfinished(&mut self, now: Instant) {
+        let more = self.brush.take_untaken();
+        if more > 0 {
+            saving::log(&format!(
+                "brushcraft: {more} of the last strokes couldn't be finished after all"
+            ));
+            self.unfinished.count += more;
+            self.unfinished.untold += more;
+        }
+        if self.unfinished.untold == 0 || !self.dialogs.takes_note() {
+            return;
+        }
+        self.unfinished.untold = 0;
+        if let Some(note) = &self.unfinished.note {
+            self.dialogs
+                .note(note, LastStroke::of(self.unfinished.count), now);
+            self.scheduler.want(Reason::Overlay);
+        }
     }
 
     /// Hands the brush the strokes a restore found still landing, if there were any
@@ -1906,7 +1959,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 unfinished += strokes.get();
             }
         }
-        self.last_stroke = LastStroke::of(unfinished);
+        self.unfinished.count = unfinished;
         self.scheduler.want(Reason::Stroke);
     }
 
@@ -3421,12 +3474,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         Ok(())
     }
 
-    /// Hears what stroke ends told the brush of the recovery file.
+    /// Hears what stroke ends told the brush of the recovery file, and of the strokes a restore
+    /// found that it couldn't finish after all ([`Owner::hear_unfinished`]).
     ///
     /// # Errors
     ///
     /// As [`Owner::heard`].
     fn hear_brush(&mut self) -> Result<()> {
+        self.hear_unfinished(Instant::now());
         let reports = self.brush.take_recovery_reports();
         for report in reports {
             self.heard(Err(report), "ending a stroke")?;

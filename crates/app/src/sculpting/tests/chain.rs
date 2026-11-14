@@ -74,6 +74,25 @@ impl Chain {
         self.brush.step(context, &pen, &budget).expect("a step")
     }
 
+    /// Routes `down` as the frame loop does before the step that takes it.
+    fn route(&mut self, down: &PenSample) -> Route {
+        let context = context(&mut self.project, self.picker.index_mut(), &self.camera);
+        self.brush.route(context, down)
+    }
+
+    /// Whether routing left a stroke begun over those under way, its op reserved, for its `Down`
+    /// to begin with.
+    fn routed_over(&self) -> bool {
+        matches!(self.brush.routed, Some(Routed::Over(_)))
+    }
+
+    /// Asserts that the store holds no op reserved: with one stroke under way, none begun over
+    /// it, routing gave back whatever it reserved.
+    fn assert_nothing_reserved(&mut self) {
+        let reserved = self.project.store().drop_every_reserved_op();
+        assert!(reserved.is_empty(), "left reserved: {reserved:?}");
+    }
+
     /// A step that lands one dab of the oldest stroke, however dear: every pen quiet for long and
     /// the catch-up starved, so a step that must make progress takes one.
     fn land_one(&mut self) -> BrushReport {
@@ -1028,4 +1047,255 @@ fn a_stroke_over_a_long_backlog_shows_its_first_frame_installing_only_its_own() 
     }
     run.land_all();
     run.close();
+}
+
+#[test]
+fn a_down_routed_over_a_landing_stroke_begins_with_the_stroke_routing_began() {
+    // Routed, then stepped, as a frame does: the step installs no future the routing didn't, and
+    // the stroke places the dabs and leaves the tiles of one that waited.
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let (down, rest) = second.split_first().expect("a Down");
+        assert_eq!(run.route(down), Route::Brush);
+        assert!(run.routed_over(), "the stroke is begun, its op reserved");
+        installs_left(Some(COUNTED));
+        run.frame(std::slice::from_ref(down));
+        let left = INSTALLS_LEFT.get();
+        installs_left(None);
+        assert_eq!(left, Some(COUNTED), "its `Down` installs no future again");
+        assert!(!run.routed_over(), "taken by its stroke");
+        assert_eq!(run.ops().len(), 2, "begun over the first");
+        run.frame(rest);
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(chained, waited_rows, "the dabs of waiting");
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+/// A [`Chain`] with a stroke along [`ACROSS`] under way, none of it landed, and the `Down` of
+/// [`crossing`] routed to the brush over it: the stroke routing began waits for its step.
+fn routed_over_one() -> (Chain, PenSample) {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    let down = *crossing().first().expect("a Down");
+    assert_eq!(run.route(&down), Route::Brush);
+    assert!(run.routed_over(), "the stroke is begun, its op reserved");
+    (run, down)
+}
+
+/// Ends a [`routed_over_one`] run whose `Down` began no stroke: nothing is reserved, the first
+/// stroke lands, and the recovery file holds batches of no op but its own.
+fn assert_given_back(mut run: Chain) {
+    assert!(!run.routed_over(), "given back");
+    run.assert_nothing_reserved();
+    let ops = run.ops();
+    let [first] = ops.as_slice() else {
+        panic!("the first stroke alone under way: {ops:?}");
+    };
+    let first = *first;
+    run.cut();
+    let path = run
+        .project
+        .recovery_path()
+        .expect("a recovery file")
+        .to_owned();
+    run.land_all();
+    let Chain { dir, project, .. } = run;
+    project.close(true).expect("closed");
+    let file = ProjectFile::open(&path).expect("the recovery file opens");
+    let batches = file.batches().map(|batch| batch.expect("a batch"));
+    let others: Vec<OpId> = batches
+        .map(|batch| batch.op())
+        .filter(|op| *op != first)
+        .collect();
+    assert!(others.is_empty(), "batches of ops never begun: {others:?}");
+    drop(dir);
+}
+
+#[test]
+fn a_down_routed_off_the_futures_navigates_and_reserves_nothing() {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    let off = sample(Phase::Down, (3.0, 3.0), 0.8);
+    assert_eq!(run.route(&off), Route::Navigate);
+    assert!(run.brush.routed_off_surface(), "nothing under it");
+    assert_given_back(run);
+}
+
+#[test]
+fn a_down_routed_and_claimed_elsewhere_gives_its_op_back_as_the_step_ends() {
+    let (mut run, _) = routed_over_one();
+    run.frame(&[]);
+    assert_given_back(run);
+}
+
+#[test]
+fn a_down_routed_and_held_for_a_frame_with_a_view_gives_its_op_back() {
+    let (mut run, down) = routed_over_one();
+    let mut pen = PenFrame::default();
+    pen.push(down, Some(Route::Brush));
+    let blind = BrushContext {
+        project: &mut run.project,
+        index: None,
+        camera: &run.camera,
+        size: size(),
+        drawn: Drawing::ALL,
+        waiting: &[],
+    };
+    run.brush
+        .step(blind, &pen, &BrushBudget::unlimited())
+        .expect("a step");
+    assert_eq!(run.brush.held.len(), 1, "the Down is held");
+    assert!(!run.routed_over(), "given back");
+    run.assert_nothing_reserved();
+    // The frame that can place it begins the stroke afresh.
+    run.frame(&crossing()[1..]);
+    assert_eq!(run.ops().len(), 2, "begun over the first");
+    run.land_all();
+    run.close();
+}
+
+#[test]
+fn a_down_routed_and_deferred_for_a_save_gives_its_op_back() {
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.brush.begin_saving(Instant::now());
+    let down = sample(Phase::Down, (150.0, 80.0), 0.8);
+    assert!(down.received > run.brush.save_asked.expect("asked"));
+    assert_eq!(run.route(&down), Route::Brush);
+    assert!(run.routed_over(), "the stroke is begun, its op reserved");
+    run.frame(&[down]);
+    assert_eq!(run.brush.deferred.len(), 1, "it waits for the save");
+    assert!(!run.routed_over(), "given back");
+    run.assert_nothing_reserved();
+    run.brush.abandon();
+    run.close();
+}
+
+#[test]
+fn a_down_routed_as_every_stroke_before_it_ends_begins_alone() {
+    let (mut run, _) = routed_over_one();
+    // The catch-up, off the frame's step, lands the first whole before the `Down` is taken.
+    let began = Instant::now();
+    run.cut();
+    while !run.ops().is_empty() {
+        // Its pen quiet for long and the catch-up starved: each call lands a dab.
+        let long_ago = Instant::now()
+            .checked_sub(RESTING_QUIET * 2)
+            .expect("after the epoch");
+        run.brush.landed_at = long_ago;
+        run.brush.unframed = false;
+        for stroke in &mut run.brush.strokes {
+            stroke.placed_at = long_ago;
+            stroke.last.received = long_ago;
+        }
+        let prepared = context(&mut run.project, run.picker.index_mut(), &run.camera);
+        run.brush
+            .prepare(prepared, Instant::now())
+            .expect("prepared");
+        assert!(began.elapsed() < Duration::from_secs(60), "the first lands");
+    }
+    assert!(run.routed_over(), "still routed: no step ended");
+    run.frame(&crossing());
+    assert!(!run.routed_over(), "given back");
+    let strokes = &run.brush.strokes;
+    let [only] = strokes.as_slice() else {
+        panic!("one stroke under way: {}", strokes.len());
+    };
+    assert!(
+        matches!(only.op, StrokeOp::Begun(_)),
+        "begun alone, on what the first left"
+    );
+    assert_eq!(run.brush.error(), None);
+    run.land_all();
+    run.close();
+}
+
+#[test]
+fn a_second_down_routed_gives_the_firsts_op_back_and_a_close_or_an_abandon_the_last() {
+    let (mut run, _) = routed_over_one();
+    let again = sample(Phase::Down, (160.0, 110.0), 0.8);
+    assert_eq!(run.route(&again), Route::Brush);
+    assert!(run.routed_over(), "the second's stands");
+    let closing = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    run.brush.begin_closing(closing).expect("closing");
+    assert!(!run.routed_over(), "a close gives it back");
+    run.assert_nothing_reserved();
+    run.land_all();
+    run.close();
+
+    let (mut abandoned, _) = routed_over_one();
+    abandoned.brush.abandon();
+    assert!(!abandoned.routed_over(), "an abandon lets it go");
+    abandoned.close();
+}
+
+/// How many times `a_down_over_a_heavy_stroke_is_timed` draws its case: the median is said.
+const TIMED_RUNS: usize = 7;
+
+/// The median of `times`.
+fn median(mut times: Vec<Duration>) -> Duration {
+    times.sort_unstable();
+    times.get(times.len() / 2).copied().unwrap_or_default()
+}
+
+/// A measurement, printed and asserting nothing of time: a heavy stroke, then at once a stroke
+/// over it, from its `Down`'s routing to the step that places and shows its first dab.
+///
+/// The heavy stroke goes to and fro over the sphere's middle on a face of 4 × 4 tiles, none of it
+/// landed; `prepare` has kept up what a later stroke reads of it, as the frames after it would.
+/// The `Down` is routed and then stepped with its first drag, as a frame does: the time said is
+/// the routing's, the step's, and both.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_down_over_a_heavy_stroke_is_timed() {
+    let mut routing = Vec::with_capacity(TIMED_RUNS);
+    let mut stepping = Vec::with_capacity(TIMED_RUNS);
+    let mut backlog = 0;
+    for _ in 0..TIMED_RUNS {
+        let level = Level::new(BACKLOG_LEVEL).expect("a level");
+        let config = StoreConfig::new(256 << 20, 1).with_display(level);
+        let mut run = Chain::new(Instant::now(), Some(config));
+        run.build_display();
+        let mut heavy = to_and_fro(64);
+        heavy.push(sample(Phase::Up, ACROSS.0, 0.0));
+        run.frame(&heavy);
+        backlog = run.rows().first().map_or(0, Vec::len);
+        let kept_up = context(&mut run.project, run.picker.index_mut(), &run.camera);
+        run.brush
+            .prepare(kept_up, Instant::now())
+            .expect("prepared");
+        let down = sample(Phase::Down, (160.0, 105.0), 0.8);
+        let drag = sample(Phase::Drag, (163.0, 105.5), 0.8);
+        let began = Instant::now();
+        let routed = run.brush.route(
+            context(&mut run.project, run.picker.index_mut(), &run.camera),
+            &down,
+        );
+        let routed_in = began.elapsed();
+        assert_eq!(routed, Route::Brush, "on the heavy stroke");
+        let stepped = Instant::now();
+        let first = run.frame(&[down, drag]);
+        let stepped_in = stepped.elapsed();
+        assert_eq!(run.ops().len(), 2, "it began over the heavy stroke");
+        assert!(first.dabs_shown > 0, "its first dab is shown: {first:?}");
+        routing.push(routed_in);
+        stepping.push(stepped_in);
+        run.brush.abandon();
+        run.close();
+    }
+    let both = routing
+        .iter()
+        .zip(&stepping)
+        .map(|(route, step)| *route + *step);
+    let both: Vec<Duration> = both.collect();
+    println!(
+        "a Down over {backlog} dabs still to land: routed in {:?}, stepped to its first dab in \
+         {:?}, {:?} in all (medians of {TIMED_RUNS})",
+        median(routing),
+        median(stepping),
+        median(both),
+    );
 }

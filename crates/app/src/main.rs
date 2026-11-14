@@ -1620,17 +1620,25 @@ mod tests {
     ///
     /// The first half of [`dabs_on_the_edited_tile`] a stroke with 3 of them landed, the second
     /// half a stroke begun over it ([`Project::begin_stroke_after`]), journalled, none landed.
-    /// Returns its recovery file, the surface the crash left, and the surface of both landed in
-    /// turn.
+    /// With `later` [`Later::OffTheModel`], the second stroke's last row is a dab far off the
+    /// model, its numbers a dab's all the same. Returns its recovery file, the surface the crash
+    /// left, and the surface of the strokes that can be finished landed in turn: both, or the
+    /// first alone.
     fn left_a_chain_landing_on_an_earlier_save(
         opening: &ProjectToOpen,
+        later_is: Later,
     ) -> (PathBuf, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>) {
         let rows_of = |dabs: &[stroke::Dab]| -> Vec<[u8; store::DAB_BYTES]> {
             dabs.iter().map(|dab| bytemuck::cast(*dab)).collect()
         };
         let mut crashed = opening.clone().open().expect("opened");
         crashed.set_dab_format(stroke::DAB_FORMAT);
-        let dabs = dabs_on_the_edited_tile(&mut crashed);
+        let mut dabs = dabs_on_the_edited_tile(&mut crashed);
+        if later_is == Later::OffTheModel
+            && let Some(last) = dabs.last_mut()
+        {
+            last.position = [50.0, 0.0, 0.0];
+        }
         let (first, second) = dabs.split_at(dabs.len() / 2);
         assert!(first.len() > 3, "dabs left to land: {}", first.len());
         let level = crashed.store().display_finest().expect("a display layer");
@@ -1656,9 +1664,11 @@ mod tests {
         let (mut whole_index, _) = never_killed.load_index(level, |_, _| {}).expect("an index");
         never_killed.begin_stroke_and_wait().expect("begun");
         land(&mut never_killed, &mut whole_index, first);
-        never_killed.end_unrecorded_stroke().expect("ended");
-        never_killed.begin_stroke_and_wait().expect("begun");
-        land(&mut never_killed, &mut whole_index, second);
+        if later_is == Later::Whole {
+            never_killed.end_unrecorded_stroke().expect("ended");
+            never_killed.begin_stroke_and_wait().expect("begun");
+            land(&mut never_killed, &mut whole_index, second);
+        }
         let whole = every_surface(&mut never_killed);
         never_killed.close(false).expect("closed");
         let mut session = opening.clone().open().expect("opened");
@@ -1668,11 +1678,49 @@ mod tests {
         (file, left, whole)
     }
 
+    /// What the second stroke [`left_a_chain_landing_on_an_earlier_save`] leaves is like.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Later {
+        /// Its dabs, every one on the model.
+        Whole,
+        /// Its last row a dab far off the model: seen only against the model, as it resumes.
+        OffTheModel,
+    }
+
+    #[test]
+    fn a_copy_whose_later_stroke_is_off_the_model_lands_the_first_and_says_so() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let (file, left, first_landed) =
+            left_a_chain_landing_on_an_earlier_save(&opening, Later::OffTheModel);
+        assert!(
+            farthest(&left, &first_landed) > 1e-3,
+            "the first's dabs not landed move the surface"
+        );
+        let copy = Reopen::Copy {
+            candidate: candidate(&opening, &file),
+        };
+        let reopened = opening.reopen(copy).expect("reopened");
+        assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
+        assert!(reopened.copied.is_some(), "the copy is saved all the same");
+        assert_eq!(
+            reopened.note,
+            Some(OpenNote::CopyUnfinished(Unfinished::One)),
+            "one stroke couldn't be finished"
+        );
+        let mut project = reopened.project;
+        assert!(!project.has_unsaved_edits(), "it's saved");
+        let apart = farthest(&every_surface(&mut project), &first_landed);
+        assert!(apart < 1e-4, "the copy holds the first stroke: {apart} off");
+        project.close(false).expect("closed");
+        assert!(!file.exists(), "in the copy, so no longer found");
+    }
+
     #[test]
     fn open_as_a_copy_lands_every_stroke_of_a_chain_first() {
         let dir = TestDir::new();
         let opening = saved(&dir, "first-sculpt.bcrf");
-        let (file, left, whole) = left_a_chain_landing_on_an_earlier_save(&opening);
+        let (file, left, whole) = left_a_chain_landing_on_an_earlier_save(&opening, Later::Whole);
         assert!(
             farthest(&left, &whole) > 1e-3,
             "the dabs not landed move the surface"

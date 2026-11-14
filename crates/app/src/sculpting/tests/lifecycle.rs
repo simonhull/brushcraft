@@ -375,9 +375,10 @@ fn silhouette(project: &mut Project, index: &SpatialIndex) -> f64 {
     on.last().expect("the sphere is under the middle")
 }
 
-/// A dab raising a bump at the silhouette of `project`'s sphere, outward along its normal there:
-/// it stands past the silhouette once landed.
-fn bump_at_the_silhouette(project: &mut Project, index: &SpatialIndex) -> Dab {
+/// A dab of `strength` at the silhouette of `project`'s sphere, along its normal there: raising a
+/// bump that stands past the silhouette once landed, or (negative) carving the surface away
+/// inside it.
+fn dab_at_the_silhouette(project: &mut Project, index: &SpatialIndex, strength: f32) -> Dab {
     let edge = silhouette(project, index);
     let near = pen_down_hit(project, index, &middle_ray(edge - 4.0)).expect("a hit");
     let centre = near.position.to_f32();
@@ -386,9 +387,95 @@ fn bump_at_the_silhouette(project: &mut Project, index: &SpatialIndex) -> Dab {
         position: [centre.x, centre.y, centre.z],
         normal: [outward.x, outward.y, outward.z],
         radius: 0.3,
-        strength: 0.25,
+        strength,
         ..Dab::default()
     }
+}
+
+/// A project of its own with `dab` landed by a stroke still open, with its directory and its
+/// index.
+fn landed_twin(dab: Dab) -> (TestDir, Project, Picker) {
+    let dir = TestDir::new();
+    let mut landed = project(&dir);
+    let mut picker = Picker::load(&mut landed)
+        .expect("the index loads")
+        .expect("a display layer");
+    landed.begin_stroke_and_wait().expect("a stroke");
+    let mut state = sculpt::Stroke::new(landed.store());
+    apply_dabs(landed.store(), picker.index_mut(), &mut state, &[dab]).expect("applied");
+    (dir, landed, picker)
+}
+
+/// Whether the ray through pixel `x` of the middle row meets `project`'s surface as it is stored.
+fn stored_hit(project: &mut Project, picker: &mut Picker, x: f64) -> bool {
+    let ray = middle_ray(x);
+    let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()).expect("a ray");
+    let hit = picker
+        .index_mut()
+        .raycast_triangle(project.store(), &narrow)
+        .expect("casts");
+    hit.is_some()
+}
+
+#[test]
+fn a_down_where_the_earlier_strokes_unlanded_dabs_carve_the_surface_away_navigates() {
+    // Where the carving leaves nothing once landed: a pixel inside the silhouette the stroke
+    // began on, found on a project of its own.
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    let mut picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let edge = silhouette(&mut project, picker.index_mut());
+    // Pushed inward along the normal, and broad: the whole chord of a ray near the silhouette
+    // lies well inside it, so the surface there goes from under the ray.
+    let raised = dab_at_the_silhouette(&mut project, picker.index_mut(), 0.25);
+    let carve = Dab {
+        normal: raised.normal.map(|n| -n),
+        radius: 0.6,
+        ..raised
+    };
+    let (twin_dir, mut twin, mut twin_picker) = landed_twin(carve);
+    let carved = (0..30)
+        .map(|d| edge - f64::from(d))
+        .find(|&x| !stored_hit(&mut twin, &mut twin_picker, x));
+    let x = carved.expect("the carving reaches inside the silhouette");
+    twin.end_unrecorded_stroke().expect("ended");
+    twin.close(false).expect("closed");
+    drop(twin_dir);
+
+    // The same dab queued by a stroke whose pen has lifted, none of it landed.
+    let mut brush = Sculpting::new(&mut project);
+    let camera = Camera::default();
+    let op = project.begin_stroke_and_wait().expect("a stroke");
+    let mut earlier = landing_stroke(&camera, &brush, op);
+    let times = earlier.last;
+    earlier.dabs = VecDeque::from([carve]);
+    earlier.sources = VecDeque::from([Source::of(&carve, times, picker.index_mut())]);
+    brush.strokes = vec![earlier];
+    assert!(
+        pen_down_hit(&mut project, picker.index_mut(), &middle_ray(x)).is_some(),
+        "on the surface the earlier stroke began on"
+    );
+    assert!(
+        stored_hit(&mut project, &mut picker, x),
+        "and on the surface as stored: nothing has landed"
+    );
+    let down = sample(Phase::Down, (x, 100.0), 0.5);
+    let routed = brush.route(context(&mut project, picker.index_mut(), &camera), &down);
+    assert_eq!(
+        routed,
+        Route::Navigate,
+        "nothing will be under it once the stroke lands"
+    );
+    assert!(brush.routed_off_surface(), "said as a miss");
+    assert_eq!(brush.error(), None);
+    assert!(brush.routed.is_none(), "nothing kept");
+    let reserved = project.store().drop_every_reserved_op();
+    assert!(reserved.is_empty(), "nothing left reserved: {reserved:?}");
+    brush.strokes.clear();
+    project.end_unrecorded_stroke().expect("ended");
+    project.close(false).expect("closed");
 }
 
 #[test]
@@ -400,7 +487,7 @@ fn a_down_on_a_ridge_only_the_earlier_strokes_unlanded_dabs_raise_brushes() {
         .expect("the index loads")
         .expect("a display layer");
     let edge = silhouette(&mut landed, landed_picker.index_mut());
-    let bump = bump_at_the_silhouette(&mut landed, landed_picker.index_mut());
+    let bump = dab_at_the_silhouette(&mut landed, landed_picker.index_mut(), 0.25);
     landed.begin_stroke_and_wait().expect("a stroke");
     let mut state = sculpt::Stroke::new(landed.store());
     apply_dabs(

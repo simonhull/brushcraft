@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use store::{OpenStroke, Project, ProjectError, SpatialIndex};
+use store::{NotResumed, OpenStroke, Project, ProjectError, SpatialIndex};
 use stroke::Dab;
 
 use super::{DabRow, FIRST_INTERVAL, Pending, Scene, Sculpting, Source, StrokeOp, ViewProjector};
@@ -126,6 +126,18 @@ fn dabs_of(found: &OpenStroke, against: Against) -> Result<VecDeque<Dab>> {
     Ok(dabs)
 }
 
+/// Whether `why`, the reason a stroke a restore found wasn't resumed, says it isn't one to finish.
+///
+/// That is a row that can't be a dab of the model ([`HostileDab`]), rows of another layout
+/// ([`OtherDabFormat`]), or a project that says it can't be resumed
+/// ([`ProjectError::NotResumable`]). Anything else is a failure of the resuming itself.
+fn not_to_finish(why: &anyhow::Error) -> bool {
+    let refused = why.downcast_ref::<NotResumed>();
+    let not_resumable =
+        refused.is_some_and(|refused| matches!(refused.error(), ProjectError::NotResumable(_)));
+    not_resumable || why.is::<HostileDab>() || why.is::<OtherDabFormat>()
+}
+
 impl Sculpting {
     /// Takes on `found`, the strokes a restore found still landing, in op order, through
     /// `context` (see "Strokes a restore found" in the module notes): the first resumed in the
@@ -180,6 +192,8 @@ impl Sculpting {
             drawn,
             ..
         } = context;
+        // An op routing reserved goes back before one resumes.
+        self.unroute(project);
         let count = found.len();
         let none_taken = |why: anyhow::Error| NotTakenOn::new(count, why).map_or(Ok(()), Err);
         let busy = !self.strokes.is_empty()
@@ -232,22 +246,34 @@ impl Sculpting {
     /// ([`Sculpting::take_on`]). With every one resumed, the rest are let go
     /// ([`Sculpting::after_resuming`]).
     ///
-    /// One the project won't resume ends the chain: it and every one after it are let go
+    /// One that isn't resumed ends the chain: it and every one after it are let go
     /// ([`Project::let_go_of_restored_strokes`], closing them in the file), their dabs never
-    /// landed, kept as an error that dropped dabs, which the next save owns up to.
+    /// landed. If the stroke can't be the brush's or the project's to finish ([`not_to_finish`]:
+    /// a row that can't be a dab of the model as it is now, rows of another layout, a project
+    /// that says it isn't resumable) they are not taken on, as if refused at the restore: counted
+    /// for the restore note ([`Brush::take_untaken`]), and no error, so a save or a copy of the
+    /// rest goes through. Any other refusal (the store's cache, twice) is kept as an error that
+    /// dropped dabs, which the next save owns up to.
     pub(super) fn resume_next(&mut self, scene: &mut Scene<'_>) {
         let Some(next) = self.restored.pop_front() else {
             return;
         };
         let projector = scene.projector;
         let resumed = self.resume_found(scene.project, scene.index, &projector, scene.drawn, next);
-        if let Err(why) = resumed {
-            self.restored.clear();
-            drop(scene.project.let_go_of_restored_strokes());
-            self.dropped("resuming a stroke a restore found", why.as_ref());
+        let Err(why) = resumed else {
+            self.after_resuming(scene.project);
             return;
+        };
+        let after = std::mem::take(&mut self.restored).len();
+        drop(scene.project.let_go_of_restored_strokes());
+        if not_to_finish(&why) {
+            crate::saving::log(&format!(
+                "brushcraft: a last stroke can't be finished, nor the {after} after it: {why:#}"
+            ));
+            self.untaken += 1 + after;
+        } else {
+            self.dropped("resuming a stroke a restore found", why.as_ref());
         }
-        self.after_resuming(scene.project);
     }
 
     /// Once every stroke a restore found that the brush takes on has resumed, the project lets
@@ -347,8 +373,8 @@ impl Sculpting {
 /// # Errors
 ///
 /// If the spatial index can't be loaded, or landing them dropped dabs: what they would hold isn't
-/// all there. The stroke has ended then, its dabs not landed counted landed, so a close that
-/// flushes would leave a recovery file a retry finds no stroke in: close the project with
+/// all there. The strokes have ended then, their dabs not landed counted landed, so a close that
+/// flushes would leave a recovery file a retry finds no strokes in: close the project with
 /// [`Project::close_untouched`] to keep the found work as it was.
 pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
     let found = project.take_open_strokes();
@@ -404,6 +430,8 @@ pub(crate) fn finish_restored(project: &mut Project) -> Result<LastStroke> {
         waiting: &[],
     };
     brush.flush(landing)?;
+    // Those it came to and couldn't finish after all: not taken on, as those refused above.
+    unfinished += brush.take_untaken();
     if brush.landing() > 0 {
         bail!("{} of the last strokes' dabs didn't land", brush.landing());
     }
