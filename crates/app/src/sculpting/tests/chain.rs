@@ -95,7 +95,11 @@ impl Chain {
 
     /// A step that lands one dab of the oldest stroke, however dear: every pen quiet for long and
     /// the catch-up starved, so a step that must make progress takes one.
+    ///
+    /// Its report is the step's own: what a `prepare` before it caught up, which a step's report
+    /// would carry too, is taken off first, so it says one dab applied whenever it lands one.
     fn land_one(&mut self) -> BrushReport {
+        self.brush.caught_up = BrushReport::default();
         let long_ago = Instant::now()
             .checked_sub(RESTING_QUIET * 2)
             .expect("after the epoch");
@@ -111,14 +115,10 @@ impl Chain {
             .expect("a step")
     }
 
-    /// Lands `count` dabs of the oldest stroke or a few more, a step at a time
-    /// ([`Chain::land_one`]: a step lands one, now and then another with it).
+    /// Lands `count` dabs of the oldest stroke, a step each ([`Chain::land_one`]).
     fn land_some(&mut self, count: usize) {
-        let mut landed = 0;
-        while landed < count {
-            let step = self.land_one().dabs_applied;
-            assert!(step > 0, "a dab lands");
-            landed += step;
+        for _ in 0..count {
+            assert_eq!(self.land_one().dabs_applied, 1, "a dab lands");
         }
     }
 
@@ -205,11 +205,17 @@ impl Chain {
     /// A `prepare` of the brush with no time to spare, as after a frame's hand-off: what a later
     /// stroke reads of those under way is kept up, and each piece of work off the pen's path gets
     /// its one batch.
+    ///
+    /// The catch-up is held meanwhile (as during a close): whether it would land a dab depends
+    /// on whether the stroke's pen-down flush has finished, which a test can't time. What lands
+    /// is what the test lands ([`Chain::land_one`]).
     fn prepare(&mut self) {
+        let landing = std::mem::replace(&mut self.brush.landing, Landing::InSteps);
         let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
         self.brush
             .prepare(prepared, Instant::now())
             .expect("prepared");
+        self.brush.landing = landing;
     }
 
     /// The tiles whose futures are installed for the newest stroke, its op reserved; none for one
@@ -1305,6 +1311,9 @@ fn a_down_where_the_pen_hovered_over_a_landing_stroke_makes_no_future_and_draws_
     let (first, second) = (stroke(ACROSS, 12), crossing());
     let (chained, chained_tiles) = drawn(epoch, |run| {
         run.frame(&first);
+        // Part of the first has landed, for sure: its cut is taken, and its dabs landed here.
+        run.cut();
+        run.land_some(3);
         let (down, rest) = second.split_first().expect("a Down");
         take_made();
         run.hover(pixel_of(down));
@@ -1326,9 +1335,97 @@ fn a_down_where_the_pen_hovered_over_a_landing_stroke_makes_no_future_and_draws_
             "the Down makes no future: those it reads were made as the pen hovered"
         );
         run.frame(rest);
+        assert_eq!(run.ops().len(), 2, "both under way");
     });
     let (waited_rows, waited_tiles) = waited(epoch);
-    assert_eq!(chained, waited_rows, "the dabs of waiting, bit for bit");
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+#[test]
+fn futures_made_ahead_hold_as_their_stroke_lands_on_before_the_down() {
+    // Warmed with nothing landed; then the first stroke lands on, some of its dabs on tiles
+    // whose futures are made, the rest of those tiles' dabs still to land; then the `Down`: the
+    // futures made before are what the landing since leaves, and are installed as they are.
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let (down, rest) = second.split_first().expect("a Down");
+        run.hover(pixel_of(down));
+        let ahead: BTreeSet<TileKey> = run.brush.ahead.tiles.keys().copied().collect();
+        assert!(!ahead.is_empty(), "futures are made as the pen hovers");
+        run.cut();
+        run.land_some(5);
+        let still: BTreeSet<TileKey> = {
+            let earlier = run.brush.strokes.first().expect("the first");
+            let remaining = earlier.remaining.as_ref().expect("made as the pen hovered");
+            remaining.reach.keys().copied().collect()
+        };
+        assert!(
+            ahead.intersection(&still).next().is_some(),
+            "tiles with futures made, part of their dabs landed since"
+        );
+        take_made();
+        assert_eq!(run.route(down), Route::Brush);
+        run.frame(std::slice::from_ref(down));
+        assert_eq!(run.ops().len(), 2, "begun over the first");
+        let installed = run.installed();
+        assert!(
+            installed.intersection(&ahead).next().is_some(),
+            "futures made before the landing are installed"
+        );
+        assert_eq!(
+            take_made(),
+            0,
+            "none made again: they hold as the stroke lands"
+        );
+        run.land_some(2);
+        run.frame(rest);
+        assert_eq!(run.ops().len(), 2, "both under way");
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+#[test]
+fn futures_made_ahead_of_a_stroke_that_lands_whole_before_the_down_are_let_go() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let down = second.first().expect("a Down");
+        run.hover(pixel_of(down));
+        assert!(!run.brush.ahead.tiles.is_empty(), "futures made ahead");
+        run.cut();
+        run.land_all();
+        assert!(run.ops().is_empty(), "the first has landed and ended");
+        take_made();
+        run.frame(&second);
+        assert_eq!(take_made(), 0, "a stroke alone reads the store");
+        assert!(run.brush.ahead.tiles.is_empty(), "let go with the stroke");
+        let strokes = &run.brush.strokes;
+        let [only] = strokes.as_slice() else {
+            panic!("one stroke under way: {}", strokes.len());
+        };
+        assert!(matches!(only.op, StrokeOp::Begun(_)), "begun alone");
+        run.cut();
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
     assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
 }
 
@@ -1417,14 +1514,25 @@ fn a_stroke_fed_a_sample_a_frame_with_its_futures_installed_ahead_places_the_dab
     let (first, second) = (stroke(ACROSS, 12), crossing());
     let (chained, chained_tiles) = drawn(epoch, |run| {
         run.frame(&first);
-        for sample in &second {
+        // The first lands on between the second's frames, for sure: its cut is taken, and a dab
+        // lands after every other sample, between the futures installed for the second.
+        run.cut();
+        let numbered = second.iter().enumerate();
+        for (n, sample) in numbered {
             run.frame(std::slice::from_ref(sample));
             run.prepare();
+            if n % 2 == 1 {
+                run.land_some(1);
+            }
         }
         assert_eq!(run.ops().len(), 2, "both under way");
     });
     let (waited_rows, waited_tiles) = waited(epoch);
-    assert_eq!(chained, waited_rows, "the dabs of waiting, bit for bit");
+    assert_eq!(
+        chained.last(),
+        waited_rows.last(),
+        "the second's dabs, bit for bit"
+    );
     assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
 }
 

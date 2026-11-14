@@ -129,7 +129,11 @@ impl Journalling {
 
     /// A step that lands one dab of the stroke under way, however dear: the pen (down or lifted)
     /// quiet for long, and the catch-up starved, so a step that must make progress takes one.
+    ///
+    /// Its report is the step's own: what a `prepare` before it caught up, which a step's report
+    /// would carry too, is taken off first, so it says one dab applied whenever it lands one.
     fn land_one(&mut self) -> BrushReport {
+        self.brush.caught_up = BrushReport::default();
         let long_ago = Instant::now()
             .checked_sub(RESTING_QUIET * 2)
             .expect("after the epoch");
