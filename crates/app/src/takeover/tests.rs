@@ -534,7 +534,17 @@ fn a_finisher_that_binds_after_the_first_ask_is_taken_over() {
     let finisher = finisher_on_a_thread(held, Listener::bind(&sockets, file).expect("bound"));
     let took = waited_out(&mut waiter, &path, Duration::from_secs(10));
     finisher.join().expect("the finisher");
-    assert_eq!(waiter.holder(), Holder::Finisher, "found as one");
+    // A finisher lets its lock go before it answers, so the lock can be seen free a moment
+    // before the answer to the ask that stopped it is heard: that ask is still in flight.
+    let heard = Instant::now();
+    while waiter.holder() != Holder::Finisher {
+        assert!(
+            heard.elapsed() < QUICK.answer + Duration::from_secs(5),
+            "found as one"
+        );
+        waiter.step(Instant::now());
+        thread::sleep(Duration::from_millis(1));
+    }
     assert!(
         took < ASK_AGAIN * 3,
         "taken over at its next ask, not at the end of the landing: {took:?}"
