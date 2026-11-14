@@ -6,9 +6,13 @@
 //! same tiles once everything has landed.
 
 use geom::Vec3;
+use sculpt::{Future, Futures};
 use store::{DabBatch, DisplayPreview, FLUSH_INTERVAL, PenDown};
 
 use super::*;
+use crate::sculpting::over::{
+    Moves, Reach, Read, box_distance_squared, chain_of, needed, ray_meets_box, rounded_up,
+};
 use crate::testing::settle;
 
 /// A brush stepped directly over a project saved in a directory of its own, as the journal tests
