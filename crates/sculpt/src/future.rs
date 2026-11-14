@@ -302,15 +302,20 @@ impl PenDownTiles {
         }
         let missing = keys.iter().filter(|key| !self.tiles.contains_key(key));
         let missing: Vec<TileKey> = missing.copied().collect();
-        let futures = before.futures_of(store, &missing);
+        let futures = before.made_of(store, &missing);
         let left = missing.into_iter().zip(futures);
         for (key, future) in left {
-            let tile = future?.into_tile();
-
-            let _pins = store.pin(&[key])?;
-            let made = ensure_prediction(store, key)?;
-            let prediction = prediction_of(store, key, made)?;
-            let positions = positions_of(&prediction, &tile)?;
+            let (future, positions) = future?;
+            // A future a dab touches comes with its positions; one no dab touches is the tile
+            // as stored, its positions the store's.
+            let positions = if let Some(positions) = positions {
+                positions
+            } else {
+                let _pins = store.pin(&[key])?;
+                let made = ensure_prediction(store, key)?;
+                let prediction = prediction_of(store, key, made)?;
+                positions_of(&prediction, future.tile())?
+            };
             self.tiles.insert(key, KeptTile::new(key, positions));
         }
         Ok(())
@@ -714,33 +719,49 @@ impl<'a> Futures<'a> {
         store: &mut TileStore,
         keys: &[TileKey],
     ) -> Vec<Result<Future, SculptError>> {
-        // Each tile's start, read one after another; a tile no dab touches is done with it.
-        let mut touched: Vec<Start> = Vec::new();
-        let started = keys.iter().map(|&key| match self.start(store, key) {
-            Ok(start) if start.touched() => {
-                touched.push(start);
-                None
+        let made = self.made_of(store, keys);
+        let futures = made.into_iter().map(|made| made.map(|(future, _)| future));
+        futures.collect()
+    }
+
+    /// [`Futures::futures_of`], each future a dab touches with the positions it leaves its tile
+    /// at (what its box is of), for a caller that keeps them ([`PenDownTiles::extend_futures`]).
+    ///
+    /// A batch at a time ([`futures_together`]): a batch's tiles are read, pinned, predicted and
+    /// replayed, and only its futures are kept past it, so what is held at once (the starts,
+    /// the pins, the predictions the store can't keep) is a batch's, however many tiles are
+    /// asked for.
+    fn made_of(&self, store: &mut TileStore, keys: &[TileKey]) -> Vec<Result<Made, SculptError>> {
+        let mut made: Vec<Result<Made, SculptError>> = Vec::with_capacity(keys.len());
+        let batches = keys.chunks(futures_together());
+        for batch in batches {
+            // Each tile's start, read one after another; a tile no dab touches is done with it.
+            let mut touched: Vec<Start> = Vec::new();
+            let mut started: Vec<Option<Result<Made, SculptError>>> = Vec::new();
+            for &key in batch {
+                started.push(match self.start(store, key) {
+                    Ok(start) if start.touched() => {
+                        touched.push(start);
+                        None
+                    }
+                    Ok(start) => {
+                        let future = Future {
+                            tile: start.tile,
+                            bounds: None,
+                        };
+                        Some(Ok((future, None)))
+                    }
+                    Err(error) => Some(Err(error)),
+                });
             }
-            Ok(start) => Some(Ok(Future {
-                tile: start.tile,
-                bounds: None,
-            })),
-            Err(error) => Some(Err(error)),
-        });
-        let started: Vec<Option<Result<Future, SculptError>>> = started.collect();
-        let most = store.kept_predictions().max(TOGETHER);
-        let batches = touched.chunks(most);
-        let replayed: Vec<Result<Future, SculptError>> = batches
-            .flat_map(|batch| self.replay_together(store, batch))
-            .collect();
-        let mut replayed = replayed.into_iter();
-        started
-            .into_iter()
-            .map(|done| {
+            let mut replayed = self.replay_together(store, &touched).into_iter();
+            let done = started.into_iter().map(|done| {
                 done.or_else(|| replayed.next())
                     .unwrap_or_else(|| Err(FutureError::Unreadable.into()))
-            })
-            .collect()
+            });
+            made.extend(done);
+        }
+        made
     }
 
     /// What tile `key`'s future starts from, read from `store` (see [`Start`]).
@@ -782,7 +803,7 @@ impl<'a> Futures<'a> {
         &self,
         store: &mut TileStore,
         batch: &[Start],
-    ) -> Vec<Result<Future, SculptError>> {
+    ) -> Vec<Result<Made, SculptError>> {
         let keys: Vec<TileKey> = batch.iter().map(|start| start.key).collect();
         let ready = store
             .pin(&keys)
@@ -793,6 +814,8 @@ impl<'a> Futures<'a> {
             (Err(_), []) => return Vec::new(),
             (Err(error), [_]) => return vec![Err(error)],
             (Err(_), _) => {
+                #[cfg(test)]
+                tests::count_split();
                 let (first, second) = batch.split_at(batch.len() / 2);
                 let mut futures = self.replay_together(store, first);
                 futures.extend(self.replay_together(store, second));
@@ -821,7 +844,7 @@ impl<'a> Futures<'a> {
     /// chain's dabs touching it replayed on its corrections in turn. `continued` is, for each
     /// stroke of the chain, the stroke state its next dab goes on from
     /// ([`Stroke::continued`]). It reads nothing of the store, so the workers run it, a tile
-    /// each, with the box of the positions it leaves the tile at.
+    /// each, with the positions it leaves the tile at and their box.
     ///
     /// # Errors
     ///
@@ -832,7 +855,7 @@ impl<'a> Futures<'a> {
         continued: &[Option<&Stroke>],
         start: &Start,
         prediction: &Prediction,
-    ) -> Result<Future, FutureError> {
+    ) -> Result<Made, FutureError> {
         let key = start.key;
         let mut tile = start.tile.clone();
         let first_pen_down = &start.first_pen_down;
@@ -883,7 +906,7 @@ impl<'a> Futures<'a> {
         }
         let positions = positions_of(prediction, &tile)?;
         let bounds = Aabb::from_points(positions.iter().copied());
-        Ok(Future { tile, bounds })
+        Ok((Future { tile, bounds }, Some(positions)))
     }
 }
 
@@ -922,12 +945,26 @@ impl Future {
     }
 }
 
-/// The fewest futures [`Futures::futures_of`] makes together, however few predictions the store
-/// keeps.
+/// A future as it is made: with the positions it leaves its tile at, if a dab touches the tile
+/// (one no dab touches is the tile as stored, and is never predicted).
+type Made = (Future, Option<Vec<Vec3>>);
+
+/// How many futures are made together: a tile for each of the store's workers.
 ///
-/// Enough for the workers of most machines to have a tile each; those the store can't keep are
-/// predicted for the call alone.
-const TOGETHER: usize = 16;
+/// More would only queue behind them, holding their tiles' starts, pins and predictions
+/// meanwhile; fewer would leave cores idle. A caller that does something with each future (the
+/// app installs them, and stops at the first the store refuses) asks for this many at a time,
+/// so it holds no more made than it is about to use.
+///
+/// The count of the default workers on this machine ([`store::Workers`]), what a store has
+/// unless configured otherwise: the store doesn't say its own. One with fewer or more workers
+/// makes the same futures, in batches that fit its workers less well.
+#[must_use]
+pub fn futures_together() -> usize {
+    /// The count, found once: counting the cores reads the system.
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| store::Workers::default().count().get())
+}
 
 /// What one tile's future starts from, read from the store one tile after another before the
 /// workers replay ([`Futures::futures_of`]).

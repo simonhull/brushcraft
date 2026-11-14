@@ -2082,3 +2082,41 @@ fn a_dab_whose_strength_is_no_number_reaches_every_way() {
         assert_eq!(reach.span, ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]));
     }
 }
+
+#[test]
+fn a_refused_install_stops_the_making_of_futures() {
+    // The store refuses the second future (as past the open strokes' share): the batch it was
+    // made in is the last made, however many the `Down` reads.
+    let down = sample(Phase::Down, (160.0, 105.0), 0.8);
+    let made_by_a_down = |refused_after: Option<usize>| {
+        let mut run = across_many_tiles(None);
+        run.brush.ahead.clear();
+        take_made();
+        installs_left(refused_after);
+        assert_eq!(run.route(&down), Route::Brush);
+        installs_left(None);
+        let made = take_made();
+        if refused_after.is_some() {
+            assert!(
+                !run.routed_over(),
+                "nothing begun: its futures can't be had"
+            );
+            run.assert_nothing_reserved();
+        }
+        run.brush.abandon();
+        run.close();
+        made
+    };
+    let wanted = made_by_a_down(None);
+    let refused = made_by_a_down(Some(1));
+    let batch = sculpt::futures_together();
+    assert!(wanted > 1, "the Down reads futures: {wanted}");
+    assert!(
+        (1..=batch).contains(&refused),
+        "one batch made at most: {refused} of a batch of {batch}"
+    );
+    assert!(
+        wanted <= batch || refused < wanted,
+        "the making stopped: {refused} made of the {wanted} the Down reads"
+    );
+}

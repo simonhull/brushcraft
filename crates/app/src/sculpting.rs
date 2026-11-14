@@ -293,12 +293,12 @@
 //! - **Made, not installed** ([`Ahead`], [`Sculpting::warm_futures`]): the futures of the tiles a
 //!   `Down` at the hover would read (along the pen's ray, then about its hit: the hit's normals,
 //!   the brush's radius, the stroke's reach; [`Sculpting::list_ahead`]) are made on the store's
-//!   workers, [`FUTURES_A_LOOK`] together, a call's futures time at a time ([`FUTURES_TIME`], at
-//!   least a batch a call), and kept beside the strokes, each with its box. Nothing is reserved for
-//!   a pen that only hovers: an op reserved must be given back on every path, opens a journal, and
-//!   stands in the way of a stroke beginning alone; a future kept apart needs none of that, and is
-//!   right for as long as the stroke it was made up to is under way (see [`Ahead`] for why, and
-//!   when it goes).
+//!   workers, a tile each ([`sculpt::futures_together`]), a call's futures time at a time
+//!   ([`FUTURES_TIME`], at least a batch a call), and kept beside the strokes, each with its box.
+//!   Nothing is reserved for a pen that only hovers: an op reserved must be given back on every
+//!   path, opens a journal, and stands in the way of a stroke beginning alone; a future kept apart
+//!   needs none of that, and is right for as long as the stroke it was made up to is under way (see
+//!   [`Ahead`] for why, and when it goes).
 //! - **At the `Down`**, the futures it reads are installed from those ([`install`]), none made; and
 //!   a tile whose future is at hand is asked for only if the read reaches the box it has as stored
 //!   or its future's own ([`needed`]), so the `Down` installs the few it reads, not every tile the
@@ -1315,9 +1315,10 @@ fn box_distance_squared(point: DVec3, low: DVec3, high: DVec3) -> f64 {
 ///
 /// Each is the one made ahead (`ahead`, the futures of the strokes `earlier` made under a
 /// hovering pen, [`Ahead::of`]) if there is one, else made now by `futures`, the futures of
-/// `earlier` (each with its [`Remaining`]), those together on the store's workers; each is
-/// labelled with the newest of the strokes whose dabs reach the tile, and refitted in `index` so
-/// the stroke's raycasts (and its previews' queries) find it there.
+/// `earlier` (each with its [`Remaining`]), those together on the store's workers, a batch of
+/// them at a time ([`sculpt::futures_together`]), each batch installed before the next is made;
+/// each is labelled with the newest of the strokes whose dabs reach the tile, and refitted in
+/// `index` so the stroke's raycasts (and its previews' queries) find it there.
 ///
 /// The label is the op of the record the tile is taken to hold once they land: provisional until
 /// the store's restore and roll-over of a chain settle what a roll-over writes it as (the
@@ -1342,45 +1343,46 @@ fn install(
     let mut added: Vec<TileKey> = Vec::with_capacity(fresh.len());
     let mut outcome = Ok(());
     let at_hand = |key: &TileKey| ahead.and_then(|ahead| ahead.get(key));
-    // Those not made ahead are made now, together on the store's workers: about one tile's time
-    // for them all.
-    let cold: Vec<TileKey> = fresh
-        .iter()
-        .filter(|key| at_hand(key).is_none())
-        .copied()
-        .collect();
-    #[cfg(test)]
-    tests::count_made(cold.len());
-    let mut made_now = futures.futures_of(store, &cold).into_iter();
-    for key in fresh {
-        let tile = match at_hand(&key) {
-            Some(future) => Some(future.tile().clone()),
-            None => made_now.next().and_then(Result::ok).map(Future::into_tile),
-        };
-        let Some(tile) = tile else {
-            outcome = Err(OnFutures::Futures);
-            break;
-        };
-        let reaching = earlier.iter().rev().find(|stroke| {
-            let remaining = stroke.remaining.as_ref();
-            remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))
-        });
-        let written_by = reaching.map(|stroke| stroke.op.id());
+    // A workers' batch at a time: those of it not made ahead are made now, together, and the
+    // batch installed before the next is made. So no more futures are held made than are about
+    // to go in, and a refusal (past the open strokes' share) stops the making with it.
+    let batches = fresh.chunks(sculpt::futures_together());
+    'batches: for batch in batches {
+        let cold = batch.iter().filter(|key| at_hand(key).is_none());
+        let cold: Vec<TileKey> = cold.copied().collect();
         #[cfg(test)]
-        if !tests::may_install() {
-            // As the store refuses one past the open strokes' share.
-            outcome = Err(OnFutures::Futures);
-            break;
+        tests::count_made(cold.len());
+        let mut made_now = futures.futures_of(store, &cold).into_iter();
+        for &key in batch {
+            let tile = match at_hand(&key) {
+                Some(future) => Some(future.tile().clone()),
+                None => made_now.next().and_then(Result::ok).map(Future::into_tile),
+            };
+            let Some(tile) = tile else {
+                outcome = Err(OnFutures::Futures);
+                break 'batches;
+            };
+            let reaching = earlier.iter().rev().find(|stroke| {
+                let remaining = stroke.remaining.as_ref();
+                remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))
+            });
+            let written_by = reaching.map(|stroke| stroke.op.id());
+            #[cfg(test)]
+            if !tests::may_install() {
+                // As the store refuses one past the open strokes' share.
+                outcome = Err(OnFutures::Futures);
+                break 'batches;
+            }
+            if store
+                .install_pen_down_of(token, key, tile, written_by)
+                .is_err()
+            {
+                outcome = Err(OnFutures::Futures);
+                break 'batches;
+            }
+            installed.insert(key);
+            added.push(key);
         }
-        if store
-            .install_pen_down_of(token, key, tile, written_by)
-            .is_err()
-        {
-            outcome = Err(OnFutures::Futures);
-            break;
-        }
-        installed.insert(key);
-        added.push(key);
     }
     let refitted = index.refit(project.store(), &added);
     outcome?;
@@ -1460,13 +1462,6 @@ type DisplayReads = BTreeMap<TileKey, BTreeSet<TileKey>>;
 /// future costs about what landing the tile costs: a fraction of a millisecond for a tile few
 /// dabs reach, several for one under many.
 const FUTURES_TIME: Duration = Duration::from_millis(2);
-
-/// How many futures are made together between looks at the clock.
-///
-/// By [`Open`]'s [`OpenStrokes::ready`], ahead of a drawing pen and under a hovering one
-/// ([`Sculpting::warm_futures`]): made on the store's workers, about one's time for them all on
-/// a machine with as many cores.
-const FUTURES_A_LOOK: usize = 8;
 
 /// The most futures kept made ahead of a `Down` ([`Ahead`]): those nearest the hovering pen.
 ///
@@ -1670,7 +1665,8 @@ impl OpenStrokes for Open<'_> {
 /// Installs the futures of `missing` for the stroke reserved as `token` after the strokes
 /// `earlier`, as many as `installing` leaves time for. Returns whether every one is installed.
 ///
-/// [`FUTURES_A_LOOK`] together between looks at the clock ([`FUTURES_TIME`]); the rest are for
+/// A workers' batch ([`sculpt::futures_together`]) between looks at the clock
+/// ([`FUTURES_TIME`]); the rest are for
 /// the calls after. They are those made ahead (`ahead`) where there are, else made now from the
 /// session's stroke state `state` ([`install`]).
 fn install_in_time(
@@ -1691,7 +1687,7 @@ fn install_in_time(
     let Ok(futures) = Futures::new(project.store(), state, &chain) else {
         return false;
     };
-    for some in missing.chunks(FUTURES_A_LOOK) {
+    for some in missing.chunks(sculpt::futures_together()) {
         if !installing.more() {
             return false;
         }
@@ -3868,8 +3864,9 @@ impl Sculpting {
     /// Makes futures ahead of a `Down` where the pen hovers over the strokes under way (see
     /// "Warming under a hovering pen" in the module notes): those a `Down` there reads, listed
     /// once per position, view and radius ([`Sculpting::list_ahead`]), and made
-    /// [`FUTURES_A_LOOK`] together on the store's workers for as long as the call's futures time
-    /// lasts ([`FUTURES_TIME`], at least a batch a call). Returns whether more are left to make.
+    /// a workers' batch together ([`sculpt::futures_together`]) for as long as the call's futures
+    /// time lasts ([`FUTURES_TIME`], at least a batch a call). Returns whether more are left to
+    /// make.
     ///
     /// Only where a `Down` would begin over the strokes under way ([`Sculpting::route_on_futures`])
     /// and what a later stroke reads of each is made, every pen up: their futures are final then.
@@ -3905,7 +3902,11 @@ impl Sculpting {
             return false;
         };
         while !self.ahead.todo.is_empty() && self.installing.more() {
-            let split = self.ahead.todo.len().saturating_sub(FUTURES_A_LOOK);
+            let split = self
+                .ahead
+                .todo
+                .len()
+                .saturating_sub(sculpt::futures_together());
             let batch = self.ahead.todo.split_off(split);
             #[cfg(test)]
             tests::count_made(batch.len());

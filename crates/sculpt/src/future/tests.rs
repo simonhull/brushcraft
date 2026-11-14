@@ -7,7 +7,7 @@ use geom::{CorrectionTile, FaceId, Level, TileKey, Vec3};
 use store::{Aabb, OpId, Project, ProjectConfig, SpatialIndex, StoreConfig, TileStore};
 use stroke::Dab;
 
-use super::{FutureError, Futures, PenDownTiles, StrokeEdits};
+use super::{FutureError, Futures, PenDownTiles, Start, StrokeEdits};
 use crate::apply::SculptError;
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab, fixed, tiles, vertex};
@@ -1223,4 +1223,74 @@ fn timings() {
     for (count, stroke_tiles) in [(2_000, 512), (2_000, 4), (16_000, 512), (16_000, 4)] {
         time_case(count, stroke_tiles);
     }
+}
+
+/// What `a_batch_whose_tiles_cant_be_pinned_together_is_made_in_halves` gives its store past the
+/// least budget it opens with: room to pin a few tiles together, not a stroke's worth.
+const TIGHT: usize = 1 << 20;
+
+thread_local! {
+    /// How many batches of futures this thread split in two since the count was last taken
+    /// ([`take_splits`]): their tiles couldn't be pinned or predicted together.
+    static SPLITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a batch of futures split in two on this thread.
+pub(super) fn count_split() {
+    SPLITS.set(SPLITS.get() + 1);
+}
+
+/// How many batches of futures this thread split since this was last asked.
+fn take_splits() -> usize {
+    SPLITS.replace(0)
+}
+
+#[test]
+fn a_batch_whose_tiles_cant_be_pinned_together_is_made_in_halves() {
+    // A budget with room to pin a tile or two beside the store's own, not a stroke's worth: the
+    // batch is halved until its tiles fit, and every future is the one made alone.
+    let mut rng = Rng::new(91);
+    let dir = TestDir::new();
+    let (mut project, index) = project(&dir, |config| {
+        let config = config.with_kept_predictions(2).with_stroke_tiles(2);
+        let least = config.minimum_budget(&geom::cube_sphere(1).unwrap());
+        config.with_budget_bytes(least + TIGHT)
+    });
+    let dabs = random_stroke(project.store(), &mut rng, 16, 0);
+    let state = Stroke::new(project.store());
+    let op = project.begin_stroke_and_wait().unwrap();
+    let reach = reach(&index, &dabs);
+    let open = Open {
+        op,
+        dabs: &dabs,
+        reach: &reach,
+    };
+    let edits = place_chain(project.store(), &state, &[open], &mut rng);
+    let alone = futures(project.store(), &state, &edits);
+    let chain: Vec<&StrokeEdits> = edits.iter().collect();
+    let made = Futures::new(project.store(), &state, &chain).unwrap();
+    let keys = tiles(project.store().mesh(), level());
+    let starts = keys
+        .iter()
+        .map(|&key| made.start(project.store(), key).unwrap());
+    let starts: Vec<Start> = starts.filter(Start::touched).collect();
+    assert!(starts.len() > 8, "a batch of tiles: {}", starts.len());
+    let whole: Vec<TileKey> = starts.iter().map(|start| start.key).collect();
+    assert!(
+        project.store().pin(&whole).is_err(),
+        "the batch's tiles can't be pinned together"
+    );
+    take_splits();
+    let together = made.replay_together(project.store(), &starts);
+    assert!(take_splits() > 0, "the batch was split");
+    assert_eq!(together.len(), starts.len(), "a future a tile, in order");
+    let each = starts.iter().zip(together);
+    for (start, future) in each {
+        let (future, positions) = future.unwrap();
+        assert!(positions.is_some(), "a tile a dab touches");
+        let one = &alone[&start.key];
+        assert_eq!(bits(future.tile()), bits(one), "tile {:?}", start.key);
+    }
+    drop(made);
+    project.end_unrecorded_stroke().unwrap();
 }

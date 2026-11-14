@@ -54,7 +54,7 @@ pub use action::{Span, add_span, dab_span};
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
 pub use footprint::radius_covering;
-pub use future::{Future, FutureError, Futures, PenDownTiles, StrokeEdits};
+pub use future::{Future, FutureError, Futures, PenDownTiles, StrokeEdits, futures_together};
 pub use preview::{
     Drawn, DrawsAll, OpenStrokes, Preview, PreviewStats, WAITING_A_CALL, display_ancestors,
     rounding_bound,
