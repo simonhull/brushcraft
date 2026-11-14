@@ -50,6 +50,24 @@ pub(super) fn may_install() -> bool {
     }
 }
 
+thread_local! {
+    /// How many futures this thread's brushes have made (replayed, not taken from those made
+    /// ahead) since the count was last taken ([`take_made`]).
+    static FUTURES_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `count` futures a brush on this thread made: at a `Down` or a sample that read them,
+/// for a preview, or ahead under a hovering pen.
+pub(super) fn count_made(count: usize) {
+    FUTURES_MADE.set(FUTURES_MADE.get() + count);
+}
+
+/// How many futures this thread's brushes made since this was last asked, the count begun
+/// afresh.
+fn take_made() -> usize {
+    FUTURES_MADE.replace(0)
+}
+
 /// The level the test projects are sculpted at: a 24-face sphere's 24 tiles of 32 × 32 quads.
 const LEVEL: u8 = 5;
 

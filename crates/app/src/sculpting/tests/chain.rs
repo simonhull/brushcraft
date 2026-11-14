@@ -171,6 +171,37 @@ impl Chain {
         panic!("the display layer never finished");
     }
 
+    /// Hovers the pen at `at` until the brush's warming has nothing left: a frame's step and a
+    /// `prepare` with a 4 ms deadline at a time, as the frame loop does. Returns how many hover
+    /// frames it took, and their `prepare`s' time in all.
+    ///
+    /// The catch-up is held meanwhile (as during a close), so nothing lands: the `Down` after it
+    /// is over the same dabs as one with no hover before.
+    fn hover(&mut self, at: (f64, f64)) -> (usize, Duration) {
+        let landing = std::mem::replace(&mut self.brush.landing, Landing::InSteps);
+        let mut pen = PenFrame::default();
+        pen.push(sample(Phase::Hover, at, 0.0), None);
+        let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
+        let mut took = (0, Duration::ZERO);
+        loop {
+            let stepped = context(&mut self.project, self.picker.index_mut(), &self.camera);
+            self.brush.step(stepped, &pen, &budget).expect("a step");
+            let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
+            let began = Instant::now();
+            let more = self
+                .brush
+                .prepare(prepared, began + Duration::from_millis(4))
+                .expect("prepared");
+            took = (took.0 + 1, took.1 + began.elapsed());
+            if !more {
+                break;
+            }
+            assert!(took.0 < HOVER_FRAMES, "the warming ends");
+        }
+        self.brush.landing = landing;
+        took
+    }
+
     /// A `prepare` of the brush with no time to spare, as after a frame's hand-off: what a later
     /// stroke reads of those under way is kept up, and each piece of work off the pen's path gets
     /// its one batch.
@@ -179,6 +210,16 @@ impl Chain {
         self.brush
             .prepare(prepared, Instant::now())
             .expect("prepared");
+    }
+
+    /// The tiles whose futures are installed for the newest stroke, its op reserved; none for one
+    /// whose op has begun.
+    fn installed(&self) -> BTreeSet<TileKey> {
+        let newest = self.brush.strokes.last();
+        newest.map_or_else(BTreeSet::new, |newest| match &newest.op {
+            StrokeOp::Reserved { installed, .. } => installed.clone(),
+            StrokeOp::Begun(_) => BTreeSet::new(),
+        })
     }
 
     /// Every tile's evaluated positions, then closes the project (keeping no recovery file).
@@ -1253,6 +1294,140 @@ fn a_second_down_routed_gives_the_firsts_op_back_and_a_close_or_an_abandon_the_l
     abandoned.close();
 }
 
+/// Where a sample's pen is, as the tests give it.
+fn pixel_of(sample: &PenSample) -> (f64, f64) {
+    (sample.at.x, sample.at.y)
+}
+
+#[test]
+fn a_down_where_the_pen_hovered_over_a_landing_stroke_makes_no_future_and_draws_as_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        let (down, rest) = second.split_first().expect("a Down");
+        take_made();
+        run.hover(pixel_of(down));
+        let ahead = run.brush.ahead.tiles.len();
+        assert!(ahead > 0, "futures are made as the pen hovers");
+        assert_eq!(take_made(), ahead, "each made once");
+        assert_eq!(run.brush.ahead.after, run.ops().last().copied());
+        run.assert_nothing_reserved();
+        // A still pen's are made once: more hover frames make none.
+        run.hover(pixel_of(down));
+        assert_eq!(take_made(), 0, "nothing more to make for a still pen");
+        assert_eq!(run.route(down), Route::Brush);
+        run.frame(std::slice::from_ref(down));
+        assert_eq!(run.ops().len(), 2, "begun over the first");
+        assert!(!run.installed().is_empty(), "its futures are installed");
+        assert_eq!(
+            take_made(),
+            0,
+            "the Down makes no future: those it reads were made as the pen hovered"
+        );
+        run.frame(rest);
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(chained, waited_rows, "the dabs of waiting, bit for bit");
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
+#[test]
+fn three_strokes_each_begun_where_the_pen_hovered_place_and_land_as_one_after_another() {
+    // The futures made ahead of the second stroke are of the first alone: the third reads
+    // those of both, made afresh as the pen hovers again.
+    let strokes = [stroke(ACROSS, 12), crossing(), over_both()];
+    let epoch = Instant::now();
+    let mut chained = Chain::new(epoch, None);
+    for samples in &strokes {
+        if let Some(newest) = chained.ops().last().copied() {
+            let down = samples.first().expect("a Down");
+            chained.hover(pixel_of(down));
+            assert_eq!(
+                chained.brush.ahead.after,
+                Some(newest),
+                "made up to the newest"
+            );
+            assert!(!chained.brush.ahead.tiles.is_empty(), "futures made ahead");
+        }
+        chained.frame(samples);
+    }
+    let chained_rows = chained.rows();
+    assert_eq!(chained_rows.len(), strokes.len(), "every stroke under way");
+    chained.land_all();
+    chained.frame(&[]);
+    assert!(
+        chained.brush.ahead.tiles.is_empty() && chained.brush.ahead.after.is_none(),
+        "let go with the strokes"
+    );
+    let chained_tiles = chained.close();
+
+    let mut waited = Chain::new(epoch, None);
+    let mut waited_rows = Vec::new();
+    for samples in &strokes {
+        waited.frame(samples);
+        waited_rows.extend(waited.rows());
+        waited.land_all();
+    }
+    assert_eq!(chained_rows, waited_rows, "the same dabs, bit for bit");
+    assert!(
+        chained_tiles == waited.close(),
+        "the same tiles, bit for bit"
+    );
+}
+
+#[test]
+fn the_futures_made_ahead_go_as_the_stroke_they_follow_ends_or_drops_dabs() {
+    // Landed and ended: its futures are the tiles themselves.
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.hover((150.0, 80.0));
+    assert!(!run.brush.ahead.tiles.is_empty(), "futures made ahead");
+    run.cut();
+    run.land_all();
+    run.frame(&[]);
+    assert!(run.brush.ahead.tiles.is_empty(), "gone with the stroke");
+    assert_eq!(run.brush.ahead.after, None);
+    assert!(run.brush.ahead.todo.is_empty(), "nothing left listed");
+    // A stroke alone after it reads the store, and lands as ever.
+    run.frame(&crossing());
+    run.cut();
+    run.land_all();
+    run.close();
+
+    // Dropped dabs: the futures were of dabs that never land.
+    let mut failed = Chain::new(Instant::now(), None);
+    failed.frame(&stroke(ACROSS, 12));
+    failed.hover((150.0, 80.0));
+    assert!(!failed.brush.ahead.tiles.is_empty(), "futures made ahead");
+    failed.cut();
+    failed.brush.knob = Knob::LandingFails;
+    assert_eq!(failed.land_one().dabs_applied, 0, "the landing failed");
+    assert!(failed.ops().is_empty(), "the stroke ended");
+    failed.brush.knob = Knob::None;
+    failed.frame(&[]);
+    assert!(failed.brush.ahead.tiles.is_empty(), "gone with the stroke");
+    failed.brush.abandon();
+    failed.close();
+}
+
+#[test]
+fn a_stroke_fed_a_sample_a_frame_with_its_futures_installed_ahead_places_the_dabs_of_waiting() {
+    let epoch = Instant::now();
+    let (first, second) = (stroke(ACROSS, 12), crossing());
+    let (chained, chained_tiles) = drawn(epoch, |run| {
+        run.frame(&first);
+        for sample in &second {
+            run.frame(std::slice::from_ref(sample));
+            run.prepare();
+        }
+        assert_eq!(run.ops().len(), 2, "both under way");
+    });
+    let (waited_rows, waited_tiles) = waited(epoch);
+    assert_eq!(chained, waited_rows, "the dabs of waiting, bit for bit");
+    assert!(chained_tiles == waited_tiles, "the same tiles, bit for bit");
+}
+
 /// A [`Chain`] on a face of 4 × 4 tiles with an ordinary stroke across the sphere under way.
 ///
 /// At [`BACKLOG_LEVEL`], none of the stroke landed, drawn with a brush of `radius` pixels (the
@@ -1267,6 +1442,104 @@ fn across_many_tiles(radius: Option<f32>) -> Chain {
     run.frame(&stroke(((110.0, 100.0), (210.0, 110.0)), 60));
     run.prepare();
     run
+}
+
+#[test]
+fn between_frames_the_futures_ahead_of_a_drawing_pen_are_installed() {
+    let mut run = across_many_tiles(None);
+    run.brush.set_radius(4.0);
+    // No previews: only the stroke's own reads ask for futures. Nothing lands meanwhile (held,
+    // as during a close): a brush with no previews would land its dabs in its steps.
+    run.brush.preview = None;
+    run.brush.landing = Landing::InSteps;
+    // Drawn along the first, a sample a frame, a `prepare` after each as the frame loop has.
+    let along = stroke(((112.0, 100.0), (172.0, 106.0)), 40);
+    let (up, drawn) = along.split_last().expect("an Up");
+    let (mut in_steps, mut ahead_of_pen) = (0, 0);
+    // Those made as the first stroke's pen lifted are let go: every future here is made, and
+    // counted, as it is installed.
+    run.brush.ahead.clear();
+    take_made();
+    for sample in drawn {
+        run.frame(std::slice::from_ref(sample));
+        in_steps += take_made();
+        let before = run.installed();
+        run.prepare();
+        let after = run.installed();
+        assert!(after.is_superset(&before), "none let go");
+        let ahead = after.len() - before.len();
+        assert_eq!(take_made(), ahead, "each made once, as it is installed");
+        ahead_of_pen += ahead;
+    }
+    assert_eq!(run.ops().len(), 2, "begun over the first");
+    assert!(
+        ahead_of_pen > 0,
+        "futures are installed ahead of the pen between its frames ({in_steps} in its steps)"
+    );
+    let changed = run.brush.strokes.first().map_or(0, |earlier| {
+        let remaining = earlier.remaining.as_ref();
+        remaining.map_or(0, |remaining| remaining.reach.len())
+    });
+    let installed = run.installed().len();
+    assert_eq!(installed, in_steps + ahead_of_pen, "each future made once");
+    assert!(
+        installed < changed,
+        "those the pen came near, not all {changed}"
+    );
+    run.frame(std::slice::from_ref(up));
+    run.brush.abandon();
+    run.close();
+}
+
+/// Every tile of [`BACKLOG_LEVEL`] of `store`'s mesh.
+fn backlog_tiles(store: &TileStore) -> Vec<TileKey> {
+    let level = Level::new(BACKLOG_LEVEL).expect("a level");
+    let per_side = u16::try_from(level.tiles_per_side()).expect("a few");
+    let tiles = store.mesh().faces().flat_map(|face| {
+        (0..per_side).flat_map(move |ty| {
+            (0..per_side).map(move |tx| TileKey::displacement(face, level, tx, ty).expect("a tile"))
+        })
+    });
+    tiles.collect()
+}
+
+/// Reads across the view of `camera`, rays and balls.
+///
+/// A ray through each pixel of a grid, up to the sphere's near side, past it or without end, and
+/// a ball about a point of each ray near the sphere's near side, of no radius up to a tile and
+/// more.
+fn reads_across(camera: &Camera) -> Vec<Read> {
+    let projector = ViewProjector::new(&camera.view(size()).expect("a view"));
+    let pixels = (0..12).flat_map(|i| (0..8).map(move |j| (i, j)));
+    let rays = pixels.filter_map(|(i, j)| {
+        let at = ScreenPoint::new(100.0 + 10.0 * f64::from(i), 70.0 + 9.0 * f64::from(j)).ok()?;
+        projector.ray(at)
+    });
+    let rays: Vec<Ray> = rays.collect();
+    assert!(rays.len() > 50, "rays through the view");
+    let mut reads: Vec<Read> = Vec::new();
+    for (n, ray) in rays.iter().enumerate() {
+        let until = [1.9, 2.3, f64::INFINITY][n % 3];
+        reads.push(Read::Ray { ray: *ray, until });
+        let center = ray.origin() + ray.direction() * 2.0;
+        let radius = [0.0, 0.02, 0.08, 0.3][n % 4];
+        reads.push(Read::Ball {
+            center,
+            radius: rounded_up(center, radius),
+        });
+    }
+    reads
+}
+
+/// Whether `read` (a ray up to its end, or a ball) meets `bounds` exactly, with no slack: the
+/// tests' own reading of a [`Read`].
+fn read_meets(read: &Read, bounds: store::Aabb) -> bool {
+    let wide = |v: Vec3| DVec3::new(f64::from(v.x), f64::from(v.y), f64::from(v.z));
+    let (low, high) = (wide(bounds.min()), wide(bounds.max()));
+    match *read {
+        Read::Ray { ray, until } => ray_meets_box(&ray, until, low, high),
+        Read::Ball { center, radius } => box_distance_squared(center, low, high) <= radius * radius,
+    }
 }
 
 /// Asserts that the box each tile is grown to holds its future, made now.
@@ -1338,10 +1611,107 @@ fn the_box_a_tile_is_grown_to_holds_its_future() {
     piled.close();
 }
 
+#[test]
+fn with_futures_at_hand_the_tiles_asked_for_lie_between_those_a_read_reaches_and_the_bound() {
+    let mut run = across_many_tiles(Some(ORDINARY_RADIUS));
+    // Every future of the stroke, and each tile's two boxes: as stored, and its future's.
+    let changed: Vec<TileKey> = {
+        let earlier = run.brush.strokes.first().expect("a stroke");
+        let remaining = earlier.remaining.as_ref().expect("made by prepare");
+        remaining.reach.keys().copied().collect()
+    };
+    let store = run.project.store();
+    let chain = chain_of(&run.brush.strokes).expect("made by prepare");
+    let futures = Futures::new(store, &run.brush.state, &chain).expect("a chain");
+    let made = futures.futures_of(store, &changed);
+    let all: BTreeMap<TileKey, Future> = changed
+        .iter()
+        .copied()
+        .zip(made.into_iter().map(|future| future.expect("a future")))
+        .collect();
+    let half: BTreeMap<TileKey, Future> = all
+        .iter()
+        .step_by(2)
+        .map(|(key, future)| (*key, future.clone()))
+        .collect();
+    let tiles = backlog_tiles(store);
+    let stored: BTreeMap<TileKey, store::Aabb> = tiles
+        .iter()
+        .map(|key| {
+            let positions = store.evaluate(*key).expect("evaluated");
+            let bounds = store::Aabb::from_points(positions.iter().copied());
+            (*key, bounds.expect("a tile of points"))
+        })
+        .collect();
+    // The tiles the stroke changes that `read` can read anything of, before or after their
+    // futures are installed: reached in either box, or in the ring of a tile a ball reaches.
+    let store = &*store;
+    let reached = |read: &Read| -> BTreeSet<TileKey> {
+        let met = |key: &TileKey| {
+            let future = all.get(key).and_then(Future::bounds);
+            read_meets(read, stored[key]) || future.is_some_and(|bounds| read_meets(read, bounds))
+        };
+        let mut reached = BTreeSet::new();
+        for key in tiles.iter().filter(|key| met(key)) {
+            if all.contains_key(key) {
+                reached.insert(*key);
+            }
+            if matches!(read, Read::Ball { .. }) {
+                let ring = store.normal_inputs(key).expect("a ring");
+                reached.extend(ring.iter().filter(|input| all.contains_key(input)));
+            }
+        }
+        reached
+    };
+
+    let reads = reads_across(&run.camera);
+    let index = run.picker.index_mut();
+    let strokes = &run.brush.strokes;
+    let (mut fewer, mut some) = (0, 0);
+    for read in &reads {
+        let one = std::slice::from_ref(read);
+        let asked = |ahead| needed(store, index, strokes, one, ahead).expect("listed");
+        let (bound, with_half, with_all) = (asked(None), asked(Some(&half)), asked(Some(&all)));
+        let reached = reached(read);
+        assert!(
+            reached.is_subset(&with_all),
+            "{read:?}: a tile it reaches isn't asked for: {:?}",
+            reached.difference(&with_all).collect::<Vec<_>>()
+        );
+        assert!(
+            with_all.is_subset(&with_half),
+            "{read:?}: more with every future"
+        );
+        assert!(
+            with_half.is_subset(&bound),
+            "{read:?}: more than the bound's"
+        );
+        assert_eq!(
+            asked(Some(&BTreeMap::new())),
+            bound,
+            "{read:?}: with no future at hand, the bound's"
+        );
+        fewer += usize::from(with_all.len() < bound.len());
+        some += usize::from(!reached.is_empty());
+    }
+    assert!(some > 10, "reads that reach the stroke's tiles: {some}");
+    assert!(
+        fewer > 10,
+        "reads asked fewer futures with them at hand: {fewer}"
+    );
+    drop(futures);
+    run.brush.abandon();
+    run.close();
+}
+
 /// How many times each timed case is drawn ([`time_downs`]): the median and the spread are said.
 const TIMED_RUNS: usize = 7;
 
-/// The most hover frames a warmed case is given before its `Down` ([`Timed::run`]).
+/// How many times the heavy stroke is landed whole for its reference
+/// (`a_down_once_a_heavy_stroke_has_landed_is_timed`): each takes the better part of a minute.
+const LANDED_RUNS: usize = 5;
+
+/// The most hover frames a pen is given for the brush's warming to end ([`Chain::hover`]).
 const HOVER_FRAMES: usize = 2000;
 
 /// The brush's radius in the ordinary timed cases, in pixels: about a tile of the 4 × 4 a face,
@@ -1403,8 +1773,10 @@ struct Took {
     route: Duration,
     /// The step that takes the `Down` and its first drag, and shows its first dab.
     step: Duration,
-    /// The futures installed for the stroke by the end of that step.
-    installed: usize,
+    /// The futures installed for the stroke by its routing, and by the end of that step.
+    installed: (usize, usize),
+    /// The futures made (not taken from those made ahead) in the routing, and in that step.
+    made: (usize, usize),
     /// The earlier stroke's dabs still to land as the pen came down.
     backlog: usize,
     /// The tiles those dabs reach.
@@ -1442,9 +1814,9 @@ impl Timed {
     /// stepped with its first drag, as a frame does.
     ///
     /// `prepare` has kept up what a later stroke reads of the earlier one, as the frames after
-    /// it would. A warmed `Down` comes after hover frames at its pixel, each a step and a
-    /// `prepare` with a 4 ms deadline, until `prepare` has no more to do; the catch-up is held
-    /// meanwhile (as during a close), so a warmed `Down` is over the same dabs as a cold one.
+    /// it would; the futures it made ahead where the earlier stroke's pen lifted are let go, so
+    /// a cold `Down` makes every future it reads. A warmed `Down` comes after hover frames at
+    /// its pixel ([`Chain::hover`]), so it is over the same dabs as a cold one.
     fn run(&self, before: Before) -> Took {
         let level = Level::new(BACKLOG_LEVEL).expect("a level");
         let config = StoreConfig::new(256 << 20, 1).with_display(level);
@@ -1463,64 +1835,48 @@ impl Timed {
             run.cut();
             run.land_all();
         }
-        let kept_up = context(&mut run.project, run.picker.index_mut(), &run.camera);
-        run.brush
-            .prepare(kept_up, Instant::now())
-            .expect("prepared");
+        run.prepare();
+        // The earlier stroke's own lift is a hover, where that `prepare` made futures ahead: a
+        // cold `Down` has none.
+        run.brush.ahead.clear();
         let backlog = run.rows().first().map_or(0, Vec::len);
         let reach = run.brush.strokes.first().map_or(0, |earlier| {
             let remaining = earlier.remaining.as_ref();
             remaining.map_or(0, |remaining| remaining.reach.len())
         });
         let (at, then) = self.pen;
-        let mut hover = (0, Duration::ZERO);
-        if before == Before::Warmed {
-            run.brush.landing = Landing::InSteps;
-            let mut pen = PenFrame::default();
-            pen.push(sample(Phase::Hover, at, 0.0), None);
-            let budget = BrushBudget::frame(Instant::now(), Duration::ZERO, setup().interval);
-            for _ in 0..HOVER_FRAMES {
-                let stepped = context(&mut run.project, run.picker.index_mut(), &run.camera);
-                run.brush.step(stepped, &pen, &budget).expect("a step");
-                let prepared = context(&mut run.project, run.picker.index_mut(), &run.camera);
-                let began = Instant::now();
-                let more = run
-                    .brush
-                    .prepare(prepared, began + Duration::from_millis(4))
-                    .expect("prepared");
-                hover = (hover.0 + 1, hover.1 + began.elapsed());
-                if !more {
-                    break;
-                }
-            }
-            run.brush.landing = Landing::InFrames;
-        }
+        let hover = if before == Before::Warmed {
+            run.hover(at)
+        } else {
+            (0, Duration::ZERO)
+        };
         let down = sample(Phase::Down, at, 0.8);
         let drag = sample(Phase::Drag, then, 0.8);
+        take_made();
         let began = Instant::now();
         let routed = run.route(&down);
         let route = began.elapsed();
         assert_eq!(routed, Route::Brush, "on the surface");
+        let by_routing = match &run.brush.routed {
+            Some(Routed::Over(over)) => over.begun.installed.len(),
+            _ => 0,
+        };
+        let made_routing = take_made();
         let stepped = Instant::now();
         let first = run.frame(&[down, drag]);
         let step = stepped.elapsed();
         assert!(first.dabs_shown > 0, "its first dab is shown: {first:?}");
         let over = if before == Before::Landed { 1 } else { 2 };
         assert_eq!(run.ops().len(), over, "it began, over the earlier stroke");
-        let installed = run
-            .brush
-            .strokes
-            .last()
-            .map_or(0, |newest| match &newest.op {
-                StrokeOp::Reserved { installed, .. } => installed.len(),
-                StrokeOp::Begun(_) => 0,
-            });
+        let installed = (by_routing, run.installed().len());
+        let made = (made_routing, take_made());
         run.brush.abandon();
         run.close();
         Took {
             route,
             step,
             installed,
+            made,
             backlog,
             reach,
             hover,
@@ -1528,23 +1884,27 @@ impl Timed {
     }
 }
 
-/// Times `case`'s `Down` with the surface under it as each of `befores` says, [`TIMED_RUNS`]
-/// times each, and prints the medians with their spread and the machine's load: a measurement,
+/// Times `case`'s `Down` with the surface under it as each of `befores` says, `count` times
+/// each, and prints the medians with their spread and the machine's load: a measurement,
 /// asserting nothing of time.
-fn time_downs(name: &str, case: &Timed, befores: &[Before]) {
+fn time_downs(name: &str, case: &Timed, befores: &[Before], count: usize) {
     println!("{name} (load {})", load());
     for &before in befores {
-        let runs: Vec<Took> = (0..TIMED_RUNS).map(|_| case.run(before)).collect();
+        let runs: Vec<Took> = (0..count).map(|_| case.run(before)).collect();
         let of = |part: fn(&Took) -> Duration| -> Vec<Duration> { runs.iter().map(part).collect() };
         let Some(last) = runs.last() else {
             return;
         };
         println!(
-            "  {before:?}: over {} dabs still to land on {} tiles, {} futures installed; routed \
-             in {}, stepped to its first dab in {}, {} in all; {} hover frames warming {:.2?}",
+            "  {before:?}: over {} dabs still to land on {} tiles; {} futures installed by its \
+             routing ({} made then) and {} by its first dab ({} more made); routed in {}, \
+             stepped to its first dab in {}, {} in all; {} hover frames warming {:.2?}",
             last.backlog,
             last.reach,
-            last.installed,
+            last.installed.0,
+            last.made.0,
+            last.installed.1,
+            last.made.1,
             spread(&of(|took| took.route)),
             spread(&of(|took| took.step)),
             spread(&of(|took| took.route + took.step)),
@@ -1553,7 +1913,7 @@ fn time_downs(name: &str, case: &Timed, befores: &[Before]) {
         );
     }
     println!(
-        "  (load {} after; medians of {TIMED_RUNS}, least to most)",
+        "  (load {} after; medians of {count}, least to most)",
         load()
     );
 }
@@ -1568,7 +1928,8 @@ fn time_downs(name: &str, case: &Timed, befores: &[Before]) {
 #[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
 fn a_down_over_a_heavy_stroke_is_timed() {
     let befores = [Before::Cold, Before::Warmed];
-    time_downs("a Down over a heavy stroke", &Timed::heavy(), &befores);
+    let name = "a Down over a heavy stroke";
+    time_downs(name, &Timed::heavy(), &befores, TIMED_RUNS);
 }
 
 /// The reference of `a_down_over_a_heavy_stroke_is_timed`: the same `Down` once the heavy stroke
@@ -1577,11 +1938,8 @@ fn a_down_over_a_heavy_stroke_is_timed() {
 #[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
 fn a_down_once_a_heavy_stroke_has_landed_is_timed() {
     let befores = [Before::Landed];
-    time_downs(
-        "a Down once a heavy stroke has landed",
-        &Timed::heavy(),
-        &befores,
-    );
+    let name = "a Down once a heavy stroke has landed";
+    time_downs(name, &Timed::heavy(), &befores, LANDED_RUNS);
 }
 
 /// A measurement, printed and asserting nothing of time: an ordinary stroke across the sphere,
@@ -1591,8 +1949,9 @@ fn a_down_once_a_heavy_stroke_has_landed_is_timed() {
 fn a_down_over_an_ordinary_stroke_is_timed() {
     let befores = [Before::Cold, Before::Warmed, Before::Landed];
     let over = Timed::ordinary(((185.0, 107.5), (188.0, 107.8)));
-    let name = "a Down on an ordinary stroke's half still to land";
-    time_downs(name, &over, &befores);
+    let on_it = "a Down on an ordinary stroke's half still to land";
+    time_downs(on_it, &over, &befores, TIMED_RUNS);
     let beside = Timed::ordinary(((185.0, 122.0), (188.0, 122.3)));
-    time_downs("a Down beside an ordinary stroke", &beside, &befores);
+    let beside_it = "a Down beside an ordinary stroke";
+    time_downs(beside_it, &beside, &befores, TIMED_RUNS);
 }

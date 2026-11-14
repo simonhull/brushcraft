@@ -173,6 +173,15 @@
 //!   installed futures ([`on_futures`]). The engine is deterministic, so that run is the one the
 //!   finished surface gives. Each future is made once: the stroke keeps which are installed until
 //!   its op begins (a future stays valid while its stroke lands).
+//! - **What a `Down` over them costs** (measured, the stroke-while-landing plan): a future costs
+//!   about its tile's share of landing, the earlier strokes' remaining dabs replayed on it, so
+//!   three things keep that off the pen's path. The futures a call lacks are **made together** on
+//!   the store's workers ([`Futures::futures_of`]), about the dearest tile's time for them all.
+//!   **Fewer are asked for:** a tile's box grows only the way its dabs move it, each along its
+//!   normal and one way ([`Moves::grown`], [`sculpt::draw_span`]), not by their strengths every
+//!   way; and a tile whose future is at hand is tested in its future's own box. And they are **made
+//!   ahead**, while the pen hovers and ahead of a drawing pen ("Warming under a hovering pen"
+//!   below), so a `Down` where the pen hovered installs them and makes none.
 //! - **Shown at once:** its dabs are shown after the earlier strokes' in the one [`Preview`], whose
 //!   dabs land in that same order, never before every dab of theirs is ([`Preview::show_over`]).
 //!   Each tile shows the newest stroke whose dabs move it: a later stroke's previews are made over
@@ -277,6 +286,33 @@
 //! What is left goes on in the next frame's `prepare`; a pen that moves on, touches or leaves
 //! cancels it. A still pen is warmed once.
 //!
+//! **Over strokes still landing** the surface a `Down` reads is their futures, which cost far
+//! more than an evaluation, so those are made ahead too (the stroke-while-landing spec, "Cost and
+//! latency"), in the same `prepare`s, while the catch-up goes on:
+//!
+//! - **Made, not installed** ([`Ahead`], [`Sculpting::warm_futures`]): the futures of the tiles a
+//!   `Down` at the hover would read (along the pen's ray, then about its hit: the hit's normals,
+//!   the brush's radius, the stroke's reach; [`Sculpting::list_ahead`]) are made on the store's
+//!   workers, [`FUTURES_A_LOOK`] together, a call's futures time at a time ([`FUTURES_TIME`], at
+//!   least a batch a call), and kept beside the strokes, each with its box. Nothing is reserved for
+//!   a pen that only hovers: an op reserved must be given back on every path, opens a journal, and
+//!   stands in the way of a stroke beginning alone; a future kept apart needs none of that, and is
+//!   right for as long as the stroke it was made up to is under way (see [`Ahead`] for why, and
+//!   when it goes).
+//! - **At the `Down`**, the futures it reads are installed from those ([`install`]), none made; and
+//!   a tile whose future is at hand is asked for only if the read reaches the box it has as stored
+//!   or its future's own ([`needed`]), so the `Down` installs the few it reads, not every tile the
+//!   strokes' dabs might have moved under it. What it lacks (the pen came down elsewhere, or sooner
+//!   than the warming ended) it makes then, together on the workers.
+//! - **Ahead of a drawing pen** over strokes still landing, the futures its next samples read are
+//!   installed between its frames ([`Sculpting::install_ahead`]): its op is reserved, so they go
+//!   straight in.
+//! - **What is left on the pen's path** once warmed: installing each future (its shape's box, then
+//!   its positions, normals and raycast blocks as the stroke first reads them, which only an op's
+//!   own set can hold), and the first frame's previews over them, the seams with the earlier
+//!   strokes' previews above all. A batch under way when the `Down` arrives is finished first: the
+//!   tiles it holds are those the `Down` would have made.
+//!
 //! # Errors
 //!
 //! A store error ends the stroke cleanly (the brush-engine spec, §3 "Errors"), and shows in the
@@ -306,7 +342,8 @@ use geom::TileKey;
 use input::Phase;
 use render::camera::View;
 use sculpt::{
-    Futures, OpenStrokes, PenDownTiles, Preview, SculptError, StoreSurface, StrokeEdits, apply_dabs,
+    Future, Futures, OpenStrokes, PenDownTiles, Preview, SculptError, StoreSurface, StrokeEdits,
+    apply_dabs,
 };
 use store::{
     CacheError, Evaluation, OpId, OpenStroke, PenDownReading, PenSample as RecordSample, PenTilt,
@@ -1152,6 +1189,15 @@ impl<S: Surface> Surface for Recorded<'_, S> {
 /// is, which it stays. A ray is checked against each tile they change in turn (the index has no
 /// query of boxes grown tile by tile), from the reach each [`Remaining`] keeps.
 ///
+/// **Where the future is at hand** (`ahead`, the futures of `earlier` made ahead of the stroke,
+/// [`Ahead::of`]), the tile's two boxes are known exactly, with no growth: the one it has in
+/// `index`, which a read finds it in until its future is installed, and its future's
+/// ([`Future::bounds`]), which a read finds it in from then on. A read reaching neither reads
+/// nothing of the tile either way, so its future needn't be installed for it: the bound on how
+/// far the tile can move, which a heavy stroke makes many tiles wide, is only for the tiles
+/// whose futures aren't made yet. The tiles in the ring of a tile a ball reaches are asked for as
+/// before, whatever their boxes: the ball reads that tile's normals, which read them.
+///
 /// # Errors
 ///
 /// As [`TileStore::normal_inputs`].
@@ -1160,20 +1206,39 @@ fn needed(
     index: &SpatialIndex,
     earlier: &[Pending],
     reads: &[Read],
+    ahead: Option<&BTreeMap<TileKey, Future>>,
 ) -> Result<BTreeSet<TileKey>, CacheError> {
     let moves = Moves::of(earlier);
     let changed = |key: &TileKey| moves.changed(key);
     let most = moves.most();
-    // The box of tile `key` grown by how far it can move, each way.
-    let grown = |key: &TileKey| moves.grown(index, key);
+    // The boxes a read must reach to read anything of tile `key`: its box in the index grown by
+    // how far it can move; or, its future at hand, that box as it is and its future's.
+    let boxes = |key: &TileKey| -> Option<(Corners, Option<Corners>)> {
+        let exact = ahead
+            .and_then(|ahead| ahead.get(key))
+            .and_then(Future::bounds);
+        match exact {
+            Some(exact) => {
+                let stored = index.bvh().bounds(key)?.aabb;
+                Some((widened(stored), Some(widened(exact))))
+            }
+            None => Some((moves.grown(index, key)?, None)),
+        }
+    };
+    // Whether a read reaches tile `key`, `meets` saying whether it meets a box; a tile with no
+    // box in the index counts as reached.
+    let reaches = |key: &TileKey, meets: &dyn Fn(DVec3, DVec3) -> bool| -> bool {
+        boxes(key).is_none_or(|(stored, future)| {
+            meets(stored.0, stored.1) || future.is_some_and(|future| meets(future.0, future.1))
+        })
+    };
     let mut needed: BTreeSet<TileKey> = BTreeSet::new();
     for read in reads {
         match *read {
             Read::Ray { ray, until } => {
                 let crossed = moves.tiles().filter(|key| {
                     !needed.contains(*key)
-                        && grown(key)
-                            .is_none_or(|(low, high)| ray_meets_box(&ray, until, low, high))
+                        && reaches(key, &|low, high| ray_meets_box(&ray, until, low, high))
                 });
                 let crossed: Vec<TileKey> = crossed.copied().collect();
                 needed.extend(crossed);
@@ -1187,7 +1252,7 @@ fn needed(
                 let (at, query) = (center.to_f32(), within as f32);
                 let near = index.query_sphere(at, query);
                 for key in near {
-                    let touched = grown(&key).is_none_or(|(low, high)| {
+                    let touched = reaches(&key, &|low, high| {
                         box_distance_squared(center, low, high) <= radius * radius
                     });
                     if !touched {
@@ -1248,9 +1313,11 @@ fn box_distance_squared(point: DVec3, low: DVec3, high: DVec3) -> f64 {
 /// Installs the futures of `keys` not `installed` yet for the stroke reserved as `token`, in
 /// `project`'s store.
 ///
-/// They are made by `futures`, the futures of the strokes `earlier` (each with its
-/// [`Remaining`]); each is labelled with the newest of them whose dabs reach the tile, and
-/// refitted in `index` so the stroke's raycasts (and its previews' queries) find it there.
+/// Each is the one made ahead (`ahead`, the futures of the strokes `earlier` made under a
+/// hovering pen, [`Ahead::of`]) if there is one, else made now by `futures`, the futures of
+/// `earlier` (each with its [`Remaining`]), those together on the store's workers; each is
+/// labelled with the newest of the strokes whose dabs reach the tile, and refitted in `index` so
+/// the stroke's raycasts (and its previews' queries) find it there.
 ///
 /// The label is the op of the record the tile is taken to hold once they land: provisional until
 /// the store's restore and roll-over of a chain settle what a roll-over writes it as (the
@@ -1264,7 +1331,7 @@ fn box_distance_squared(point: DVec3, low: DVec3, high: DVec3) -> f64 {
 fn install(
     project: &mut Project,
     index: &mut SpatialIndex,
-    futures: &Futures<'_>,
+    (futures, ahead): (&Futures<'_>, Option<&BTreeMap<TileKey, Future>>),
     earlier: &[Pending],
     token: &ReservedOp,
     installed: &mut BTreeSet<TileKey>,
@@ -1274,15 +1341,26 @@ fn install(
     let store = project.store();
     let mut added: Vec<TileKey> = Vec::with_capacity(fresh.len());
     let mut outcome = Ok(());
-    // Made together, on the store's workers: about one tile's time for them all.
-    let made = futures.futures_of(store, &fresh);
-    let made = fresh.into_iter().zip(made);
-    for (key, future) in made {
-        let Ok(future) = future else {
+    let at_hand = |key: &TileKey| ahead.and_then(|ahead| ahead.get(key));
+    // Those not made ahead are made now, together on the store's workers: about one tile's time
+    // for them all.
+    let cold: Vec<TileKey> = fresh
+        .iter()
+        .filter(|key| at_hand(key).is_none())
+        .copied()
+        .collect();
+    #[cfg(test)]
+    tests::count_made(cold.len());
+    let mut made_now = futures.futures_of(store, &cold).into_iter();
+    for key in fresh {
+        let tile = match at_hand(&key) {
+            Some(future) => Some(future.tile().clone()),
+            None => made_now.next().and_then(Result::ok).map(Future::into_tile),
+        };
+        let Some(tile) = tile else {
             outcome = Err(OnFutures::Futures);
             break;
         };
-        let tile = future.into_tile();
         let reaching = earlier.iter().rev().find(|stroke| {
             let remaining = stroke.remaining.as_ref();
             remaining.is_some_and(|remaining| remaining.reach.contains_key(&key))
@@ -1325,12 +1403,13 @@ fn install(
 /// futures can't be had, or a run still finds some missing after [`FUTURE_ROUNDS`].
 fn on_futures<T>(
     scene: &mut Scene<'_>,
-    state: &sculpt::Stroke,
+    (state, ahead): (&sculpt::Stroke, &Ahead),
     earlier: &[Pending],
     token: &ReservedOp,
     installed: &mut BTreeSet<TileKey>,
     mut call: impl FnMut(&mut Recorded<'_, StoreSurface<'_>>) -> T,
 ) -> Result<T, OnFutures> {
+    let ahead = ahead.of(earlier);
     let mut futures: Option<Futures<'_>> = None;
     for _ in 0..FUTURE_ROUNDS {
         let (made, reads) = {
@@ -1345,7 +1424,7 @@ fn on_futures<T>(
             surface.finish().map_err(OnFutures::Surface)?;
             (made, reads)
         };
-        let wanted = needed(scene.project.store(), scene.index, earlier, &reads)
+        let wanted = needed(scene.project.store(), scene.index, earlier, &reads, ahead)
             .map_err(|_why| OnFutures::Futures)?;
         if wanted.is_subset(installed) {
             return Ok(made);
@@ -1359,7 +1438,7 @@ fn on_futures<T>(
         install(
             scene.project,
             scene.index,
-            &made_futures,
+            (&made_futures, ahead),
             earlier,
             token,
             installed,
@@ -1382,8 +1461,60 @@ type DisplayReads = BTreeMap<TileKey, BTreeSet<TileKey>>;
 /// dabs reach, several for one under many.
 const FUTURES_TIME: Duration = Duration::from_millis(2);
 
-/// How many futures [`Open`]'s [`OpenStrokes::ready`] installs between looks at the clock.
-const FUTURES_A_LOOK: usize = 4;
+/// How many futures are made together between looks at the clock.
+///
+/// By [`Open`]'s [`OpenStrokes::ready`], ahead of a drawing pen and under a hovering one
+/// ([`Sculpting::warm_futures`]): made on the store's workers, about one's time for them all on
+/// a machine with as many cores.
+const FUTURES_A_LOOK: usize = 8;
+
+/// The most futures kept made ahead of a `Down` ([`Ahead`]): those nearest the hovering pen.
+///
+/// A future is a tile's corrections, some tens of kilobytes, held beside the store's budget, so
+/// they are few; a `Down` reading more makes the rest as it comes.
+const AHEAD_MOST: usize = 128;
+
+/// The futures made ahead of a `Down`, under a hovering pen, off the pen's path (see "Warming
+/// under a hovering pen" in the module notes).
+///
+/// The futures of every stroke under way as they were made, up to the newest (`after`): what a
+/// stroke begun after that one reads, so its `Down` installs them without making them
+/// ([`install`]), and knows each tile's box exactly ([`needed`]). They are kept beside the
+/// strokes, not in the store: no op is reserved for a pen that only hovers.
+///
+/// **They stay right** while the stroke `after` is under way: a future is what the strokes'
+/// landing leaves, which their landing doesn't change (a stroke before `after` that ends has
+/// landed just that), and none of them places a dab more (they are made only with every pen
+/// up, the strokes sealed). A stroke that drops dabs ends in that call, and every stroke after
+/// it with it, `after` among them. So they are read only by a stroke begun right after `after`
+/// ([`Ahead::of`]), and let go once `after` is no longer under way ([`Sculpting::keep_ahead`]).
+#[derive(Debug, Default)]
+struct Ahead {
+    /// The op of the newest stroke under way as they were made; `None` with none made.
+    after: Option<OpId>,
+    /// Each tile's future, with its box.
+    tiles: BTreeMap<TileKey, Future>,
+    /// What they were listed for: where the pen hovered, the view, and the brush's radius in
+    /// pixels then. A still pen's are listed once.
+    target: Option<(Pixel, View, f32)>,
+    /// The tiles still to make for `target`, the next to make last.
+    todo: Vec<TileKey>,
+}
+
+impl Ahead {
+    /// The futures made ahead that a stroke begun over `earlier` reads: those of exactly these
+    /// strokes, the newest of them the one they were made up to. `None` if they are of another
+    /// chain (or none is made).
+    fn of(&self, earlier: &[Pending]) -> Option<&BTreeMap<TileKey, Future>> {
+        let newest = earlier.last().map(|stroke| stroke.op.id());
+        (newest.is_some() && newest == self.after).then_some(&self.tiles)
+    }
+
+    /// Lets every future go, and what was listed.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 /// What one call's previews may still spend installing futures ([`FUTURES_TIME`]).
 #[derive(Debug, Clone, Copy)]
@@ -1453,6 +1584,8 @@ struct Open<'a> {
     /// What the brush's step (or its `prepare`) may still spend installing futures
     /// ([`FUTURES_TIME`]): one for all the step's calls.
     installing: &'a mut Installing,
+    /// The futures made ahead under a hovering pen: installed without being made again.
+    ahead: &'a Ahead,
 }
 
 impl OpenStrokes for Open<'_> {
@@ -1500,7 +1633,8 @@ impl OpenStrokes for Open<'_> {
         });
         let reads: Vec<Read> = balls.collect();
         let store = self.project.store();
-        let Ok(mut wanted) = needed(store, self.index, earlier, &reads) else {
+        let ahead = self.ahead.of(earlier);
+        let Ok(mut wanted) = needed(store, self.index, earlier, &reads, ahead) else {
             return false;
         };
         // The tiles the strokes before still change, as they land: a future of one landed is
@@ -1521,37 +1655,54 @@ impl OpenStrokes for Open<'_> {
             }
         }
         let missing: Vec<TileKey> = wanted.difference(installed).copied().collect();
-        if missing.is_empty() {
-            return true;
-        }
-        let Some(chain) = chain_of(earlier) else {
-            return false;
-        };
-        let Ok(futures) = Futures::new(store, self.state, &chain) else {
-            return false;
-        };
-        // As many as the call's time allows; the rest in the calls after.
-        for some in missing.chunks(FUTURES_A_LOOK) {
-            if !self.installing.more() {
-                return false;
-            }
-            let now: BTreeSet<TileKey> = some.iter().copied().collect();
-            let installed_now = install(
-                self.project,
-                self.index,
-                &futures,
-                earlier,
-                token,
-                installed,
-                &now,
-            );
-            if installed_now.is_err() {
-                return false;
-            }
-            self.installing.any = true;
-        }
-        true
+        install_in_time(
+            self.project,
+            self.index,
+            (self.state, ahead),
+            earlier,
+            (token, installed),
+            &missing,
+            self.installing,
+        )
     }
+}
+
+/// Installs the futures of `missing` for the stroke reserved as `token` after the strokes
+/// `earlier`, as many as `installing` leaves time for. Returns whether every one is installed.
+///
+/// [`FUTURES_A_LOOK`] together between looks at the clock ([`FUTURES_TIME`]); the rest are for
+/// the calls after. They are those made ahead (`ahead`) where there are, else made now from the
+/// session's stroke state `state` ([`install`]).
+fn install_in_time(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+    (state, ahead): (&sculpt::Stroke, Option<&BTreeMap<TileKey, Future>>),
+    earlier: &[Pending],
+    (token, installed): (&ReservedOp, &mut BTreeSet<TileKey>),
+    missing: &[TileKey],
+    installing: &mut Installing,
+) -> bool {
+    if missing.is_empty() {
+        return true;
+    }
+    let Some(chain) = chain_of(earlier) else {
+        return false;
+    };
+    let Ok(futures) = Futures::new(project.store(), state, &chain) else {
+        return false;
+    };
+    for some in missing.chunks(FUTURES_A_LOOK) {
+        if !installing.more() {
+            return false;
+        }
+        let now: BTreeSet<TileKey> = some.iter().copied().collect();
+        let both = (&futures, ahead);
+        if install(project, index, both, earlier, token, installed, &now).is_err() {
+            return false;
+        }
+        installing.any = true;
+    }
+    true
 }
 
 /// A stroke, from its `Down` (or its resuming, for one a restore found) until its op ends: its
@@ -1961,6 +2112,8 @@ pub(crate) struct Sculpting {
     /// later stroke's futures for its previews ([`FUTURES_TIME`]): one budget for all its calls,
     /// set afresh as each begins.
     installing: Installing,
+    /// The futures made ahead of a `Down` over the strokes under way, while the pen hovers.
+    ahead: Ahead,
     /// Test knob: how strokes over strokes still landing fail.
     #[cfg(test)]
     knob: Knob,
@@ -2013,6 +2166,7 @@ impl Sculpting {
             waited_to_land: 0,
             dropping_later: None,
             installing: Installing::new(),
+            ahead: Ahead::default(),
             #[cfg(test)]
             knob: Knob::None,
         };
@@ -2463,7 +2617,7 @@ impl Sculpting {
         let (settings, projector) = (&self.settings, scene.projector);
         let begun = on_futures(
             scene,
-            &self.state,
+            (&self.state, &self.ahead),
             &self.strokes,
             &token,
             &mut installed,
@@ -2756,9 +2910,11 @@ impl Sculpting {
         if self.knob == Knob::FuturesFail {
             return Placing::Waits;
         }
-        let run = on_futures(scene, &self.state, earlier, token, installed, |surface| {
+        let both = (&self.state, &self.ahead);
+        let run = on_futures(scene, both, earlier, token, installed, |surface| {
             call(engine.clone(), surface)
         });
+
         match run {
             Ok((going_on, placed)) => {
                 pending.engine = going_on;
@@ -2893,6 +3049,7 @@ impl Sculpting {
                 strokes: &mut self.strokes,
                 state: &self.state,
                 installing: &mut self.installing,
+                ahead: &self.ahead,
             };
             let shown = preview.show_over(&mut open, op, &dabs, &wanted);
             let count = preview.shown() - before;
@@ -3151,6 +3308,7 @@ impl Sculpting {
                         strokes: &mut self.strokes,
                         state: &self.state,
                         installing: &mut self.installing,
+                        ahead: &self.ahead,
                     };
                     if let Err(error) = preview.note_applied_over(&mut open, op, &direct) {
                         self.fail("moving the previews by dabs applied at once", &error);
@@ -3248,6 +3406,7 @@ impl Sculpting {
             strokes: &mut self.strokes,
             state: &self.state,
             installing: &mut self.installing,
+            ahead: &self.ahead,
         };
         let mut landed = preview.land_over(&mut open, count, &|key: &TileKey| drawn.draws(key));
         if rebase && landed.is_ok() {
@@ -3696,6 +3855,190 @@ impl Sculpting {
         }
     }
 
+    /// Lets the futures made ahead go once the stroke they were made up to is no longer under
+    /// way (see [`Ahead`]): looked at as each step and each `prepare` begins.
+    fn keep_ahead(&mut self) {
+        let after = self.ahead.after;
+        let mut under_way = self.strokes.iter().map(|stroke| stroke.op.id());
+        if !under_way.any(|op| Some(op) == after) {
+            self.ahead.clear();
+        }
+    }
+
+    /// Makes futures ahead of a `Down` where the pen hovers over the strokes under way (see
+    /// "Warming under a hovering pen" in the module notes): those a `Down` there reads, listed
+    /// once per position, view and radius ([`Sculpting::list_ahead`]), and made
+    /// [`FUTURES_A_LOOK`] together on the store's workers for as long as the call's futures time
+    /// lasts ([`FUTURES_TIME`], at least a batch a call). Returns whether more are left to make.
+    ///
+    /// Only where a `Down` would begin over the strokes under way ([`Sculpting::route_on_futures`])
+    /// and what a later stroke reads of each is made, every pen up: their futures are final then.
+    fn warm_futures(&mut self, scene: &mut Scene<'_>) -> bool {
+        let Some((at, view)) = self.warm.wanted else {
+            return false;
+        };
+        let newest = self.strokes.last().map(|stroke| stroke.op.id());
+        let over = newest.is_some() && self.restored.is_empty() && self.deferred.is_empty();
+        let sealed = self.strokes.iter().all(|stroke| {
+            let remaining = stroke.remaining.as_ref();
+            remaining.is_some_and(|remaining| remaining.edits.is_sealed())
+        });
+        if !over || !sealed || self.pen_on_stroke() {
+            return false;
+        }
+        if self.ahead.after != newest {
+            self.ahead.clear();
+            self.ahead.after = newest;
+        }
+        let target = (at, view, self.settings.radius().get());
+        if self.ahead.target != Some(target) {
+            self.ahead.target = Some(target);
+            self.list_ahead(scene, at);
+        }
+        if self.ahead.todo.is_empty() {
+            return false;
+        }
+        let store = scene.project.store();
+        let futures = chain_of(&self.strokes).map(|chain| Futures::new(store, &self.state, &chain));
+        let Some(Ok(futures)) = futures else {
+            self.ahead.todo.clear();
+            return false;
+        };
+        while !self.ahead.todo.is_empty() && self.installing.more() {
+            let split = self.ahead.todo.len().saturating_sub(FUTURES_A_LOOK);
+            let batch = self.ahead.todo.split_off(split);
+            #[cfg(test)]
+            tests::count_made(batch.len());
+            let made = futures.futures_of(store, &batch);
+            let made = batch.into_iter().zip(made);
+            for (key, future) in made {
+                // One that can't be made is left to the `Down` that reads it, which says why.
+                if let Ok(future) = future {
+                    self.ahead.tiles.insert(key, future);
+                }
+            }
+            self.installing.any = true;
+        }
+        !self.ahead.todo.is_empty()
+    }
+
+    /// Lists the futures to make ahead for a pen hovering at `at`: those a `Down` there may read
+    /// ([`needed`]), in the order it reads them, the nearest first in each group.
+    ///
+    /// Along the pen's ray (the `Down` is routed by a raycast, however far the strokes' dabs dig
+    /// or raise the surface there); then about its hit on the surface as stored: the hit's
+    /// normals, the brush's radius (the first dab's area normal), and the stroke's reach
+    /// ([`stroke::REACH_RADII`] radii, its first drag's walk). The hit on the surface the
+    /// strokes leave may lie elsewhere along the ray, and so may what the `Down` reads about it:
+    /// the list is a good guess, and the `Down` makes what it lacks. At most [`AHEAD_MOST`]; the
+    /// futures made before that aren't listed now are let go, the others kept.
+    fn list_ahead(&mut self, scene: &mut Scene<'_>, at: Pixel) {
+        self.ahead.todo.clear();
+        let projector = scene.projector;
+        let screen = ScreenPoint::new(at.x, at.y).ok();
+        let Some(ray) = screen.and_then(|screen| projector.ray(screen)) else {
+            return;
+        };
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
+        let hit = surface.raycast(&ray);
+        if let Err(error) = surface.finish() {
+            self.fail("warming the surface under the pen", &error);
+            return;
+        }
+        let along = Read::Ray {
+            ray,
+            until: f64::INFINITY,
+        };
+        let mut reads = vec![along];
+        if let Some(hit) = hit {
+            let depth = ray.depth_of(hit.position);
+            let radius = f64::from(self.settings.radius().get()) * projector.world_per_pixel(depth);
+            let about = [0.0, radius, REACH_RADII * radius].map(|radius| Read::Ball {
+                center: hit.position,
+                radius: rounded_up(hit.position, radius),
+            });
+            reads.extend(about);
+        }
+        let (store, index) = (&*scene.project.store(), &*scene.index);
+        let under = hit.map(|hit| hit.position.to_f32());
+        // How far tile `key`'s box in the index lies from the hit: what each group is sorted by.
+        let distance = |key: &TileKey| -> f32 {
+            let from = under.zip(index.bvh().bounds(key));
+            from.map_or(0.0, |(point, bounds)| bounds.aabb.distance_squared(point))
+        };
+
+        let made = self.ahead.of(&self.strokes);
+        let mut listed: Vec<TileKey> = Vec::new();
+        let mut seen: BTreeSet<TileKey> = BTreeSet::new();
+        for read in &reads {
+            let one = std::slice::from_ref(read);
+            let Ok(wanted) = needed(store, index, &self.strokes, one, made) else {
+                break;
+            };
+            let mut group: Vec<TileKey> = wanted.difference(&seen).copied().collect();
+            group.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+            seen.extend(group.iter().copied());
+            listed.extend(group);
+        }
+        listed.truncate(AHEAD_MOST);
+        let kept: BTreeSet<TileKey> = listed.iter().copied().collect();
+        self.ahead.tiles.retain(|key, _| kept.contains(key));
+        let todo = listed
+            .into_iter()
+            .rev()
+            .filter(|key| !self.ahead.tiles.contains_key(key));
+        self.ahead.todo = todo.collect();
+    }
+
+    /// Installs, ahead of a pen drawing over strokes still landing, the futures its next samples
+    /// read: those about where its dabs head ([`AHEAD_DABS`] spacings past its last, within the
+    /// stroke's reach, as [`Sculpting::warm_ahead`] warms the ground there), for as long as the
+    /// call's futures time lasts ([`FUTURES_TIME`]). So a sample's own reads find them installed,
+    /// and its step makes none.
+    ///
+    /// Installing a future early is always right: it is the surface the stroke reads there,
+    /// whenever it comes to read it.
+    fn install_ahead(&mut self, scene: &mut Scene<'_>) {
+        let Some((newest, earlier)) = self.strokes.split_last_mut() else {
+            return;
+        };
+        let [Some(previous), Some(last)] = newest.heading else {
+            return;
+        };
+        let StrokeOp::Reserved { token, installed } = &mut newest.op else {
+            return;
+        };
+        let at = |dab: &Dab| {
+            let [x, y, z] = dab.position;
+            DVec3::new(f64::from(x), f64::from(y), f64::from(z))
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a few spacings ahead, a small count"
+        )]
+        let center = at(&last) + (at(&last) - at(&previous)) * (AHEAD_DABS as f64);
+        let reach = REACH_RADII * f64::from(last.radius);
+        let read = Read::Ball {
+            center,
+            radius: rounded_up(center, reach),
+        };
+        let ahead = self.ahead.of(earlier);
+        let store = scene.project.store();
+        let Ok(wanted) = needed(store, scene.index, earlier, &[read], ahead) else {
+            return;
+        };
+        let missing: Vec<TileKey> = wanted.difference(installed).copied().collect();
+        install_in_time(
+            scene.project,
+            scene.index,
+            (&self.state, ahead),
+            earlier,
+            (token, installed),
+            &missing,
+            &mut self.installing,
+        );
+    }
+
     /// Evaluates the last [`WARM_BATCH`] tiles still to warm.
     fn warm_batch(&mut self, scene: &mut Scene<'_>) {
         let split = self.warm.todo.len().saturating_sub(WARM_BATCH);
@@ -3800,6 +4143,7 @@ impl Brush for Sculpting {
         budget: &BrushBudget,
     ) -> Result<BrushReport> {
         self.installing = Installing::new();
+        self.keep_ahead();
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let mut scene = match Scene::of(context) {
@@ -3927,6 +4271,7 @@ impl Brush for Sculpting {
 
     fn prepare(&mut self, context: BrushContext<'_>, deadline: Instant) -> Result<bool> {
         self.installing = Installing::new();
+        self.keep_ahead();
         let Ok(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
@@ -3941,6 +4286,7 @@ impl Brush for Sculpting {
                 strokes: &mut self.strokes,
                 state: &self.state,
                 installing: &mut self.installing,
+                ahead: &self.ahead,
             };
             if let Err(error) = preview.make_waiting_over(&mut open, scene.waiting) {
                 self.fail("making the previews the renderer waits for", &error);
@@ -3958,6 +4304,7 @@ impl Brush for Sculpting {
                 strokes: &mut self.strokes,
                 state: &self.state,
                 installing: &mut self.installing,
+                ahead: &self.ahead,
             };
             let wanted = |key: &TileKey| drawn.draws(key);
             if let Err(error) = preview.take_over_displays(&mut open, &wanted) {
@@ -3968,6 +4315,7 @@ impl Brush for Sculpting {
         // call: placement's reads there (the area normal, the raycasts) find it evaluated.
         if self.pen_on_stroke() {
             self.warm_ahead(&mut scene);
+            self.install_ahead(&mut scene);
         }
         // What a stroke begun over those under way would read of them, kept up as their dabs are
         // placed: a `Down` then brushes only the dabs placed since. One that fails is made
@@ -3975,6 +4323,9 @@ impl Brush for Sculpting {
         if self.make_remaining(&mut scene).is_err() {
             // Let go by `make_remaining`: the next `Down` over it makes it again.
         }
+        // Under a pen hovering over them, the futures a `Down` there reads: made now, a call's
+        // time of them at a time, while the catch-up goes on.
+        let warming = self.warm_futures(&mut scene);
         if self.catching_up() > 0 {
             // The catch-up: finest work of the dabs shown, at least a dab a call, off the
             // latency path. No warming under a hover meanwhile: the pen is down, or its stroke
@@ -3989,7 +4340,7 @@ impl Brush for Sculpting {
             self.caught_up = std::mem::take(&mut self.caught_up).then(report);
             // More of it wanted only while it moves on: a pen drawing takes only dabs that fit,
             // and the next frame (wanted while dabs are queued) tries again.
-            return Ok(progress && self.queued() > 0);
+            return Ok((progress && self.queued() > 0) || warming);
         }
         // At least one piece of work each call, so warming finishes even in frames that overrun.
         let mut worked = false;
@@ -4004,7 +4355,7 @@ impl Brush for Sculpting {
             self.warm_batch(&mut scene);
             worked = true;
         }
-        Ok(!self.warm.todo.is_empty())
+        Ok(!self.warm.todo.is_empty() || warming)
     }
 
     fn next_sample_due(&self) -> Option<Instant> {
@@ -4111,6 +4462,7 @@ impl Brush for Sculpting {
         self.restored.clear();
         self.held.clear();
         self.forget_deferred();
+        self.ahead.clear();
         self.landing = Landing::InFrames;
         self.save_asked = None;
     }
