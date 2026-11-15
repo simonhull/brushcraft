@@ -111,6 +111,10 @@ pub(crate) struct Setting {
     pub(crate) size: &'static str,
     /// `--script-speed`: real time for the measured scales.
     pub(crate) speed: &'static str,
+    /// `--script-path` of the over run: the whole path for the measured scales, the brief one
+    /// (one pair and the chain, a few seconds) for the tiny check, which only proves that the
+    /// run's record reads.
+    pub(crate) over: &'static str,
 }
 
 impl Setting {
@@ -122,12 +126,14 @@ impl Setting {
                 adapter: "software",
                 size: "320x200",
                 speed: "4",
+                over: "over-brief",
             },
             Scale::Medium | Scale::Full => Self {
                 runs: 3,
                 adapter: "hardware",
                 size: "3840x2160",
                 speed: "1",
+                over: "over",
             },
         }
     }
@@ -892,7 +898,7 @@ fn measure(
             Recorded::parse(&bar_text).with_context(|| format!("{}", bar_record.display()))?;
         gaps.extend(sample_ui(&with_bar, scale, &mut samples)?);
         let over_record = dir.join(format!("over-{run}.jsonl"));
-        runner.app(&args("over", &over_record), &dir.join("state"))?;
+        runner.app(&args(setting.over, &over_record), &dir.join("state"))?;
         let over_text = std::fs::read_to_string(&over_record)
             .with_context(|| format!("reading {}", over_record.display()))?;
         let overs =

@@ -48,7 +48,8 @@ options:
                    that stroke touching down lightly; or near (still, in close, the first
                    of the strokes): what a stroke costs on its own; or over (six pairs of
                    strokes, the later drawn over the earlier while it still lands): what a
-                   stroke over one still landing costs
+                   stroke over one still landing costs; or over-brief (one of
+                   those pairs and three strokes at once): that such a run records
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads; in a window

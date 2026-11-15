@@ -625,9 +625,11 @@ fn the_over_paths_grounds_lie_apart() {
     let script = Script::over(Speed::ONE);
     let grounds = over_grounds(&script);
     assert_eq!(grounds.len(), 7, "six pairs and the chain");
-    for (i, ground) in grounds.iter().enumerate() {
+    let numbered = grounds.iter().enumerate();
+    for (i, ground) in numbered {
         assert!(!ground.is_empty(), "ground {i} has strokes");
-        for (j, other) in grounds.iter().enumerate().skip(i + 1) {
+        let later = grounds.iter().enumerate().skip(i + 1);
+        for (j, other) in later {
             let nearest = ground
                 .iter()
                 .flat_map(|a| other.iter().map(|b| apart(a.point, b.point)))
@@ -649,7 +651,8 @@ fn the_over_paths_later_strokes_come_down_cold_warmed_and_once_landed() {
     let pairs = Weight::ALL
         .into_iter()
         .flat_map(|weight| Before::ALL.map(|before| (weight, before)));
-    for ((weight, before), ground) in pairs.zip(&grounds) {
+    let drawn = pairs.zip(&grounds);
+    for ((weight, before), ground) in drawn {
         let strokes = strokes_of(ground);
         let [earlier, later] = strokes.as_slice() else {
             panic!("{weight:?} {before:?}: {} strokes", strokes.len());
@@ -839,9 +842,52 @@ fn a_to_and_fro_stroke_runs_across_and_back_and_a_part_is_part_of_the_way() {
 
 #[test]
 fn the_over_path_is_named_on_the_command_line() {
-    assert_eq!("over".parse::<ScriptPath>(), Ok(ScriptPath::Over));
+    let named: Result<ScriptPath, BadPath> = "over".parse();
+    assert_eq!(named, Ok(ScriptPath::Over));
     let script = Script::new(ScriptPath::Over, Speed::ONE);
     assert_eq!(script, Script::over(Speed::ONE));
-    let said = "fast".parse::<ScriptPath>().unwrap_err().to_string();
-    assert!(said.contains("near or over"), "{said}");
+    let brief: Result<ScriptPath, BadPath> = "over-brief".parse();
+    assert_eq!(brief, Ok(ScriptPath::OverBrief));
+    let cut = Script::new(ScriptPath::OverBrief, Speed::ONE);
+    assert_eq!(cut, Script::over_brief(Speed::ONE));
+    let unknown: Result<ScriptPath, BadPath> = "fast".parse();
+    let said = unknown.unwrap_err().to_string();
+    assert!(said.contains("near, over or over-brief"), "{said}");
+}
+
+/// The brief over path is the over path's ordinary cold pair and its chain, in a few seconds:
+/// every kind of segment and touch an over record has, with short waits.
+#[test]
+fn the_brief_over_path_is_one_pair_and_the_chain_in_a_few_seconds() {
+    let script = Script::over_brief(Speed::ONE);
+    let spans = script.segments();
+    let names: Vec<&str> = spans.iter().map(|span| span.0.name()).collect();
+    let expected = [
+        "open",
+        "turn",
+        "over_first",
+        "over_ordinary_cold",
+        "turn",
+        "over_first",
+        "over_chain",
+        "settle",
+    ];
+    assert_eq!(names, expected);
+    let pairs = spans.windows(2);
+    for pair in pairs {
+        assert_eq!(pair[0].2, pair[1].1, "{:?} then {:?}", pair[0], pair[1]);
+    }
+    // At the tiny check's speed: under three seconds, against the whole path's twenty-five.
+    let whole = Script::over(Speed::ONE).duration().as_secs_f64() / 4.0;
+    let brief = script.duration().as_secs_f64() / 4.0;
+    assert!(brief < 3.0 && whole > 20.0, "{brief} s against {whole} s");
+    // The same strokes as the whole path's, each segment's touch in it.
+    let grounds = over_grounds(&script);
+    assert_eq!(grounds.len(), 2, "a pair and the chain");
+    assert_eq!(strokes_of(&grounds[0]).len(), 2, "the pair");
+    assert_eq!(strokes_of(&grounds[1]).len(), 3, "the chain");
+    let touched = spans
+        .iter()
+        .filter(|span| script.first_down(span.1, span.2).is_some());
+    assert_eq!(touched.count(), 4, "each stroke segment has its touch");
 }

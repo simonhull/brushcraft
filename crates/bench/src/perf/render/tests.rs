@@ -552,6 +552,10 @@ fn the_measured_scales_run_on_a_hardware_gpu_at_4k_and_the_tiny_check_on_lavapip
         assert!(setting.runs >= 3);
     }
     assert_eq!(Setting::of(Scale::Tiny).adapter, "software");
+    // The over run: the whole path where it is measured, the brief one for the tiny check.
+    assert_eq!(Setting::of(Scale::Medium).over, "over");
+    assert_eq!(Setting::of(Scale::Full).over, "over");
+    assert_eq!(Setting::of(Scale::Tiny).over, "over-brief");
 }
 
 /// Three runs of a project at `scale`, the spin catch-up reached in the first `reached` (at 50

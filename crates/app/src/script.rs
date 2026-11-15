@@ -111,6 +111,10 @@
 //! `over_first`), and a third at once over both (**`over_chain`**): three strokes landing
 //! together. The run ends with 2 s of **settle**.
 //!
+//! `--script-path over-brief` ([`Script::over_brief`]) is that path cut down to its ordinary cold
+//! pair and its chain, each given a second to land: a few seconds at the tiny check's speed, for
+//! proving a run yields an over record, where nothing is measured.
+//!
 //! # The sweep path
 //!
 //! `--script-path sweep` ([`Script::sweep`]) draws one long, sweeping stroke for looking at, its
@@ -756,6 +760,10 @@ pub(crate) const OVER_GAP: f64 = 0.05;
 /// segment has none of the earlier stroke's samples to show.
 pub(crate) const OVER_EDGE: f64 = OVER_GAP / 2.0;
 
+/// How long the brief over path gives the strokes of a pair to land, in seconds at speed 1
+/// ([`Script::over_brief`]).
+const BRIEF_LANDING: f64 = 1.0;
+
 /// The brush of the over path's later strokes: the default 40 pixels.
 const OVER_BRUSH: BrushSize = BrushSize::Pixels(40.0);
 
@@ -1084,11 +1092,16 @@ pub(crate) enum ScriptPath {
     Near,
     /// Strokes over strokes still landing: six pairs ([`Script::over`]).
     Over,
+    /// The over path cut down to one pair and the chain ([`Script::over_brief`]).
+    OverBrief,
 }
 
 /// Why a text isn't a [`ScriptPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0:?} isn't a script path: benchmark, strokes, sweep, spiral, spiral-light, near or over")]
+#[error(
+    "{0:?} isn't a script path: benchmark, strokes, sweep, spiral, spiral-light, near, over or \
+     over-brief"
+)]
 pub(crate) struct BadPath(String);
 
 impl FromStr for ScriptPath {
@@ -1103,6 +1116,7 @@ impl FromStr for ScriptPath {
             "spiral-light" => Ok(Self::SpiralLight),
             "near" => Ok(Self::Near),
             "over" => Ok(Self::Over),
+            "over-brief" => Ok(Self::OverBrief),
             _ => Err(BadPath(text.to_owned())),
         }
     }
@@ -1175,6 +1189,7 @@ impl Script {
             ScriptPath::SpiralLight => Self::spiral_light(speed),
             ScriptPath::Near => Self::near(speed),
             ScriptPath::Over => Self::over(speed),
+            ScriptPath::OverBrief => Self::over_brief(speed),
         }
     }
 
@@ -1265,29 +1280,53 @@ impl Script {
     /// a turn to ground of its own, the earlier stroke, and the later one along it; then the
     /// chain of three.
     pub(crate) fn over(speed: Speed) -> Self {
-        let mut path = OverPath::new();
         let pairs = Weight::ALL
             .into_iter()
             .flat_map(|weight| Before::ALL.map(|before| (weight, before)));
-        for (weight, before) in pairs {
+        let pairs: Vec<(Weight, Before)> = pairs.collect();
+        Self::over_of(speed, &pairs, Weight::landing, 2.0)
+    }
+
+    /// The brief over path, run at `speed`: the over path cut down to its ordinary cold pair and
+    /// its chain, each given [`BRIEF_LANDING`] to land.
+    ///
+    /// For checking that a run yields an over record (its segments, their touches, what the open
+    /// strokes hold), where nothing is measured: the performance suite's tiny check. Its strokes
+    /// needn't have landed as the next begin.
+    pub(crate) fn over_brief(speed: Speed) -> Self {
+        let pairs = [(Weight::Ordinary, Before::Cold)];
+        Self::over_of(speed, &pairs, |_| BRIEF_LANDING, 0.5)
+    }
+
+    /// An over path run at `speed`: each of `pairs` on ground of its own, then the chain of
+    /// three, each given `landing` (by its earlier stroke's weight) to land, and `settle` seconds
+    /// still at the end.
+    fn over_of(
+        speed: Speed,
+        pairs: &[(Weight, Before)],
+        landing: impl Fn(Weight) -> f64,
+        settle: f64,
+    ) -> Self {
+        let mut path = OverPath::new();
+        for &(weight, before) in pairs {
             path.turn();
             let lift = path.earlier(weight);
             path.segment(Segment::OverFirst, lift + OVER_EDGE);
             let (back, hovering) = match before {
                 Before::Cold => (OVER_GAP, 0.0),
                 Before::Warmed => (OVER_GAP, weight.hover()),
-                Before::Landed => (weight.landing(), 0.3),
+                Before::Landed => (landing(weight), 0.3),
             };
             let lift = path.later(weight, lift + back, hovering);
-            path.segment(Segment::Over(weight, before), lift + weight.landing());
+            path.segment(Segment::Over(weight, before), lift + landing(weight));
         }
         path.turn();
         let first = path.earlier(Weight::Ordinary);
         let second = path.later(Weight::Ordinary, first + OVER_GAP, 0.0);
         path.segment(Segment::OverFirst, second + OVER_EDGE);
         let third = path.later(Weight::Ordinary, second + OVER_GAP, 0.0);
-        path.segment(Segment::OverChain, third + Weight::Ordinary.landing());
-        path.segment(Segment::Settle, path.now + 2.0);
+        path.segment(Segment::OverChain, third + landing(Weight::Ordinary));
+        path.segment(Segment::Settle, path.now + settle);
         let mut script = Self {
             start: START,
             keyframes: path.keyframes,
