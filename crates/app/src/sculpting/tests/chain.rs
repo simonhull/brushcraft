@@ -2158,7 +2158,7 @@ struct Timed {
 }
 
 /// What one run of a timed `Down` took ([`Timed::run`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Took {
     /// Routing the `Down`.
     route: Duration,
@@ -2174,6 +2174,8 @@ struct Took {
     reach: usize,
     /// The hover frames before the `Down`, and what their warming took in all.
     hover: (usize, Duration),
+    /// The steps of the frames after it, each given one more sample of the pen drawing on.
+    later: Vec<Duration>,
 }
 
 impl Timed {
@@ -2208,7 +2210,7 @@ impl Timed {
     /// it would; the futures it made ahead where the earlier stroke's pen lifted are let go, so
     /// a cold `Down` makes every future it reads. A warmed `Down` comes after hover frames at
     /// its pixel ([`Chain::hover`]), so it is over the same dabs as a cold one.
-    fn run(&self, before: Before) -> Took {
+    fn run(&self, before: Before, frames: usize) -> Took {
         let level = Level::new(BACKLOG_LEVEL).expect("a level");
         let config = StoreConfig::new(256 << 20, 1).with_display(level);
         let mut run = Chain::new(Instant::now(), Some(config));
@@ -2241,8 +2243,20 @@ impl Timed {
         } else {
             (0, Duration::ZERO)
         };
-        let down = sample(Phase::Down, at, 0.8);
-        let drag = sample(Phase::Drag, then, 0.8);
+        // The pen's samples are a frame apart on its clock, the last of them taken about now.
+        let interval = setup().interval;
+        let ahead = u32::try_from(frames).expect("a few frames");
+        let earliest = Instant::now().checked_sub(interval * ahead);
+        let earliest = earliest.expect("after the epoch");
+        let at_frame = |mut taken: PenSample, frame: u32| {
+            taken.timestamp = earliest + interval * frame;
+            taken.received = taken.timestamp;
+            taken
+        };
+        let (mut down, mut drag) = (sample(Phase::Down, at, 0.8), sample(Phase::Drag, then, 0.8));
+        if frames > 0 {
+            (down, drag) = (at_frame(down, 0), at_frame(drag, 0));
+        }
         take_made();
         let began = Instant::now();
         let routed = run.route(&down);
@@ -2261,6 +2275,18 @@ impl Timed {
         assert_eq!(run.ops().len(), over, "it began, over the earlier stroke");
         let installed = (by_routing, run.installed().len());
         let made = (made_routing, take_made());
+        // The frames after it, the pen drawing on along its first drag, a sample a frame.
+        let mut later = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let frame = u32::try_from(frame).expect("a few frames");
+            let k = f64::from(frame) + 2.0;
+            let on = (at.0 + (then.0 - at.0) * k, at.1 + (then.1 - at.1) * k);
+            let next = at_frame(sample(Phase::Drag, on, 0.8), frame + 1);
+            let drawn_at = Instant::now();
+            let shown = run.frame(&[next]);
+            later.push(drawn_at.elapsed());
+            assert_eq!(run.brush.error(), None, "the frame is shown: {shown:?}");
+        }
         run.brush.abandon();
         run.close();
         Took {
@@ -2271,6 +2297,7 @@ impl Timed {
             backlog,
             reach,
             hover,
+            later,
         }
     }
 }
@@ -2281,7 +2308,7 @@ impl Timed {
 fn time_downs(name: &str, case: &Timed, befores: &[Before], count: usize) {
     println!("{name} (load {})", load());
     for &before in befores {
-        let runs: Vec<Took> = (0..count).map(|_| case.run(before)).collect();
+        let runs: Vec<Took> = (0..count).map(|_| case.run(before, 0)).collect();
         let of = |part: fn(&Took) -> Duration| -> Vec<Duration> { runs.iter().map(part).collect() };
         let Some(last) = runs.last() else {
             return;
@@ -2307,6 +2334,64 @@ fn time_downs(name: &str, case: &Timed, befores: &[Before], count: usize) {
         "  (load {} after; medians of {count}, least to most)",
         load()
     );
+}
+
+/// Which of the frames after a timed `Down`'s is said as the steady one ([`time_frames`]): the
+/// tenth of the pen drawing on.
+const STEADY_FRAME: usize = 10;
+
+/// Times the frames of a stroke drawn on from `case`'s `Down`: a measurement, asserting nothing
+/// of time.
+///
+/// A sample a frame along its first drag, with the surface under it as each of `befores` says,
+/// `count` times each; prints the medians of its first frame's step and its [`STEADY_FRAME`]th's
+/// with their spread and the machine's load.
+///
+/// The earlier stroke lands nothing meanwhile: every frame shows one more sample's dabs beside
+/// its previews, where the two strokes' previews meet.
+fn time_frames(name: &str, case: &Timed, befores: &[Before], count: usize) {
+    println!("{name} (load {})", load());
+    for &before in befores {
+        let runs: Vec<Took> = (0..count).map(|_| case.run(before, STEADY_FRAME)).collect();
+        let first: Vec<Duration> = runs.iter().map(|took| took.step).collect();
+        let steady = runs.iter().filter_map(|took| took.later.last().copied());
+        let steady: Vec<Duration> = steady.collect();
+        println!(
+            "  {before:?}: its first frame stepped in {}, its frame {STEADY_FRAME} after in {}",
+            spread(&first),
+            spread(&steady),
+        );
+    }
+    println!(
+        "  (load {} after; medians of {count}, least to most)",
+        load()
+    );
+}
+
+/// A measurement, printed and asserting nothing of time: the frames of a stroke drawn along a
+/// stroke still landing.
+///
+/// Its first and one well into it, where every frame's previews meet the earlier stroke's; and
+/// those of the same stroke drawn once the earlier one has landed, alone.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_frame_drawn_over_a_landing_stroke_is_timed() {
+    let befores = [Before::Warmed, Before::Landed];
+    let ordinary = Timed::ordinary(((185.0, 107.5), (188.0, 107.8)));
+    let on_ordinary = "frames drawn on an ordinary stroke's half still to land";
+    time_frames(on_ordinary, &ordinary, &befores, TIMED_RUNS);
+    let on_heavy = "frames drawn on a heavy stroke";
+    time_frames(on_heavy, &Timed::heavy(), &[Before::Warmed], TIMED_RUNS);
+}
+
+/// The reference of `a_frame_drawn_over_a_landing_stroke_is_timed`'s heavy case: the same frames
+/// once the heavy stroke has landed, a stroke alone. Apart, as landing the heavy stroke each time
+/// takes long.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_frame_drawn_once_a_heavy_stroke_has_landed_is_timed() {
+    let name = "frames drawn once a heavy stroke has landed";
+    time_frames(name, &Timed::heavy(), &[Before::Landed], LANDED_RUNS);
 }
 
 /// A measurement, printed and asserting nothing of time: a heavy stroke, then at once a stroke
