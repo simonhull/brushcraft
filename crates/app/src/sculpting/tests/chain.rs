@@ -2267,7 +2267,12 @@ struct Timed {
     half_landed: bool,
     /// Where the pen comes down, and its first drag.
     pen: ((f64, f64), (f64, f64)),
+    /// The store's budget, in bytes.
+    budget: usize,
 }
+
+/// The store's budget in the timed cases, unless one says another: the tests' own.
+const TIMED_BUDGET: usize = 256 << 20;
 
 /// What one run of a timed `Down` took ([`Timed::run`]).
 #[derive(Debug, Clone)]
@@ -2288,6 +2293,8 @@ struct Took {
     hover: (usize, Duration),
     /// The steps of the frames after it, each given one more sample of the pen drawing on.
     later: Vec<Duration>,
+    /// The most the open strokes held, over its frames.
+    held: Held,
 }
 
 impl Timed {
@@ -2301,6 +2308,7 @@ impl Timed {
             earlier,
             half_landed: false,
             pen: ((160.0, 105.0), (163.0, 105.5)),
+            budget: TIMED_BUDGET,
         }
     }
 
@@ -2312,6 +2320,7 @@ impl Timed {
             earlier: stroke(((110.0, 100.0), (210.0, 110.0)), 60),
             half_landed: true,
             pen,
+            budget: TIMED_BUDGET,
         }
     }
 
@@ -2324,7 +2333,7 @@ impl Timed {
     /// its pixel ([`Chain::hover`]), so it is over the same dabs as a cold one.
     fn run(&self, before: Before, frames: usize) -> Took {
         let level = Level::new(BACKLOG_LEVEL).expect("a level");
-        let config = StoreConfig::new(256 << 20, 1).with_display(level);
+        let config = StoreConfig::new(self.budget, 1).with_display(level);
         let mut run = Chain::new(Instant::now(), Some(config));
         run.build_display();
         if let Some(radius) = self.radius {
@@ -2387,6 +2396,7 @@ impl Timed {
         assert_eq!(run.ops().len(), over, "it began, over the earlier stroke");
         let installed = (by_routing, run.installed().len());
         let made = (made_routing, take_made());
+        let mut held = Held::of(&mut run);
         // The frames after it, the pen drawing on along its first drag, a sample a frame.
         let mut later = Vec::with_capacity(frames);
         for frame in 0..frames {
@@ -2398,6 +2408,7 @@ impl Timed {
             let shown = run.frame(&[next]);
             later.push(drawn_at.elapsed());
             assert_eq!(run.brush.error(), None, "the frame is shown: {shown:?}");
+            held = held.most(Held::of(&mut run));
         }
         run.brush.abandon();
         run.close();
@@ -2410,6 +2421,7 @@ impl Timed {
             reach,
             hover,
             later,
+            held,
         }
     }
 }
@@ -2960,4 +2972,452 @@ fn futures_made_ahead_are_read_only_over_their_own_store_with_the_oldest_strokes
     assert!(run.brush.ahead.tiles.is_empty(), "let go by a flush");
     other.close();
     run.close();
+}
+
+/// The level of the wide timed cases: 16 × 16 tiles a face, 6,144 on the sphere.
+///
+/// Some 800 of them lie on the face the camera sees: more than the stroke's state has buffers
+/// for ([`StoreConfig::DEFAULT_STROKE_TILES`], 512). A level lower, a stroke over the whole face
+/// reaches 204.
+const WIDE_LEVEL: u8 = 10;
+
+/// The brush's radius in the wide timed cases, in pixels: a dab reaches a dozen or so tiles.
+const WIDE_RADIUS: f32 = 6.0;
+
+/// The middle of the sphere's face as the default camera sees it and how far from it the wide
+/// cases' raster runs, in pixels: most of the face, short of its limb.
+const WIDE_FACE: ((f64, f64), f64) = ((160.0, 102.0), 56.0);
+
+/// How far apart the passes of the wide cases' first raster are, in pixels: one coarse sweep of
+/// the face, whose dabs land and fill the stroke's state.
+const WIDE_SWEEP: f64 = 5.0;
+
+/// How far apart the passes of the wide cases' second raster are, in pixels: the backlog, some
+/// 26,000 dabs over every tile of the face (the plan asks for 16,000: the harder case).
+const WIDE_BACKLOG: f64 = 0.42;
+
+/// The store's budget in the wide timed cases: the app's default.
+const WIDE_BUDGET: usize = 2048 << 20;
+
+/// How many times each of the wide case's parts is timed
+/// (`futures_over_a_full_stroke_state_are_timed`).
+const WIDE_TIMES: usize = 21;
+
+/// How many times the wide case's `Down` is drawn, each over a backlog placed afresh
+/// (`a_down_over_a_full_stroke_state_is_timed`).
+const WIDE_RUNS: usize = 5;
+
+/// A raster over the sphere's face ([`WIDE_FACE`]): passes across it `apart` pixels apart, top
+/// to bottom, each the other way from the last, a sample every 2.5 pixels; every sample a drag.
+fn raster(apart: f64) -> Vec<PenSample> {
+    let ((across, down), reach) = WIDE_FACE;
+    // How many steps of `step` pixels fit `span` pixels, the first at its start.
+    let steps = |span: f64, step: f64| {
+        let counted = (0_u32..).take_while(move |&k| f64::from(k) * step <= span);
+        counted.map(move |k| f64::from(k) * step)
+    };
+    let mut samples = Vec::new();
+    let passes = steps(2.0 * reach, apart).zip([false, true].into_iter().cycle());
+    for (lower, backwards) in passes {
+        let off = lower - reach;
+        let half = (reach.powi(2) - off.powi(2)).max(0.0).sqrt();
+        let along = steps(2.0 * half, 2.5);
+        let mut pass: Vec<PenSample> = along
+            .map(|x| sample(Phase::Drag, (across - half + x, down + off), 0.8))
+            .collect();
+        if backwards {
+            pass.reverse();
+        }
+        samples.extend(pass);
+    }
+    samples
+}
+
+/// The wide timed case, drawn: one stroke over the sphere's face on 16 × 16 tiles a face, under a
+/// store of `budget` bytes.
+///
+/// Its first sweep of the face has landed, so the stroke's state holds as many tiles as it has
+/// buffers for; its second, some 26,000 dabs over the same tiles, is placed and shown and none of
+/// it landed; its pen is up, and what a later stroke reads of it is made. More tiles than the
+/// state has buffers for are still to be edited, so the state's decisions for them are made dab
+/// by dab ([`Futures::continuous`] says no).
+fn wide(budget: usize) -> Chain {
+    let level = Level::new(WIDE_LEVEL).expect("a level");
+    let config = StoreConfig::new(budget, 1).with_display(level);
+    // The backlog's samples are a minute's worth at the pen's rate, taken up to now.
+    let epoch = Instant::now().checked_sub(Duration::from_secs(600));
+    let mut run = Chain::new(epoch.expect("ten minutes up"), Some(config));
+    run.build_display();
+    run.brush.set_radius(WIDE_RADIUS);
+    let (coarse, dense) = (raster(WIDE_SWEEP), raster(WIDE_BACKLOG));
+    let swept = coarse.len();
+    let mut samples: Vec<PenSample> = coarse.into_iter().chain(dense).collect();
+    if let Some(down) = samples.first_mut() {
+        down.phase = Phase::Down;
+    }
+    samples.push(sample(Phase::Up, WIDE_FACE.0, 0.0));
+    let samples = taken_up_to_now(samples);
+    let (touch, rest) = samples.split_at(2);
+    let (sweep, backlog) = rest.split_at(swept - 2);
+    // Its op begun and its cut taken, the first sweep lands as it is drawn.
+    run.frame(touch);
+    run.cut();
+    run.brush.cost = DabCost::any_number();
+    run.frame(sweep);
+    assert_eq!(
+        run.rows().first().map_or(0, Vec::len),
+        0,
+        "the sweep landed"
+    );
+    run.brush.cost = DabCost::one_at_a_time();
+    run.frame(backlog);
+    run.prepare();
+    run.brush.ahead.clear();
+    assert_eq!(run.brush.error(), None);
+    let buffers = run.project.store().stroke_tiles();
+    assert_eq!(
+        run.brush.state.tiles_held(),
+        buffers,
+        "the stroke's state is full"
+    );
+    run
+}
+
+/// The tiles the oldest stroke's dabs still to land reach, those most dabs reach first, each
+/// with how many.
+fn busiest(run: &Chain) -> Vec<(usize, TileKey)> {
+    let earlier = run.brush.strokes.first();
+    let remaining = earlier.and_then(|earlier| earlier.remaining.as_ref());
+    let mut tiles: Vec<(usize, TileKey)> = remaining.map_or_else(Vec::new, |remaining| {
+        let reached = remaining.reach.iter();
+        reached.map(|(key, reach)| (reach.dabs, *key)).collect()
+    });
+    tiles.sort_unstable();
+    tiles.reverse();
+    tiles
+}
+
+/// Makes the future of every tile of `keys` twice over, and prints what became of their
+/// predictions.
+///
+/// A workers' batch at a time, in key order as a `Down` asks for them; each time, how many the
+/// store had kept as their batch came, how many it kept as the batch ended and as the pass did,
+/// and what making them took of the pass (each batch's made first, as its futures would make
+/// them).
+fn time_predictions(store: &mut TileStore, futures: &Futures<'_>, keys: &[TileKey]) {
+    let workers = store.workers();
+    let kept = |held: &TileStore, batch: &[TileKey]| {
+        let kept = batch
+            .iter()
+            .filter(|key| held.kept_prediction(key).is_some());
+        kept.count()
+    };
+    for pass in ["first", "second"] {
+        let (mut had, mut keeps, mut batches) = (0, 0, 0);
+        let mut predicting = Duration::ZERO;
+        let began = Instant::now();
+        for batch in keys.chunks(workers) {
+            had += kept(store, batch);
+            let pinned = store.pin(batch).expect("the batch pinned");
+            let predicted = Instant::now();
+            let together = store.keep_predictions_of(batch);
+            predicting += predicted.elapsed();
+            drop(pinned);
+            assert!(together.is_ok(), "kept together: {together:?}");
+            let made = futures.futures_of(store, batch);
+            assert!(made.iter().all(Result::is_ok), "every future made");
+            keeps += kept(store, batch);
+            batches += 1;
+        }
+        let took = began.elapsed();
+        let still = kept(store, keys);
+        println!(
+            "  the {pass} pass over all {} tiles, {batches} batches of {workers}, in {took:.2?} \
+             ({predicting:.2?} of it making predictions): {had} predictions the store had kept, \
+             {} made afresh; {keeps} kept as their batch ended, {still} still kept as the pass \
+             did",
+            keys.len(),
+            keys.len() - had,
+        );
+    }
+}
+
+/// A measurement, printed and asserting nothing of time: the futures of a stroke whose state is
+/// full, at a held-tile count as a long stroke on a real model has it (the stroke-while-landing
+/// plan, Task 7).
+///
+/// On a sphere of 6,144 tiles, some 800 of them under the stroke: making the chain's [`Futures`]
+/// (the stroke state's decisions for every dab still to land, as more tiles are to be edited
+/// than it has buffers: afresh, and as the stroke's edits keep them), one future (the tile most
+/// dabs reach, and one at the middle), a workers' batch of the busiest, and what becomes of the
+/// predictions as every tile reached has its future made, a workers' batch at a time: how many
+/// the store had kept, how many it keeps after, and what making them takes of the pass.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn futures_over_a_full_stroke_state_are_timed() {
+    println!("futures over a full stroke state (load {})", load());
+    let mut run = wide(WIDE_BUDGET);
+    let tiles = busiest(&run);
+    let backlog = run.rows().first().map_or(0, Vec::len);
+    let chain = chain_of(&run.brush.strokes).expect("what a later stroke reads is made");
+    let state = &run.brush.state;
+    let store = run.project.store();
+    let (held, buffers, workers) = (state.tiles_held(), store.stroke_tiles(), store.workers());
+    // The plan and its decisions: made afresh for a copy of the stroke's edits, which keeps
+    // none; kept by the stroke's own from the first time they were made.
+    let copies: Vec<sculpt::StrokeEdits> = chain.iter().map(|&edits| edits.clone()).collect();
+    let afresh: Vec<&sculpt::StrokeEdits> = copies.iter().collect();
+    let decided = {
+        let began = Instant::now();
+        drop(Futures::new(store, state, &afresh).expect("a chain"));
+        began.elapsed()
+    };
+    let futures_of = |over: &TileStore| Futures::new(over, state, &chain).expect("a chain");
+    let mut built = Vec::with_capacity(WIDE_TIMES);
+    for _ in 0..WIDE_TIMES {
+        let began = Instant::now();
+        let futures = futures_of(store);
+        built.push(began.elapsed());
+        drop(futures);
+    }
+    let futures = futures_of(store);
+    let by_dab: Vec<bool> = futures.continuous().iter().map(|fast| !fast).collect();
+    println!(
+        "  {backlog} dabs still to land on {} tiles, the stroke's state holding {held} of \
+         {buffers}; decided dab by dab: {by_dab:?}; the futures built in {decided:.2?} with \
+         their decisions made afresh, and in {} with them kept",
+        tiles.len(),
+        spread(&built),
+    );
+    // One future: the tile most dabs reach, then the one at the middle of them.
+    let picked = [tiles.first(), tiles.get(tiles.len() / 2)];
+    for &(dabs, key) in picked.into_iter().flatten() {
+        let mut made = Vec::with_capacity(WIDE_TIMES);
+        for _ in 0..WIDE_TIMES {
+            let began = Instant::now();
+            futures.future_of(store, key).expect("a future");
+            made.push(began.elapsed());
+        }
+        println!(
+            "  one future, of a tile {dabs} dabs reach: {}",
+            spread(&made)
+        );
+    }
+    // A workers' batch: what a cold `Down` over the busiest tiles waits for, a batch at a time.
+    let batch: Vec<TileKey> = tiles.iter().take(workers).map(|&(_, key)| key).collect();
+    let mut together = Vec::with_capacity(WIDE_TIMES);
+    for _ in 0..WIDE_TIMES {
+        let began = Instant::now();
+        let made = futures.futures_of(store, &batch);
+        together.push(began.elapsed());
+        assert!(made.iter().all(Result::is_ok), "every future made");
+    }
+    println!(
+        "  the {} busiest together, a workers' batch: {}",
+        batch.len(),
+        spread(&together)
+    );
+    let mut keys: Vec<TileKey> = tiles.iter().map(|&(_, key)| key).collect();
+    keys.sort_unstable();
+    time_predictions(store, &futures, &keys);
+    drop(futures);
+    println!(
+        "  (load {} after; medians of {WIDE_TIMES}, least to most)",
+        load()
+    );
+    run.brush.abandon();
+    run.close();
+}
+
+/// What the open strokes hold of a store, as a measurement says it.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    /// The open strokes' pen-down data, in bytes ([`TileStore::pen_down_bytes`]).
+    bytes: usize,
+    /// What the stitches' tables hold of it between calls, in bytes.
+    seams: usize,
+    /// What the open strokes may hold together ([`TileStore::open_strokes_share`]).
+    share: usize,
+    /// Whether a `Down` waited for want of it.
+    waited: bool,
+}
+
+impl Held {
+    /// What `run`'s open strokes hold now.
+    fn of(run: &mut Chain) -> Self {
+        let seams = run.brush.preview.as_ref().map_or(0, Preview::seam_bytes);
+        let waited = !run.brush.deferred.is_empty();
+        let store = run.project.store();
+        Self {
+            bytes: store.pen_down_bytes(),
+            seams,
+            share: store.open_strokes_share(),
+            waited,
+        }
+    }
+
+    /// The more of this and `other`, by the bytes held.
+    fn most(self, other: Self) -> Self {
+        Self {
+            waited: self.waited || other.waited,
+            ..if other.bytes > self.bytes {
+                other
+            } else {
+                self
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let part = 100.0 * mib(self.bytes) / mib(self.share).max(f64::MIN_POSITIVE);
+        write!(
+            f,
+            "{:.1} MiB held ({:.1} MiB of it the seam tables) of a share of {:.0} MiB: {part:.1} %{}",
+            mib(self.bytes),
+            mib(self.seams),
+            mib(self.share),
+            if self.waited { ", A DOWN WAITED" } else { "" }
+        )
+    }
+}
+
+/// A `Down` on the middle of the sphere's face and `frames` frames of the pen drawing on.
+///
+/// A sample a frame, as [`Timed::run`] draws them: the routing's time, the first step's, the
+/// futures made in each, and the most the open strokes held ([`Held::waited`] if the `Down`
+/// waited for the stroke before it, past their share: nothing of it is shown then).
+fn down_and_draw(run: &mut Chain, frames: u32) -> (Duration, Duration, (usize, usize), Held) {
+    let (at, by) = (WIDE_FACE.0, (0.6, 0.1));
+    let down = sample(Phase::Down, at, 0.8);
+    let drag = sample(Phase::Drag, (at.0 + by.0, at.1 + by.1), 0.8);
+    take_made();
+    let began = Instant::now();
+    let routed = run.route(&down);
+    let route = began.elapsed();
+    assert_eq!(routed, Route::Brush, "on the surface");
+    let made_routing = take_made();
+    let stepped = Instant::now();
+    let first = run.frame(&[down, drag]);
+    let step = stepped.elapsed();
+    let made = (made_routing, take_made());
+    let mut held = Held::of(run);
+    assert!(
+        held.waited || first.dabs_shown > 0,
+        "its first dab is shown, unless it waits: {first:?}"
+    );
+    for frame in 2..frames + 2 {
+        let on = (
+            at.0 + by.0 * f64::from(frame),
+            at.1 + by.1 * f64::from(frame),
+        );
+        run.frame(&[sample(Phase::Drag, on, 0.8)]);
+        run.prepare();
+        held = held.most(Held::of(run));
+    }
+    assert_eq!(run.brush.error(), None);
+    (route, step, made, held)
+}
+
+/// A measurement, printed and asserting nothing of time: a cold `Down` over a full stroke state.
+///
+/// Over the busiest tiles of a stroke whose state is full, on a sphere of 6,144 tiles (the
+/// stroke-while-landing plan, Task 7), and what the open strokes hold as the pen draws on from
+/// it.
+#[test]
+#[ignore = "a measurement, printed: run it alone on a quiet machine, with --no-capture"]
+fn a_down_over_a_full_stroke_state_is_timed() {
+    println!("a Down over a full stroke state (load {})", load());
+    let mut routes = Vec::with_capacity(WIDE_RUNS);
+    let mut steps = Vec::with_capacity(WIDE_RUNS);
+    for _ in 0..WIDE_RUNS {
+        let mut run = wide(WIDE_BUDGET);
+        let backlog = run.rows().first().map_or(0, Vec::len);
+        let reached = busiest(&run).len();
+        let (route, step, made, held) = down_and_draw(&mut run, 10);
+        assert!(!held.waited, "it began over the stroke: {held}");
+        println!(
+            "  over {backlog} dabs still to land on {reached} tiles: routed in {route:.2?} ({} \
+             futures made), stepped to its first dab in {step:.2?} ({} more made), {} installed \
+             ten frames on; {held}",
+            made.0,
+            made.1,
+            run.installed().len(),
+        );
+        routes.push(route);
+        steps.push(step);
+        run.brush.abandon();
+        run.close();
+    }
+    println!(
+        "  routed in {}, stepped in {} (load {} after; medians of {WIDE_RUNS}, least to most)",
+        spread(&routes),
+        spread(&steps),
+        load()
+    );
+}
+
+/// A measurement, printed and asserting nothing: what the open strokes hold of their share.
+///
+/// At its most ([`TileStore::pen_down_bytes`] against [`TileStore::open_strokes_share`], the seam
+/// tables counted in it), on the timed cases, under the app's default budget and a lean one.
+///
+/// The ordinary and the heavy stroke with a stroke drawn over each after a hover (the futures
+/// made ahead are kept beside the store, so they aren't in the count until the `Down` installs
+/// them); three strokes in a chain; and the stroke whose state is full. Nothing lands meanwhile,
+/// as in the other timed cases: every stroke holds all it ever does.
+#[test]
+#[ignore = "a measurement, printed: run it alone, with --no-capture"]
+fn what_the_open_strokes_hold_is_measured() {
+    println!("what the open strokes hold");
+    for budget in [WIDE_BUDGET, 256 << 20] {
+        println!("  under a budget of {:.0} MiB:", mib(budget));
+        let cases = [
+            (
+                "the ordinary stroke",
+                Timed::ordinary(((185.0, 107.5), (188.0, 107.8))),
+            ),
+            ("the heavy stroke", Timed::heavy()),
+        ];
+        for (name, case) in cases {
+            let case = Timed { budget, ..case };
+            let took = case.run(Before::Warmed, STEADY_FRAME);
+            println!(
+                "    {name} and one over it, over {} dabs on {} tiles: {}",
+                took.backlog, took.reach, took.held
+            );
+        }
+        let (under_way, chained) = held_by_three(budget);
+        println!("    three in a chain ({under_way} under way): {chained}");
+        // The stroke whose state is full, and one over it.
+        let mut run = wide(budget);
+        let alone = Held::of(&mut run);
+        let (_, _, _, over) = down_and_draw(&mut run, 10);
+        println!("    the wide stroke alone: {alone}");
+        println!("    the wide stroke and one over it: {over}");
+        run.brush.abandon();
+        run.close();
+    }
+}
+
+/// Three strokes in a chain under a store of `budget` bytes: the heavy stroke, one crossing it
+/// and one over both. How many are under way at the end, and the most they held.
+fn held_by_three(budget: usize) -> (usize, Held) {
+    let level = Level::new(BACKLOG_LEVEL).expect("a level");
+    let config = StoreConfig::new(budget, 1).with_display(level);
+    let mut run = Chain::new(Instant::now(), Some(config));
+    run.build_display();
+    let mut heavy = to_and_fro(64);
+    heavy.push(sample(Phase::Up, ACROSS.0, 0.0));
+    let mut held = Held::of(&mut run);
+    for samples in [heavy, crossing(), over_both()] {
+        run.frame(&samples);
+        run.prepare();
+        held = held.most(Held::of(&mut run));
+    }
+    let under_way = run.ops().len();
+    run.brush.abandon();
+    run.close();
+    (under_way, held)
 }

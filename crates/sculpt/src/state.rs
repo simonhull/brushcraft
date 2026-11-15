@@ -371,9 +371,10 @@ impl Stroke {
         self.end_dab(store);
     }
 
-    /// How many tiles' state the stroke holds now.
-    #[cfg(test)]
-    pub(crate) fn tiles_held(&self) -> usize {
+    /// How many tiles' state the stroke holds now: for tests and measurements.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn tiles_held(&self) -> usize {
         self.tiles.len()
     }
 

@@ -1029,6 +1029,14 @@ impl Preview {
         self.neighbours.len() + self.finest_places.len() + self.border_places.len()
     }
 
+    /// About the bytes the stitches' tables hold between calls, as counted with the open
+    /// strokes' pen-down data ([`TileStore::pen_down_bytes`]): for tests and measurements.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub const fn seam_bytes(&self) -> usize {
+        self.seam_bytes
+    }
+
     /// Makes the previews of different strokes meet bit for bit where `seeds`, the finest tiles
     /// the call made, kept or cleared, and the display tiles it handed over lie (see "Seams" in
     /// the module notes): at a vertex previews of different strokes hold, every one draws the
