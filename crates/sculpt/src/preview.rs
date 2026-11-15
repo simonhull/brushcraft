@@ -523,7 +523,7 @@ impl Winners {
                 stitched = Some(moved);
             }
         }
-        let drawn_as = newer.iter().map(|&(_, place, _)| place).collect();
+        let drawn_as: Vec<Place> = newer.iter().map(|&(_, place, _)| place).collect();
         Some(Stitched {
             key: *key,
             drawn_as,
@@ -2687,16 +2687,33 @@ impl Preview {
 /// its roughness, its bound and whether it is held. A renderer handed one has the other.
 ///
 /// Bits, not values: a `-0.0` for a `0.0` is another preview, and a NaN equals itself.
+///
+/// Each is taken apart field by field: a field added to a display preview doesn't compile here
+/// until it is compared too.
 fn same_bits(a: &DisplayPreview, b: &DisplayPreview) -> bool {
     let same = |these: &[Vec3], those: &[Vec3]| {
         let mut pairs = these.iter().zip(those);
         these.len() == those.len() && pairs.all(|(p, q)| p.to_bits() == q.to_bits())
     };
-    a.held == b.held
-        && a.bound.to_bits() == b.bound.to_bits()
-        && a.roughness == b.roughness
-        && same(&a.positions, &b.positions)
-        && same(&a.normals, &b.normals)
+    let DisplayPreview {
+        positions,
+        normals,
+        roughness,
+        bound,
+        held,
+    } = a;
+    let DisplayPreview {
+        positions: other_positions,
+        normals: other_normals,
+        roughness: other_roughness,
+        bound: other_bound,
+        held: other_held,
+    } = b;
+    held == other_held
+        && bound.to_bits() == other_bound.to_bits()
+        && roughness == other_roughness
+        && same(positions, other_positions)
+        && same(normals, other_normals)
 }
 
 /// The tiles `keys`, gathered with their rings, as tiles to move, with their pen-down blocks: each
