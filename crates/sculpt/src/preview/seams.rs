@@ -152,6 +152,16 @@ impl Shared {
         let slots = slots.collect();
         Some(Self { block, slots })
     }
+
+    /// About the bytes it holds: its block's points and its slots.
+    pub(super) fn bytes(&self) -> usize {
+        let rings = (0..4).filter_map(|c| self.block.corner(c));
+        let ring_points: usize = rings
+            .map(|ring| ring.edges().len() + ring.diagonals().len())
+            .sum();
+        let points = self.block.padded().len() + ring_points;
+        size_of::<Self>() + points * size_of::<Vec3>() + size_of_val(self.slots.as_slice())
+    }
 }
 
 /// Every point `block` holds, in order: its positions with the ring, then each corner ring's

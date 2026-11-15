@@ -114,10 +114,12 @@
 //! A stitch looks at the previews about the tiles its call changed, and what it looks up there
 //! is kept from call to call, until the last stroke ends: which tiles lie around each preview
 //! (`Neighbours`) and where each preview's vertices lie on the faces' grids (the `seams`
-//! module), both set by the mesh alone, so nothing a dab or a landing does makes them stale.
+//! module), both set by the mesh alone, so nothing a dab or a landing does makes them stale,
+//! and both counted in the store's budget with the previews' states.
 //! Which previews hold a vertex, whose they are and what they draw there is asked afresh by
 //! every stitch. A caller that knows where a stroke is about to begin over those landing has
-//! them noted ahead ([`Preview::warm_seams`]).
+//! them noted ahead ([`Preview::warm_seams`]), and lets go of those no preview came to hold
+//! once that place is left ([`Preview::let_go_unheld_seams`]).
 //!
 //! # Which tiles
 //!
@@ -180,6 +182,10 @@ pub const WAITING_A_CALL: usize = 8;
 
 /// What a set's node keeps for each key in [`Readers::by_display`], beside the key: an estimate.
 const READER_BYTES: usize = 16;
+
+/// About what a map of the stitches' keeps for a tile beside what is noted for it: its key and
+/// its node's share.
+const SEAM_NODE_BYTES: usize = size_of::<TileKey>() + READER_BYTES;
 
 /// The most tiles [`Preview::make_waiting`] tries a call, counting those that get no preview.
 const WAITING_TRIES: usize = 4 * WAITING_A_CALL;
@@ -382,6 +388,10 @@ pub struct Preview {
     /// Per preview a call looked around, the tiles whose previews may hold a vertex it holds
     /// ([`Neighbours`]).
     neighbours: BTreeMap<TileKey, Neighbours>,
+    /// About the bytes `finest_places`, `border_places` and `neighbours` hold, kept up as they
+    /// are noted and let go ([`Preview::seams_counted`] counts them afresh): told to the store
+    /// with the display previews' states ([`Preview::note_bytes`]).
+    seam_bytes: usize,
 }
 
 /// A display preview being handed to the store ([`Preview::publish`]): whether it is held, its
@@ -412,6 +422,26 @@ struct Neighbours {
     finest: Vec<TileKey>,
     /// The display tiles above them, in key order, each once.
     display: Vec<TileKey>,
+}
+
+impl Neighbours {
+    /// About the bytes it holds, its place in the map included.
+    fn bytes(&self) -> usize {
+        let tiles = self.finest.len() + self.display.len();
+        SEAM_NODE_BYTES + size_of::<Self>() + tiles * size_of::<TileKey>()
+    }
+}
+
+/// About the bytes a finest tile's places `shared` hold in [`Preview::finest_places`], their
+/// place in the map included; a tile whose region can't be gathered keeps its place alone.
+fn places_bytes(shared: Option<&seams::Shared>) -> usize {
+    SEAM_NODE_BYTES + shared.map_or(size_of::<Option<seams::Shared>>(), seams::Shared::bytes)
+}
+
+/// About the bytes a display tile's border places `border` hold in [`Preview::border_places`],
+/// their place in the map included.
+fn border_bytes(border: &[(usize, Place)]) -> usize {
+    SEAM_NODE_BYTES + size_of::<Vec<(usize, Place)>>() + size_of_val(border)
 }
 
 /// What each place the previews around a call's seams hold shows ([`Preview::choose`]): built
@@ -823,6 +853,7 @@ impl Preview {
             finest: finest.into_iter().collect(),
             display: above.into_iter().collect(),
         };
+        self.seam_bytes += neighbours.bytes();
         self.neighbours.insert(*key, neighbours);
         Ok(())
     }
@@ -863,12 +894,53 @@ impl Preview {
             .partition(|key| key.channel() == geom::Channel::DISPLAY);
         if !finest.is_empty() {
             let shared = store.par_map(&finest, |key| seams::Shared::of(mesh, key));
+            let noted = shared.iter().map(|places| places_bytes(places.as_ref()));
+            self.seam_bytes += noted.sum::<usize>();
             self.finest_places.extend(finest.into_iter().zip(shared));
         }
         if !display.is_empty() {
             let borders = store.par_map(&display, |key| seams::border_places(mesh, key));
+            let noted = borders.iter().map(|border| border_bytes(border));
+            self.seam_bytes += noted.sum::<usize>();
             self.border_places.extend(display.into_iter().zip(borders));
         }
+    }
+
+    /// About the bytes the stitches' tables hold, counted afresh: what `seam_bytes` is kept at.
+    fn seams_counted(&self) -> usize {
+        let around: usize = self.neighbours.values().map(Neighbours::bytes).sum();
+        let finest = self.finest_places.values();
+        let finest: usize = finest.map(|places| places_bytes(places.as_ref())).sum();
+        let display = self.border_places.values();
+        let display: usize = display.map(|border| border_bytes(border)).sum();
+        around + finest + display
+    }
+
+    /// Lets go of what the stitches keep for every tile with no preview (see "Seams" in the
+    /// module notes), and tells the store what is left.
+    ///
+    /// **The rule:** what is kept for a tile (the tiles around it, its places) follows from
+    /// the mesh alone and is noted again by whichever call next looks it up, so any of it may
+    /// be let go at any time and nothing shown changes. It is kept for the tiles previewed,
+    /// whose stitches read it every call, and for those noted ahead of a stroke about to begin
+    /// ([`Preview::warm_seams`]) until the caller says that place is left: a pen hovering on
+    /// would otherwise leave some megabytes behind at every place it rested, held until the
+    /// last stroke ends.
+    pub fn let_go_unheld_seams(&mut self, store: &mut TileStore) {
+        let (reached, displays) = (&self.reached, &self.displays);
+        let held = |key: &TileKey| {
+            if key.channel() == geom::Channel::DISPLAY {
+                displays.contains_key(key)
+            } else {
+                let showing = reached.get(key).map(|tile| tile.showing);
+                matches!(showing, Some(Showing::Of(_)))
+            }
+        };
+        self.neighbours.retain(|key, _| held(key));
+        self.finest_places.retain(|key, _| held(key));
+        self.border_places.retain(|key, _| held(key));
+        self.seam_bytes = self.seams_counted();
+        self.note_bytes(store);
     }
 
     /// Notes ahead what the stitches about finest tiles `tiles` look up (see "Seams" in the
@@ -880,7 +952,11 @@ impl Preview {
     /// Nothing shown changes, and nothing a later call does: what is noted follows from the
     /// mesh alone, and a stitch notes whatever it finds missing. A tile whose neighbours can't
     /// be listed is passed over, for the stitch to say. Nothing is noted while no dab is shown.
-    pub fn warm_seams(&mut self, store: &TileStore, tiles: &[TileKey]) {
+    ///
+    /// What is noted is counted in the store's budget with the previews' states, and kept
+    /// until the last stroke ends or the caller lets go of what no preview holds
+    /// ([`Preview::let_go_unheld_seams`]).
+    pub fn warm_seams(&mut self, store: &mut TileStore, tiles: &[TileKey]) {
         if self.shown.is_empty() {
             return;
         }
@@ -900,6 +976,7 @@ impl Preview {
             let _unlisted = self.note_neighbours(store, key);
         }
         self.note_places(store, &near);
+        self.note_bytes(store);
     }
 
     /// Forgets what the stitches keep between calls (see "Seams" in the module notes: the
@@ -910,6 +987,7 @@ impl Preview {
         self.neighbours.clear();
         self.finest_places.clear();
         self.border_places.clear();
+        self.seam_bytes = 0;
     }
 
     /// How many previews have something kept for the stitches to come
@@ -1281,7 +1359,8 @@ impl Preview {
         reserved.collect()
     }
 
-    /// Tells the store what the display previews' states hold, for its budget.
+    /// Tells the store what the display previews' states hold, and what the stitches keep
+    /// between calls (`seam_bytes`), for its budget.
     fn note_bytes(&self, store: &mut TileStore) {
         let states: usize = self.displays.values().map(DisplayState::bytes).sum();
         let sets = self
@@ -1291,7 +1370,8 @@ impl Preview {
         let lists = sets.map(BTreeSet::len);
         let readers = lists.sum::<usize>() * (size_of::<TileKey>() + READER_BYTES);
         let stroke = self.stroke.len() * size_of::<Imprint>();
-        store.note_preview_state_bytes(states + readers + stroke + self.dab_index.bytes());
+        let dabs = stroke + self.dab_index.bytes();
+        store.note_preview_state_bytes(states + readers + dabs + self.seam_bytes);
     }
 
     /// Adds `dab`, of stroke `op`, to the strokes' dabs, and its strength to the overlaps of
@@ -1447,6 +1527,7 @@ impl Preview {
         self.display_seeds.clear();
         self.finest_places.clear();
         self.neighbours.clear();
+        self.seam_bytes = 0;
         self.finest_subs.clear();
         self.display_subs.clear();
         store.take_pen_down_added();

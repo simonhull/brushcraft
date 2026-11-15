@@ -638,3 +638,63 @@ fn a_preview_over_dabs_its_stroke_landed_differs_from_what_lands_only_by_the_enc
     );
     drop(project.close(false));
 }
+
+#[test]
+fn what_the_stitches_keep_is_counted_in_the_stores_budget_and_let_go_where_no_preview_holds_it() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, index, _) = open_copy(&dir, &base, "seams");
+    let dabs = path(project.store(), 8);
+    let store = project.store();
+    let mut preview = Preview::new();
+    preview.show(store, &index, &dabs, &finest_only).unwrap();
+    assert_eq!(
+        preview.seam_bytes, 0,
+        "one stroke's previews: no stitch, nothing kept"
+    );
+    let before = store.pen_down_bytes();
+    // Noted ahead about every tile of the sphere, far more than the stroke previews.
+    let every: Vec<TileKey> = (0..6_u32)
+        .flat_map(|face| (0..4_u16).map(move |n| (face, n % 2, n / 2)))
+        .map(|(face, tx, ty)| TileKey::displacement(FaceId::new(face), level(), tx, ty).unwrap())
+        .collect();
+    preview.warm_seams(store, &every);
+    let noted = preview.seam_bytes;
+    assert_eq!(noted, preview.seams_counted(), "kept up as they are noted");
+    assert_eq!(
+        store.pen_down_bytes() - before,
+        noted,
+        "counted in the store"
+    );
+    assert_eq!(
+        preview.finest_places.len(),
+        every.len(),
+        "every tile's places"
+    );
+    // A tile of 64 quads with its ring: 67 points a side, 12 bytes each, and its slots.
+    let least = every.len() * 67 * 67 * size_of::<Vec3>();
+    assert!(noted > least, "{noted} bytes for {} tiles", every.len());
+    let previewed: Vec<TileKey> = store.previewed().copied().collect();
+    assert!(previewed.len() < every.len(), "not every tile is previewed");
+    // The place left: only what the previews hold stays, and the count follows.
+    preview.let_go_unheld_seams(store);
+    let kept: Vec<TileKey> = preview.finest_places.keys().copied().collect();
+    assert_eq!(kept, previewed, "the previewed tiles' places stay");
+    assert!(
+        preview.border_places.is_empty(),
+        "no display tile is previewed"
+    );
+    let around: Vec<TileKey> = preview.neighbours.keys().copied().collect();
+    assert_eq!(around, previewed, "and the tiles around them");
+    let left = preview.seam_bytes;
+    assert!(left > 0 && left < noted, "{left} of {noted} bytes left");
+    assert_eq!(left, preview.seams_counted(), "kept up as they are let go");
+    assert_eq!(store.pen_down_bytes() - before, left, "and in the store");
+    // Noted again where it is looked up: the same count as before.
+    preview.warm_seams(store, &every);
+    assert_eq!(preview.seam_bytes, noted, "noted again, the same");
+    preview.end_stroke(store).unwrap();
+    assert_eq!(preview.seam_bytes, 0, "nothing kept past the last stroke");
+    assert_eq!(preview.seams_counted(), 0);
+    drop(project.close(false));
+}

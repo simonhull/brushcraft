@@ -280,9 +280,16 @@ impl Sculpting {
     /// ([`stroke::REACH_RADII`] radii, its first drag's walk). The hit on the surface the
     /// strokes leave may lie elsewhere along the ray, and so may what the `Down` reads about it:
     /// the list is a good guess, and the `Down` makes what it lacks. At most [`AHEAD_MOST`]; the
-    /// futures made before that aren't listed now are let go, the others kept.
+    /// futures made before that aren't listed now are let go, the others kept. So is what was
+    /// noted ahead of the seams about the tiles listed before, where no preview holds it
+    /// ([`sculpt::Preview::let_go_unheld_seams`]): a hover that wanders keeps its last place's.
     pub(super) fn list_ahead(&mut self, scene: &mut Scene<'_>, at: Pixel) {
         self.ahead.todo.clear();
+        // What was noted of the seams about the place it hovered before, where no preview came
+        // to hold it, goes: it is noted again for where the pen is now.
+        if let Some(preview) = &mut self.preview {
+            preview.let_go_unheld_seams(scene.project.store());
+        }
         let projector = scene.projector;
         let screen = ScreenPoint::new(at.x, at.y).ok();
         let Some(ray) = screen.and_then(|screen| projector.ray(screen)) else {
