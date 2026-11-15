@@ -1018,8 +1018,9 @@ impl Preview {
     ) -> Result<(), SculptError> {
         let mut seeds = seeds;
         seeds.append(&mut self.display_seeds);
+        // Nothing changed: what each preview draws of another's stays noted, for the stitch
+        // that finds them parted (or one stroke's alone) to draw their own again.
         if seeds.is_empty() {
-            self.display_subs.clear();
             return Ok(());
         }
         if !self.mixed() && self.finest_subs.is_empty() {

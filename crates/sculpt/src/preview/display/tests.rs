@@ -1172,3 +1172,146 @@ fn a_later_strokes_display_previews_wait_for_their_futures_and_drop_no_earlier_w
     assert_bounds(store, &taken, "taken over");
     drop(project.close(false));
 }
+
+/// How many border vertices of the store's display previews don't hold the bits of the finest
+/// vertex as drawn (its preview's, else the store's): each one a seam drawn apart.
+fn border_strays(store: &mut TileStore) -> usize {
+    let finest = level();
+    let mut strays = 0;
+    for (key, made) in previews(store) {
+        let side = key.side();
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        let border = grid.filter(|&(i, j)| i == 0 || j == 0 || i + 1 == side || j + 1 == side);
+        for (i, j) in border {
+            let (under, a, b) = finest_place(&key, finest, i, j).unwrap();
+            let want = match store.preview(&under) {
+                Some(block) => block.get(i64::from(a), i64::from(b)),
+                None => store.evaluate(under).unwrap()[usize::try_from(b * 65 + a).unwrap()],
+            };
+            let got = made.positions[usize::try_from(j * side + i).unwrap()];
+            strays += usize::from(got.to_bits() != want.to_bits());
+        }
+    }
+    strays
+}
+
+/// A ridge's stroke begun on `project`, and a small stroke along its crest reserved behind it.
+///
+/// The future of every tile is installed for the small stroke and `index` refitted over them.
+/// Returns the strokes' ops, their dabs (the ridge's, then the crest's), and the session's
+/// stroke state.
+fn ridge_and_crest(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+) -> (OpId, ReservedOp, [Vec<Dab>; 2], Stroke) {
+    let earlier = project.begin_stroke_and_wait().unwrap();
+    let ridge_dabs = ridge(project.store(), 24);
+    let state = Stroke::new(project.store());
+    let all: BTreeSet<TileKey> = finest_tiles(project.store()).into_iter().collect();
+    let mut edits = StrokeEdits::new(earlier, None);
+    {
+        let store = project.store();
+        let pen_down = PenDownTiles::of_oldest(store, earlier, &all).unwrap();
+        edits.place(store, &ridge_dabs, &pen_down).unwrap();
+        edits.seal();
+    }
+    let later = project.begin_stroke_after().unwrap();
+    {
+        let store = project.store();
+        let futures = Futures::new(store, &state, &[&edits]).unwrap();
+        for &key in &all {
+            let future = futures.future_of(store, key).unwrap();
+            store
+                .install_pen_down_of(&later, key, future, Some(earlier))
+                .unwrap();
+        }
+    }
+    let keys: Vec<TileKey> = all.iter().copied().collect();
+    index.refit(project.store(), &keys).unwrap();
+    // Along the crest, as the ridge will leave it.
+    let crest: Vec<Dab> = {
+        let mut reading = project.store().read_pen_down_of(&later).unwrap();
+        (0..8_u32)
+            .map(|n| {
+                let tile = u16::from(n >= 4);
+                let key = TileKey::displacement(FaceId::new(0), level(), tile, 0).unwrap();
+                let (i, j) = ((n * 12 + 6) % 64, 64);
+                let at = usize::try_from(j * 65 + i).unwrap();
+                let centre = reading.pen_down_positions(key).unwrap()[at];
+                dab(centre, 0.03, 0.004, 0.0, 100 + n)
+            })
+            .collect()
+    };
+    (earlier, later, [ridge_dabs, crest], state)
+}
+
+#[test]
+fn a_stitch_with_nothing_to_look_at_keeps_what_the_previews_draw_of_others() {
+    // A ridge and a small stroke along its crest, reserved behind it; the ridge lands whole, its
+    // display previews left drawing other previews' bits where they meet, the small stroke's
+    // among them. A call that shows nothing (the small stroke's next dabs not ready, say)
+    // stitches with nothing to look at: what each draws of another stays noted, so that when
+    // the small stroke goes, its dabs dropped, the stitch then finds them and has them draw
+    // their own.
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "kept");
+    let (earlier, later, [ridge_dabs, crest], mut state) =
+        ridge_and_crest(&mut project, &mut index);
+    let mut preview = Preview::new();
+    {
+        let mut two = Two {
+            store: project.store(),
+            index: &index,
+            earlier,
+            later: &later,
+            displays_ready: true,
+        };
+        preview
+            .show_over(&mut two, earlier, &ridge_dabs, &DrawsAll)
+            .unwrap();
+        let shown = preview
+            .show_over(&mut two, later.op(), &crest, &DrawsAll)
+            .unwrap();
+        assert_eq!(shown.dabs, crest.len(), "the small stroke's dabs are shown");
+    }
+    // The ridge lands whole; the small stroke's previews stay, over its futures.
+    apply_dabs(project.store(), &mut index, &mut state, &ridge_dabs).unwrap();
+    let mut two = Two {
+        store: project.store(),
+        index: &index,
+        earlier,
+        later: &later,
+        displays_ready: true,
+    };
+    preview
+        .land_over(&mut two, ridge_dabs.len(), &DrawsAll)
+        .unwrap();
+    // How many display previews draw another preview's bits at some vertex.
+    let drawing_others = |shown: &Preview| {
+        let seams = shown.display_subs.values();
+        seams.filter(|seams| !seams.is_empty()).count()
+    };
+    let drew = drawing_others(&preview);
+    assert!(drew > 0, "previews draw others' bits where they meet");
+    // A call with nothing to show, and so nothing for its stitch to look at.
+    let nothing = preview
+        .show_over(&mut two, later.op(), &[], &DrawsAll)
+        .unwrap();
+    assert_eq!(nothing.dabs, 0);
+    assert_eq!(
+        drawing_others(&preview),
+        drew,
+        "what they draw is still noted"
+    );
+    // The small stroke goes, its dabs dropped.
+    preview.let_go(two.store, &[later.op()]).unwrap();
+    preview.land_over(&mut two, crest.len(), &DrawsAll).unwrap();
+    assert_eq!(preview.shown(), 0, "every dab landed or dropped");
+    let strays = border_strays(two.store);
+    assert_eq!(strays, 0, "the previews left draw the surface as it is");
+    drop(project.drop_stroke_after(later));
+    preview.end_stroke(project.store()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    drop(project.close(false));
+}
