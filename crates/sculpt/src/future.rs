@@ -71,7 +71,11 @@
 //!   predictions.
 //! - **Deciding** ([`Futures::new`]): nothing past a count, when the stroke's state has room for
 //!   the tiles its remaining dabs edit; else the stroke state's decisions for every remaining dab,
-//!   a few map operations a dab and tile.
+//!   a few map operations a dab and tile (25 ms for 26,000 dabs over 800 tiles, measured), made
+//!   once for as long as nothing they follow from changes: a stroke's [`StrokeEdits`] keeps them
+//!   until a dab of it is placed or lands or the stroke state's bookkeeping moves, so the
+//!   [`Futures`] made again and again between two landings (a `Down`'s rounds, a batch made ahead)
+//!   decide once.
 //! - **A future**: one tile replayed over the dabs of each stroke that touch it: about what landing
 //!   that tile costs.
 //!
@@ -111,6 +115,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use brush::{Imprint, Smoothstep, draw_imprint};
 use geom::{CorrectionError, CorrectionTile, Prediction, TileKey, Topology, Vec3};
@@ -121,7 +126,7 @@ use thiserror::Error;
 use crate::apply::{
     PenDownTile, Plan, Run, SculptError, Stopped, TileInput, imprint_of, replay_tile,
 };
-use crate::state::Stroke;
+use crate::state::{Book, Stroke};
 
 /// Why a tile's future couldn't be made. The new stroke then waits for the strokes before it to
 /// land, as it would without futures.
@@ -364,6 +369,39 @@ pub struct StrokeEdits {
     /// For each tile, how many dabs not landed edit it: the tiles whose state the stroke's
     /// remaining dabs need.
     edited: BTreeMap<TileKey, usize>,
+    /// The stroke state's decisions for the dabs not landed, as last made dab by dab
+    /// ([`StrokeEdits::plan`]).
+    decided: Decisions,
+}
+
+/// The stroke state's decisions for a stroke's dabs not landed, kept from the last time they
+/// were made dab by dab, with all they follow from ([`StrokeEdits::plan`]).
+///
+/// Behind a lock, as the futures made of a [`StrokeEdits`] only borrow it, and are read by the
+/// store's workers: it is taken once a [`Futures::new`], never by a worker.
+#[derive(Debug, Default)]
+struct Decisions(Mutex<Option<Decided>>);
+
+impl Clone for Decisions {
+    /// None kept: a copy decides for itself, the first time it is asked.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// Decisions made dab by dab, and what they were made from: the same book over the same dabs
+/// gives the same decisions ([`Plan::decide`] reads nothing else).
+#[derive(Debug)]
+struct Decided {
+    /// The stroke state's bookkeeping they start from.
+    book: Book,
+    /// The number of the first dab not landed then: with `dabs`, which dabs they are of (dabs
+    /// are only ever added after the last and dropped from the first).
+    first: usize,
+    /// How many dabs weren't landed then.
+    dabs: usize,
+    /// The decisions.
+    plan: Arc<Plan>,
 }
 
 /// One dab of a [`StrokeEdits`].
@@ -391,6 +429,7 @@ impl StrokeEdits {
             dabs: VecDeque::new(),
             touching: BTreeMap::new(),
             edited: BTreeMap::new(),
+            decided: Decisions(Mutex::new(None)),
         }
     }
 
@@ -529,14 +568,40 @@ impl StrokeEdits {
 
     /// The stroke state's decisions for the remaining dabs, from `book_for` the stroke's op (see
     /// "The grants of that state" in the module notes).
-    fn plan(&self, store: &TileStore, stroke: &Stroke) -> Plan {
+    ///
+    /// Made dab by dab, they are kept ([`Decisions`]) and given again for as long as they would
+    /// come out the same: while the book they start from and the dabs not landed are those they
+    /// were made of. They cost a few map operations a dab and tile, tens of milliseconds for a
+    /// backlog of tens of thousands of dabs, and a `Down` over the stroke asks for them several
+    /// times over (each round of futures it finds missing), with nothing landed between.
+    fn plan(&self, store: &TileStore, stroke: &Stroke) -> Arc<Plan> {
         let book = stroke.book_for(store, self.op);
         if book.has_room_for(self.edited.keys()) {
-            return Plan::Continuous;
+            return Arc::new(Plan::Continuous);
+        }
+        // A lock poisoned holds what a thread that panicked left: looked at as any other, it is
+        // used only if it is of this very book and these very dabs.
+        let mut decided = self
+            .decided
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let kept = decided.as_ref().filter(|kept| {
+            kept.first == self.first && kept.dabs == self.dabs.len() && kept.book == book
+        });
+        if let Some(kept) = kept {
+            return Arc::clone(&kept.plan);
         }
         let edits = self.dabs.iter().map(|dab| dab.edits.as_slice());
         let (grants, _, _) = Plan::decide(&book, edits);
-        Plan::Granted(grants)
+        let plan = Arc::new(Plan::Granted(grants));
+        *decided = Some(Decided {
+            book,
+            first: self.first,
+            dabs: self.dabs.len(),
+            plan: Arc::clone(&plan),
+        });
+        plan
     }
 
     /// The dabs not landed that touch `key`, in order: their imprints, and their numbers counted
@@ -629,7 +694,7 @@ pub struct Futures<'a> {
     /// The session's stroke state, the one [`crate::apply_dabs`] lands with.
     stroke: &'a Stroke,
     /// The chain's strokes, oldest first, each with its decisions.
-    strokes: Vec<(&'a StrokeEdits, Plan)>,
+    strokes: Vec<(&'a StrokeEdits, Arc<Plan>)>,
 }
 
 impl<'a> Futures<'a> {
@@ -669,13 +734,15 @@ impl<'a> Futures<'a> {
         self.strokes.iter().all(|(edits, _)| edits.sealed)
     }
 
-    /// For each stroke of the chain, whether its decisions took the fast path
-    /// ([`crate::apply::Plan::Continuous`]): for the tests.
-    #[cfg(test)]
-    pub(crate) fn continuous(&self) -> Vec<bool> {
+    /// For each stroke of the chain, whether its decisions took the fast path (the stroke's state
+    /// has room for every tile its remaining dabs edit: see "The grants of that state" in the
+    /// module notes) rather than being made dab by dab: for tests and measurements.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn continuous(&self) -> Vec<bool> {
         self.strokes
             .iter()
-            .map(|(_, plan)| *plan == Plan::Continuous)
+            .map(|(_, plan)| **plan == Plan::Continuous)
             .collect()
     }
 

@@ -1021,7 +1021,7 @@ fn another_strokes_pen_down_shapes_are_refused() {
 /// Asserts `edits`, the oldest open stroke's, counts exactly the tiles its remaining dabs edit.
 ///
 /// And that its futures take the fast path exactly when those tiles holding no state fit the
-/// stroke state's free buffers.
+/// stroke state's free buffers, and that the decisions it keeps are the ones it would make now.
 fn assert_fast_path(store: &TileStore, state: &Stroke, edits: &StrokeEdits, case: &str) {
     let edited: BTreeSet<TileKey> = edits
         .dabs
@@ -1042,6 +1042,19 @@ fn assert_fast_path(store: &TileStore, state: &Stroke, edits: &StrokeEdits, case
         vec![unheld <= free],
         "{case}: {unheld} tiles to take, {free} free"
     );
+    // The decisions it keeps from when they were last made dab by dab are those made afresh (a
+    // copy keeps none), whatever was placed or landed since; and asked for again with nothing
+    // changed, they are the ones kept, not made again.
+    let kept = edits.plan(store, state);
+    let afresh = edits.clone().plan(store, state);
+    assert_eq!(*kept, *afresh, "{case}: the decisions kept");
+    if unheld > free {
+        let again = edits.plan(store, state);
+        assert!(
+            std::sync::Arc::ptr_eq(&kept, &again),
+            "{case}: decided once"
+        );
+    }
 }
 
 /// One interleaved case, of `seed`, over 2 to 13 tiles of stroke state.
