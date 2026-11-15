@@ -851,6 +851,9 @@ impl OpenStrokes for Two<'_> {
 /// one changes installed and the index refitted over them, as the app has them by the time a
 /// stroke's dabs are shown. Without, the earlier stroke has landed and ended, and the later one
 /// is alone.
+///
+/// The futures installed are those of the tiles the earlier stroke's dabs reach by the index,
+/// no more: the tiles its landing changes.
 struct Over {
     /// The project, with the earlier stroke's dabs shown (or landed).
     ridge: Ridge,
@@ -1032,7 +1035,8 @@ fn first_dab(bencher: divan::Bencher<'_, '_>, landing: bool) {
 ///
 /// # Panics
 ///
-/// If showing fails, which would be a bug.
+/// If showing fails, which would be a bug, or the samples run past the earlier stroke's ridge
+/// ([`OVER_FROM`] and those drawn, against [`OVER_DABS`]).
 fn steady_dab(bencher: divan::Bencher<'_, '_>, landing: bool) {
     let over = RefCell::new(Over::new(landing));
     for _ in 0..OVER_SHOWN {
@@ -1041,7 +1045,15 @@ fn steady_dab(bencher: divan::Bencher<'_, '_>, landing: bool) {
         over.show(&dab);
     }
     bencher
-        .with_inputs(|| over.borrow_mut().next_dab())
+        .with_inputs(|| {
+            let over = &mut *over.borrow_mut();
+            let on_ridge = OVER_FROM + over.drawn < OVER_DABS;
+            assert!(
+                on_ridge,
+                "the stroke has run off the earlier stroke's ridge"
+            );
+            over.next_dab()
+        })
         .bench_local_values(|dab| over.borrow_mut().show(&dab));
 }
 
@@ -1070,7 +1082,7 @@ fn over_first_noted(bencher: divan::Bencher<'_, '_>) {
             let dab = over.next_dab();
             let near = over.reach(&dab);
             let store = over.ridge.project.store();
-            over.ridge.preview.warm_seams(store, &near);
+            assert!(over.ridge.preview.warm_seams(store, &near), "room to note");
             (over, dab)
         })
         .bench_local_values(|(mut over, dab)| {
