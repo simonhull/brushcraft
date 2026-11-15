@@ -2045,11 +2045,9 @@ fn seams_drawn(
         run.land_one();
         assert!(run.ops().is_empty(), "every stroke ended");
         run.brush.knob = Knob::None;
-        // The strokes over, the display previews left are released, each as its stroke left
-        // it, drawn until the refresh replaces it: no stitch makes them meet any more.
-        let mut left = ShownBits::of(run.project.store());
-        left.cracks.clear();
-        shown.push(left);
+        // The strokes over, the display previews left are released, drawn until the refresh
+        // replaces them: each draws its own bits again, and they meet as one stroke's do.
+        shown.push(ShownBits::of(run.project.store()));
         run.brush.abandon();
         run.close();
         return shown;

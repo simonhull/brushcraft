@@ -109,7 +109,9 @@
 //! stroke's finest preview by the stored encoding (that of the earlier strokes' work, which its
 //! pen-down holds rounded, and its own), within the finest previews' bound; a display preview's
 //! bound measures the vertices it draws (the `display` module's "The bound"). One whose vertex
-//! another no longer wins (the later stroke's preview gone) is made again.
+//! another no longer wins (the later stroke's preview gone) is made again, and once the previews
+//! are one stroke's alone, the display previews that drew another's bits are handed over
+//! drawing their own.
 //!
 //! A stitch looks at the previews about the tiles its call changed, and what it looks up there
 //! is kept from call to call, until the last stroke ends: which tiles lie around each preview
@@ -1016,9 +1018,12 @@ impl Preview {
     ) -> Result<(), SculptError> {
         let mut seeds = seeds;
         seeds.append(&mut self.display_seeds);
-        if seeds.is_empty() || (!self.mixed() && self.finest_subs.is_empty()) {
+        if seeds.is_empty() {
             self.display_subs.clear();
             return Ok(());
+        }
+        if !self.mixed() && self.finest_subs.is_empty() {
+            return self.unstitch(strokes, stats);
         }
         // The previews holding a vertex a seed holds that meet another stroke's (or drew one's
         // bits), and those holding a vertex they hold: where previews of one stroke alone meet,
@@ -1106,6 +1111,36 @@ impl Preview {
         self.publish(&mut store, &republish, stats)?;
         self.display_seeds.clear();
         Ok(())
+    }
+
+    /// The previews are one stroke's alone now, with no seam left between strokes: the display
+    /// previews that drew another's bits at shared vertices are handed over again drawing their
+    /// own, and none is noted as drawing another's any more.
+    ///
+    /// They were last handed over with those bits, some by this very call (a stroke's previews
+    /// made again as the strokes after it went with their dabs dropped, say): left so, each
+    /// would draw at its border what a preview since made again, or gone, drew there before,
+    /// and two of them would part there until the refresh replaced them.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a correction tile can't be read or the store refuses a preview.
+    fn unstitch<S: OpenStrokes>(
+        &mut self,
+        strokes: &mut S,
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        let drew = std::mem::take(&mut self.display_subs).into_iter();
+        let drew = drew.filter(|(_, seams)| !seams.is_empty());
+        let drew: Vec<TileKey> = drew.map(|(key, _)| key).collect();
+        if drew.is_empty() {
+            return Ok(());
+        }
+        let (mut store, _) = strokes.current();
+        let published = self.publish(&mut store, &drew, stats);
+        // Handed over as their own: nothing for the next stitch to look at.
+        self.display_seeds.clear();
+        published
     }
 
     /// What each place a preview of `holders` holds shows (see "Seams" in the module notes): the
