@@ -46,7 +46,9 @@ options:
                    how a stroke looks, with --screenshot; or spiral (one stroke 25 s long
                    across the whole sphere): what a stroke's length costs; or spiral-light,
                    that stroke touching down lightly; or near (still, in close, the first
-                   of the strokes): what a stroke costs on its own
+                   of the strokes): what a stroke costs on its own; or over (six pairs of
+                   strokes, the later drawn over the earlier while it still lands): what a
+                   stroke over one still landing costs
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads; in a window

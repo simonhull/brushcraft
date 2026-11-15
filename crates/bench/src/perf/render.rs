@@ -36,6 +36,11 @@
 //! of its own so that nothing the others measure draws any UI, whose record gives the UI's cost
 //! ([`strokes::ui_costs`]).
 //!
+//! Each run also runs the over script (`--script-path over`), whose record gives what a stroke
+//! over one still landing costs ([`over`]: the later stroke's `Down` to its first dab shown, with
+//! no hover before, after one, and once the earlier stroke has landed; a steady frame; and what
+//! the open strokes hold at their peak).
+//!
 //! Each run also runs the strokes script (`--script-path strokes`), whose record gives the pen's
 //! metrics for its five strokes ([`strokes`]: sample to present, frame start to present
 //! submitted, the brush, the most dabs carried and the frames to drain them after pen-up, frames
@@ -64,6 +69,7 @@ use crate::perf::project::{Scale, Source, WorkDir};
 use crate::perf::suite::{AppExit, Runner, Samples};
 
 mod clocks;
+mod over;
 mod strokes;
 pub(crate) mod summary;
 #[cfg(test)]
@@ -184,6 +190,8 @@ pub(crate) struct Frame {
     pub(crate) ui_ms: Option<f64>,
     /// The UI's pass on the GPU, in ms, if it drew and was timed.
     pub(crate) gpu_ui_ms: Option<f64>,
+    /// The bytes the open strokes' pen-down data held as its brush step ended.
+    pub(crate) kept_bytes: Option<f64>,
 }
 
 impl Frame {
@@ -224,8 +232,14 @@ pub(crate) struct Recorded {
     pub(crate) clock_unix_ms: Option<f64>,
     /// The interval frames were paced to, in ms, if the record gives it.
     pub(crate) refresh_ms: Option<f64>,
+    /// The bytes the open strokes' pen-down data may hold in the run, if the record gives it.
+    pub(crate) open_strokes_share: Option<f64>,
     /// Each segment's name, start and end on the frame loop's clock, in ms.
     pub(crate) segments: Vec<(String, f64, f64)>,
+    /// When the scripted pen first touched in each segment it touched in, on the frame loop's
+    /// clock, in ms, by the segment's name (the first of that name, as the over metrics read it:
+    /// their segments are each named once); none from a record that doesn't say.
+    pub(crate) downs: Vec<(String, f64)>,
     /// Every frame, in order.
     pub(crate) frames: Vec<Frame>,
     /// The GPU's clocks over the run, as joined to the frames.
@@ -284,6 +298,7 @@ impl Recorded {
                 self.open_ms = required(object, "open_ms")?;
                 self.clock_unix_ms = number(object, "clock_unix_us").map(|us| us / 1e3);
                 self.refresh_ms = number(object, "refresh_ms");
+                self.open_strokes_share = number(object, "open_strokes_share");
                 return Ok(true);
             }
             Some("segment") => {
@@ -292,6 +307,9 @@ impl Recorded {
                 let start = required(object, "start_ms")?;
                 let end = required(object, "end_ms")?;
                 self.segments.push((name.to_owned(), start, end));
+                if let Some(down) = number(object, "down_ms") {
+                    self.downs.push((name.to_owned(), down));
+                }
             }
             Some("frame") => self.frames.push(Frame {
                 time_ms: required(object, "time_ms")?,
@@ -323,6 +341,7 @@ impl Recorded {
                 tiles_edited: number(object, "tiles_edited"),
                 ui_ms: number(object, "ui_ms"),
                 gpu_ui_ms: number(object, "gpu_ui_ms"),
+                kept_bytes: number(object, "kept_bytes"),
             }),
             _ => {}
         }
@@ -652,6 +671,22 @@ fn sample_strokes(recorded: &Recorded, scale: Scale, samples: &mut Samples) -> R
     sample_named(named, scale, samples)
 }
 
+/// What a stroke over one still landing cost in one over run, `recorded` ([`over`]), added to
+/// `samples` under `scale`'s names; returns those it had none of, and what its pairs were.
+///
+/// # Errors
+///
+/// If a name isn't a metric name, or a unit clashes.
+fn sample_over(
+    recorded: &Recorded,
+    scale: Scale,
+    samples: &mut Samples,
+) -> Result<(Vec<Gap>, Vec<String>)> {
+    let derived = over::derive(recorded);
+    let gaps = sample_named(derived.named(), scale, samples)?;
+    Ok((gaps, derived.notes()))
+}
+
 /// The UI's cost in one run of the near stroke with a bar showing, `recorded`
 /// ([`strokes::ui_costs`]), added to `samples` under `scale`'s names; returns those it had none of.
 ///
@@ -856,7 +891,16 @@ fn measure(
         let with_bar =
             Recorded::parse(&bar_text).with_context(|| format!("{}", bar_record.display()))?;
         gaps.extend(sample_ui(&with_bar, scale, &mut samples)?);
+        let over_record = dir.join(format!("over-{run}.jsonl"));
+        runner.app(&args("over", &over_record), &dir.join("state"))?;
+        let over_text = std::fs::read_to_string(&over_record)
+            .with_context(|| format!("reading {}", over_record.display()))?;
+        let overs =
+            Recorded::parse(&over_text).with_context(|| format!("{}", over_record.display()))?;
+        let (over_gaps, pairs) = sample_over(&overs, scale, &mut samples)?;
+        gaps.extend(over_gaps);
         let mut said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
+        said.extend(pairs);
         said.push(metrics.clock_note());
         notes.push(format!("run {}: {}", run + 1, said.join(", ")));
         for gap in gaps {

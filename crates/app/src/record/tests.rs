@@ -325,10 +325,27 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         open: ms(250),
         clock_unix: Some(Duration::from_micros(1_793_401_426_346_500)),
         refresh: Duration::from_micros(6944),
+        open_strokes_share: 3 << 20,
     };
     let script = Script::benchmark(Speed::ONE);
     let lines = recorder.lines(&info, Some(&script));
     assert_eq!(lines.len(), 1 + 5 + 2);
+    // A segment the scripted pen touches in says when it first does.
+    let near = Script::near(Speed::ONE);
+    let stroked = recorder.lines(&info, Some(&near));
+    let touched: Vec<&String> = stroked
+        .iter()
+        .filter(|line| line.contains("down_ms"))
+        .collect();
+    let [stroke] = touched.as_slice() else {
+        panic!("one segment with a touch: {touched:?}");
+    };
+    assert!(
+        stroke.starts_with(
+            r#"{"bench":"render","result":"segment","segment":"stroke_near","start_ms":4500,"end_ms":6500,"down_ms":500"#
+        ),
+        "{stroke}"
+    );
     assert!(
         lines[0]
             .starts_with(r#"{"bench":"render","result":"run","project":"/p/sphere \"x\".bcrf","#),
@@ -336,7 +353,9 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         lines[0]
     );
     assert!(
-        lines[0].contains(r#""open_ms":250"#) && lines[0].contains(r#""frames":2"#),
+        lines[0].contains(r#""open_ms":250"#)
+            && lines[0].contains(r#""frames":2"#)
+            && lines[0].contains(r#""open_strokes_share":3145728"#),
         "{}",
         lines[0]
     );
@@ -405,6 +424,7 @@ fn dropped_readbacks_are_marked_on_their_frame_and_totalled_on_the_run_line() {
         open: ms(0),
         clock_unix: None,
         refresh: ms(16),
+        open_strokes_share: 0,
     };
     let lines = recorder.lines(&info, Some(&Script::benchmark(Speed::ONE)));
     assert!(
@@ -449,6 +469,7 @@ fn the_record_reaches_its_file_as_the_run_goes_on() {
         open: ms(0),
         clock_unix: None,
         refresh: ms(16),
+        open_strokes_share: 0,
     };
     let mut stream = RecordStream::to(path.clone());
     let now = Instant::now();

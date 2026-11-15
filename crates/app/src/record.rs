@@ -18,13 +18,16 @@
 //!
 //! Every line is a flat JSON object of named numbers, strings, booleans and number arrays, with
 //! `"bench":"render"` and its `"result"`: one `run` line (the setting), one `segment` line per
-//! segment of the script, then one `frame` line per frame, in order. Times are in milliseconds;
-//! `time_ms` and `presented_ms` are on the frame loop's clock (from its first frame), and
-//! `open_ms` is how long before that the project began to open. The run line also gives
+//! segment of the script (its name, `start_ms` and `end_ms`, and, in a segment the scripted pen
+//! touches in, `down_ms`: when it first does), then one `frame` line per frame, in order. Times are
+//! in milliseconds; `time_ms` and `presented_ms` are on the frame loop's clock (from its first
+//! frame), and `open_ms` is how long before that the project began to open. The run line also gives
 //! `clock_unix_us`, the frame loop's clock's start by the system clock (microseconds since the
 //! Unix epoch), so samples taken beside the run by another process (the performance suite's GPU
-//! clocks) can be joined to frames; and `refresh_ms`, the interval frames are paced to as the run
-//! starts (the display's refresh, 1/60 s offscreen). The frame line's fields:
+//! clocks) can be joined to frames; `refresh_ms`, the interval frames are paced to as the run
+//! starts (the display's refresh, 1/60 s offscreen); and `open_strokes_share`, the bytes the open
+//! strokes' pen-down data may hold together, which each frame's `kept_bytes` is held to. The
+//! frame line's fields:
 //!
 //! - `frame`, `time_ms` (its start), `presented_ms` (when the owner heard it was shown), `segment`,
 //!   `moving` (whether the view changed since the last frame);
@@ -495,6 +498,9 @@ pub(crate) struct RunInfo {
     /// The interval frames are paced to as the run starts: the display's refresh, or 1/60 s
     /// offscreen.
     pub(crate) refresh: Duration,
+    /// The bytes the open strokes' pen-down data may hold together
+    /// ([`store::TileStore::open_strokes_share`]): what each frame's `kept_bytes` is held to.
+    pub(crate) open_strokes_share: usize,
 }
 
 /// The moment `at` (now or earlier) as time since the Unix epoch by the system clock; `None` if
@@ -658,14 +664,19 @@ impl Recorder {
             .with("open_ms", info.open)
             .with("clock_unix_us", info.clock_unix.map(micros))
             .with("refresh_ms", info.refresh)
+            .with("open_strokes_share", info.open_strokes_share)
             .with("frames", self.frames.len())
             .with("readbacks_dropped", dropped);
         let spans = script.map(Script::segments).unwrap_or_default();
         let segments = spans.into_iter().map(|(segment, start, end)| {
-            Line::new("segment")
+            let line = Line::new("segment")
                 .with("segment", segment.name())
                 .with("start_ms", start)
-                .with("end_ms", end)
+                .with("end_ms", end);
+            match script.and_then(|script| script.first_down(start, end)) {
+                Some(down) => line.with("down_ms", down),
+                None => line,
+            }
         });
         std::iter::once(run)
             .chain(segments)

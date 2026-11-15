@@ -1025,6 +1025,27 @@ pub(crate) struct Setup {
     pub(crate) show_bar: bool,
 }
 
+impl Setup {
+    /// What a recorded run's record says of its setting ([`Setup::record`], taken), the frame
+    /// loop's clock starting at `now`, over a store whose open strokes' pen-down data may hold
+    /// `open_strokes_share` bytes; `None` for no record.
+    fn run_info(&mut self, now: Instant, open_strokes_share: usize) -> Option<RunInfo> {
+        let record = self.record.take()?;
+        let size = self.size;
+        Some(RunInfo {
+            project: record.project,
+            adapter: self.adapter.clone(),
+            size: size.map_or((0, 0), |size| (size.width(), size.height())),
+            gpu_timing: record.gpu_timing,
+            lod_timing: record.lod_timing,
+            open: now.saturating_duration_since(record.opening),
+            clock_unix: crate::record::since_epoch(now),
+            refresh: self.interval,
+            open_strokes_share,
+        })
+    }
+}
+
 /// Whether the window was asked to close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Close {
@@ -1527,7 +1548,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         mut project: Project,
         brush: B,
         uploads: U,
-        setup: Setup,
+        mut setup: Setup,
         now: Instant,
     ) -> Self {
         let cursor = project.store().subscribe_stale();
@@ -1549,18 +1570,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .as_ref()
             .and_then(|record| record.path.clone())
             .map(RecordStream::to);
-        let run_info = setup.record.map(|record| RunInfo {
-            project: record.project,
-            adapter: setup.adapter.clone(),
-            size: setup
-                .size
-                .map_or((0, 0), |size| (size.width(), size.height())),
-            gpu_timing: record.gpu_timing,
-            lod_timing: record.lod_timing,
-            open: now.saturating_duration_since(record.opening),
-            clock_unix: crate::record::since_epoch(now),
-            refresh: setup.interval,
-        });
+        let run_info = setup.run_info(now, project.store().open_strokes_share());
         Self {
             project,
             cursor,

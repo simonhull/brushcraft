@@ -46,7 +46,9 @@ subcommands:
   strokes-summary  the pen's numbers, a row a stroke, from the app's records (brushcraft
              --record) in --records DIR: sample to present p50 and p99, the brush, the queue,
              the catch-up and time to exact, level jumps, tiles a dab, each target marked
-             (scripts/measure-strokes.sh makes the records and runs it)
+             (scripts/measure-strokes.sh makes the records and runs it); and of an over
+             run's record (brushcraft --script-path over), what a stroke over one still
+             landing cost, as the suite derives it
 
 options (each subcommand takes the ones it uses):
   --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);

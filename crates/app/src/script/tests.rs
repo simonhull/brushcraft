@@ -547,3 +547,301 @@ fn the_sweep_runs_across_the_view_on_the_sphere_seen_at_a_slant() {
     let near = WorldPoint::new(eye.x - middle.x, eye.y - middle.y, eye.z - middle.z).length();
     assert!((0.4..0.6).contains(&near), "close: {near}");
 }
+
+/// The over path's samples by ground: those taken between one turn's end and the next turn's
+/// start.
+fn over_grounds(script: &Script) -> Vec<Vec<&ScriptPen>> {
+    let spans = script.segments();
+    let turns: Vec<Duration> = spans
+        .iter()
+        .filter(|span| span.0 == Segment::Turn)
+        .map(|span| span.2)
+        .collect();
+    let ends = turns.iter().skip(1).copied().chain([script.duration()]);
+    let grounds = turns.iter().zip(ends).map(|(&from, to)| {
+        let samples = script.pen(from, to);
+        samples.iter().collect()
+    });
+    grounds.collect()
+}
+
+/// A ground's samples as its strokes: each from its first sample to its `Leave`.
+fn strokes_of<'a>(ground: &[&'a ScriptPen]) -> Vec<Vec<&'a ScriptPen>> {
+    let mut strokes = vec![Vec::new()];
+    for &sample in ground {
+        strokes.last_mut().unwrap().push(sample);
+        if sample.phase == Phase::Leave {
+            strokes.push(Vec::new());
+        }
+    }
+    strokes.retain(|stroke| !stroke.is_empty());
+    strokes
+}
+
+/// The distance between two points of the unit sphere.
+fn apart(a: WorldPoint, b: WorldPoint) -> f64 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+/// The over path's segments: after the open one, each weight met each way (a turn, the earlier
+/// stroke's, the later stroke's), then the chain and the settle.
+#[test]
+fn the_over_path_draws_six_pairs_and_a_chain_back_to_back() {
+    let script = Script::over(Speed::ONE);
+    let spans = script.segments();
+    let names: Vec<&str> = spans.iter().map(|span| span.0.name()).collect();
+    let later = [
+        "over_ordinary_cold",
+        "over_ordinary_warmed",
+        "over_ordinary_landed",
+        "over_heavy_cold",
+        "over_heavy_warmed",
+        "over_heavy_landed",
+        "over_chain",
+    ];
+    let mut expected = vec!["open"];
+    for name in later {
+        expected.extend(["turn", "over_first", name]);
+    }
+    expected.push("settle");
+    assert_eq!(names, expected);
+    assert_eq!(spans[0].1, Duration::ZERO, "from the start");
+    for pair in spans.windows(2) {
+        assert_eq!(pair[0].2, pair[1].1, "{:?} then {:?}", pair[0], pair[1]);
+    }
+    assert_eq!(spans.last().unwrap().2, script.duration(), "to the end");
+    // Still while the strokes are drawn; only a turn moves the camera.
+    for &(segment, start, end) in &spans {
+        let (from, to) = (script.at(start).pose, script.at(middle(start, end)).pose);
+        assert_eq!(close(from, to), segment != Segment::Turn, "{segment}");
+    }
+}
+
+/// Each ground lies apart from every other: no stroke of the path comes within reach of
+/// another ground's strokes (the heavy brush's radius is about 0.16, the later strokes' reach
+/// about as much).
+#[test]
+fn the_over_paths_grounds_lie_apart() {
+    let script = Script::over(Speed::ONE);
+    let grounds = over_grounds(&script);
+    assert_eq!(grounds.len(), 7, "six pairs and the chain");
+    for (i, ground) in grounds.iter().enumerate() {
+        assert!(!ground.is_empty(), "ground {i} has strokes");
+        for (j, other) in grounds.iter().enumerate().skip(i + 1) {
+            let nearest = ground
+                .iter()
+                .flat_map(|a| other.iter().map(|b| apart(a.point, b.point)))
+                .fold(f64::INFINITY, f64::min);
+            assert!(nearest > 0.45, "grounds {i} and {j}: {nearest} apart");
+        }
+    }
+}
+
+/// How each later stroke's pen comes down: cold, after a hover, or once the earlier has landed.
+///
+/// At once with no hover, after a hover, or once the earlier stroke has had its time to land; and
+/// its segment starts between the earlier stroke's lift and its own touch.
+#[test]
+fn the_over_paths_later_strokes_come_down_cold_warmed_and_once_landed() {
+    let script = Script::over(Speed::ONE);
+    let grounds = over_grounds(&script);
+    let period = PEN_RATE.recip();
+    let pairs = Weight::ALL
+        .into_iter()
+        .flat_map(|weight| Before::ALL.map(|before| (weight, before)));
+    for ((weight, before), ground) in pairs.zip(&grounds) {
+        let strokes = strokes_of(ground);
+        let [earlier, later] = strokes.as_slice() else {
+            panic!("{weight:?} {before:?}: {} strokes", strokes.len());
+        };
+        // The earlier stroke: sized by its vertices as it enters, a hover, then its touch; out
+        // of range as it lifts.
+        assert_eq!(earlier[0].phase, Phase::Enter, "{weight:?} {before:?}");
+        assert_eq!(earlier[0].size, Some(weight.brush()));
+        let [.., up, leave] = earlier.as_slice() else {
+            panic!("an earlier stroke of one sample");
+        };
+        assert_eq!((up.phase, leave.phase), (Phase::Up, Phase::Leave));
+        assert_eq!(up.time, leave.time, "it leaves as it lifts");
+        let lift = up.time.as_secs_f64();
+        let touch = later.iter().find(|sample| sample.phase == Phase::Down);
+        let touch = touch.expect("the later stroke touches");
+        let first = later[0];
+        assert_eq!(first.size, Some(OVER_BRUSH), "sized on its first sample");
+        let (back, hovered) = (
+            first.time.as_secs_f64() - lift,
+            touch.time.as_secs_f64() - first.time.as_secs_f64(),
+        );
+        match before {
+            Before::Cold => {
+                assert_eq!(first.phase, Phase::Down, "{weight:?}: no hover");
+                assert!((back - OVER_GAP).abs() < 1e-9, "{weight:?}: back {back}");
+            }
+            Before::Warmed => {
+                assert_eq!(first.phase, Phase::Enter, "{weight:?}");
+                assert!((back - OVER_GAP).abs() < 1e-9, "{weight:?}: back {back}");
+                assert!(
+                    (weight.hover()..weight.hover() + period).contains(&hovered),
+                    "{weight:?}: hovered {hovered}"
+                );
+            }
+            Before::Landed => {
+                assert_eq!(first.phase, Phase::Enter, "{weight:?}");
+                assert!((back - weight.landing()).abs() < 1e-9, "{weight:?}: {back}");
+                assert!(
+                    (0.3..0.3 + period).contains(&hovered),
+                    "{weight:?}: hovered {hovered}"
+                );
+            }
+        }
+        // It hovers where it comes down (the touch, a report later, is a step along).
+        let hovers = later
+            .iter()
+            .take_while(|sample| sample.phase != Phase::Down);
+        for hover in hovers {
+            assert!(apart(hover.point, touch.point) < 0.01, "{weight:?}");
+        }
+        // Its segment: begun after the earlier stroke's last sample and before its own first,
+        // and its record's touch is this one.
+        let segment = Segment::Over(weight, before);
+        let spans = script.segments();
+        let &(_, start, end) = spans.iter().find(|span| span.0 == segment).unwrap();
+        assert!(leave.time < start && start < first.time, "{segment}");
+        assert_eq!(script.first_down(start, end), Some(touch.time), "{segment}");
+        // Time to land after its lift, before the next ground's turn.
+        let lifted = later
+            .iter()
+            .find(|sample| sample.phase == Phase::Up)
+            .unwrap();
+        let rest = end.checked_sub(lifted.time).unwrap().as_secs_f64();
+        assert!((rest - weight.landing()).abs() < 1e-9, "{segment}: {rest}");
+    }
+}
+
+/// A later stroke is drawn along the earlier one: every point it touches lies on the earlier
+/// stroke's path (within the earlier pen's step between two reports).
+#[test]
+fn the_over_paths_later_strokes_run_along_the_earlier_ones() {
+    let script = Script::over(Speed::ONE);
+    for ground in over_grounds(&script) {
+        let strokes = strokes_of(&ground);
+        let (earlier, later) = strokes.split_first().unwrap();
+        let touching = |sample: &&&ScriptPen| matches!(sample.phase, Phase::Down | Phase::Drag);
+        let path: Vec<WorldPoint> = earlier.iter().filter(touching).map(|s| s.point).collect();
+        for stroke in later {
+            let touched: Vec<WorldPoint> =
+                stroke.iter().filter(touching).map(|s| s.point).collect();
+            assert!(touched.len() > 50, "drawn for {} reports", touched.len());
+            let moved = apart(touched[0], *touched.last().unwrap());
+            assert!(moved > 0.05, "it moves along: {moved}");
+            for point in touched {
+                let nearest = path
+                    .iter()
+                    .map(|&on| apart(on, point))
+                    .fold(f64::INFINITY, f64::min);
+                assert!(nearest < 0.02, "{nearest} off the earlier stroke");
+            }
+        }
+    }
+}
+
+/// The chain: an ordinary stroke, a second at once along it, and a third at once over both, the
+/// third in its own segment.
+#[test]
+fn the_over_paths_chain_is_three_strokes_at_once() {
+    let script = Script::over(Speed::ONE);
+    let grounds = over_grounds(&script);
+    let strokes = strokes_of(grounds.last().unwrap());
+    let [first, second, third] = strokes.as_slice() else {
+        panic!("{} strokes", strokes.len());
+    };
+    assert_eq!(first[0].size, Some(Weight::Ordinary.brush()));
+    let lift = |stroke: &[&ScriptPen]| {
+        let up = stroke.iter().find(|sample| sample.phase == Phase::Up);
+        up.unwrap().time.as_secs_f64()
+    };
+    for (before, after) in [(first, second), (second, third)] {
+        assert_eq!(after[0].phase, Phase::Down, "at once, no hover");
+        let back = after[0].time.as_secs_f64() - lift(before);
+        assert!((back - OVER_GAP).abs() < 1e-9, "back {back}");
+    }
+    let spans = script.segments();
+    let &(_, start, end) = spans
+        .iter()
+        .find(|span| span.0 == Segment::OverChain)
+        .unwrap();
+    assert!(second.last().unwrap().time < start && start < third[0].time);
+    assert_eq!(script.first_down(start, end), Some(third[0].time));
+}
+
+/// The pen's samples come in order of time at any speed the suite runs the path at: no stroke's
+/// samples overlap the next's, however short the gap between them.
+#[test]
+fn the_over_paths_samples_come_in_order_at_the_suites_speeds() {
+    for speed in ["1", "4"] {
+        let script = Script::over(speed.parse().unwrap());
+        let samples = script.pen(Duration::ZERO, script.duration());
+        assert!(samples.len() > 500, "{speed}: {} samples", samples.len());
+        for pair in samples.windows(2) {
+            assert!(pair[0].time <= pair[1].time, "{speed}: {pair:?}");
+        }
+        let touches = samples.iter().filter(|s| s.phase == Phase::Down).count();
+        assert_eq!(touches, 6 * 2 + 3, "{speed}: every stroke touches");
+    }
+}
+
+/// A to-and-fro stroke runs its span one way, then back, through the facing point; and a part of
+/// a shape is that part of its way.
+#[test]
+fn a_to_and_fro_stroke_runs_across_and_back_and_a_part_is_part_of_the_way() {
+    let camera = START.camera();
+    let whole = PenStroke {
+        hover: 0.0,
+        down: 1.0,
+        up: 2.0,
+        size: BrushSize::Pixels(40.0),
+        shape: Shape::ToAndFro {
+            span: 0.4,
+            passes: 2,
+        },
+        pressure: Pressure::Firm,
+        part: WHOLE,
+        leave: 0.0,
+    };
+    let (left, middle, right) = (
+        whole.point(&camera, 0.0),
+        whole.point(&camera, 0.25),
+        whole.point(&camera, 0.5),
+    );
+    let facing = unit(camera.eye());
+    let facing = WorldPoint::new(facing.x, facing.y, facing.z);
+    assert!(apart(middle, facing) < 1e-12, "through the facing point");
+    assert!(apart(whole.point(&camera, 1.0), left) < 1e-12, "and back");
+    assert!(
+        apart(whole.point(&camera, 0.75), middle) < 1e-12,
+        "the same way back"
+    );
+    // Each end is half the span off the facing point, before it is laid on the sphere.
+    let off = (0.2_f64).atan();
+    for end in [left, right] {
+        let angle = 2.0 * (apart(end, facing) / 2.0).asin();
+        assert!((angle - off).abs() < 1e-9, "{angle} for {off}");
+    }
+    assert!(apart(left, right) > 0.39, "the ends lie the span apart");
+    let part = PenStroke {
+        part: (0.25, 0.5),
+        ..whole
+    };
+    assert!(apart(part.point(&camera, 0.0), middle) < 1e-12, "from");
+    assert!(apart(part.point(&camera, 1.0), right) < 1e-12, "to");
+    assert_eq!(whole.pressure(0.3), Unit::try_from(0.8).unwrap(), "firm");
+}
+
+#[test]
+fn the_over_path_is_named_on_the_command_line() {
+    assert_eq!("over".parse::<ScriptPath>(), Ok(ScriptPath::Over));
+    let script = Script::new(ScriptPath::Over, Speed::ONE);
+    assert_eq!(script, Script::over(Speed::ONE));
+    let said = "fast".parse::<ScriptPath>().unwrap_err().to_string();
+    assert!(said.contains("near or over"), "{said}");
+}

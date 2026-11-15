@@ -806,6 +806,27 @@ fn the_run_line_places_the_clock_and_gives_the_refresh() {
     assert_eq!((older.clock_unix_ms, older.refresh_ms), (None, None));
 }
 
+#[test]
+fn the_record_gives_the_open_strokes_share_each_segments_touch_and_what_each_frame_kept() {
+    let text = r#"{"bench":"render","result":"run","open_ms":1,"open_strokes_share":1048576}
+{"bench":"render","result":"segment","segment":"over_first","start_ms":0,"end_ms":100,"down_ms":30.5}
+{"bench":"render","result":"segment","segment":"turn","start_ms":100,"end_ms":200,"down_ms":null}
+{"bench":"render","result":"frame","time_ms":40,"segment":"over_first","kept_bytes":4096}"#;
+    let recorded = Recorded::parse(text).unwrap();
+    assert_eq!(recorded.open_strokes_share, Some(1_048_576.0));
+    assert_eq!(recorded.downs, [("over_first".to_owned(), 30.5)]);
+    assert_eq!(
+        recorded.segments.len(),
+        2,
+        "a segment the pen never touched in too"
+    );
+    assert_eq!(recorded.frames[0].kept_bytes, Some(4096.0));
+    // An older record says none of them.
+    let older = Recorded::parse(RECORDED).unwrap();
+    assert_eq!(older.open_strokes_share, None);
+    assert!(older.downs.is_empty(), "{:?}", older.downs);
+}
+
 /// [`stroke_frame`] whose brush left `catching_up` dabs shown to catch up, with `standing_in`
 /// display tiles standing in and no epoch pending.
 fn catch_up_frame(

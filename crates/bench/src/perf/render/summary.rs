@@ -19,6 +19,11 @@
 //! Each row is a JSON line (`{"bench":"strokes-summary","result":"stroke",…}`, a number not
 //! known `null`) and a line of the human summary, with each figure the spec sets a target for
 //! marked as meeting or missing it.
+//!
+//! An over run's record (`--script-path over`: strokes drawn over strokes still landing) has no
+//! stroke row; it gives each metric the suite derives of it ([`over`]) as a JSON line
+//! (`{"bench":"strokes-summary","result":"over",…}`) and a line, then what its pairs were
+//! ([`say_over`]).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,7 +31,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 
 use super::strokes::{self, Drain, HUGE_EXACT_MS, MOST_CARRIED, StrokeMetrics};
-use super::{Frame, Recorded};
+use super::{Frame, Recorded, Value, over};
 use crate::report::{Output, Record};
 
 /// The pen's latency target, sample to present submitted at p99, in ms.
@@ -274,6 +279,45 @@ pub(crate) fn run<J: Write, H: Write>(dir: &Path, out: &mut Output<J, H>) -> Res
             out.record(&row.record(&file, &recorded))?;
             out.say(&row.line())?;
         }
+        say_over(&file, &recorded, out)?;
+    }
+    Ok(())
+}
+
+/// Says what a stroke over one still landing cost in `recorded`, the record at `file`.
+///
+/// Only of an over run's ([`over`]): each metric the suite derives as a JSON line
+/// (`{"bench":"strokes-summary","result":"over",…}`) and a line of the human summary, then what
+/// its pairs were.
+///
+/// # Errors
+///
+/// If writing fails.
+fn say_over<J: Write, H: Write>(
+    file: &Path,
+    recorded: &Recorded,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    let is_over = |(name, _, _): &(String, f64, f64)| name.starts_with("over_");
+    if !recorded.segments.iter().any(is_over) {
+        return Ok(());
+    }
+    let derived = over::derive(recorded);
+    for (name, unit, value) in derived.named() {
+        let Value::Of(value) = value else {
+            out.say(&format!("  {name:<48} –"))?;
+            continue;
+        };
+        let record = Record::new("strokes-summary", "over")
+            .with("file", file.display().to_string())
+            .with("metric", name)
+            .with("unit", unit.name())
+            .with("value", value);
+        out.record(&record)?;
+        out.say(&format!("  {name:<48} {value:>9.2} {}", unit.name()))?;
+    }
+    for note in derived.notes() {
+        out.say(&format!("  {note}"))?;
     }
     Ok(())
 }
@@ -308,6 +352,72 @@ mod tests {
             level_jump: jump,
             ..Frame::default()
         }
+    }
+
+    #[test]
+    fn an_over_record_gives_each_metric_it_has_and_says_what_its_pairs_were() {
+        // The chain alone: two strokes in `over_first`, the third touching 25 ms into its own
+        // segment over 90 dabs still to land, its first dab shown by a frame begun 50 ms on.
+        let (first, chain) = (Some("over_first"), Some("over_chain"));
+        let landing = |segment, time_ms, latency, catching_up| Frame {
+            dabs_catching_up: Some(catching_up),
+            kept_bytes: Some(100.0 * 1024.0 * 1024.0),
+            ..frame(segment, time_ms, true, latency, (0.0, 0.0), None)
+        };
+        let recorded = Recorded {
+            open_strokes_share: Some(1024.0 * 1024.0 * 1024.0),
+            segments: vec![
+                ("over_first".to_owned(), 0.0, 100.0),
+                ("over_chain".to_owned(), 100.0, 500.0),
+            ],
+            downs: vec![("over_chain".to_owned(), 125.0)],
+            frames: vec![
+                landing(first, 20.0, Some(3.0), 40.0),
+                landing(first, 90.0, Some(3.0), 90.0),
+                landing(chain, 175.0, Some(46.0), 95.0),
+                landing(chain, 200.0, Some(4.0), 80.0),
+            ],
+            ..Recorded::default()
+        };
+        assert!(rows(&recorded).is_empty(), "no stroke row");
+        let mut out = Output::new(Vec::new(), Vec::new());
+        say_over(Path::new("over.jsonl"), &recorded, &mut out).unwrap();
+        let (json, human) = out.into_parts();
+        let (json, human) = (
+            String::from_utf8(json).unwrap(),
+            String::from_utf8(human).unwrap(),
+        );
+        // From the touch at 125 ms to the present submitted at 177 ms.
+        assert!(
+            json.contains(r#""result":"over","file":"over.jsonl","metric":"render.over_chain.third_down_ms","unit":"ms","value":52"#),
+            "{json}"
+        );
+        assert_eq!(json.lines().count(), 2, "the chain's two metrics: {json}");
+        let lines: Vec<&str> = human.lines().map(str::trim).collect();
+        let lacked = lines
+            .iter()
+            .find(|line| line.starts_with("render.over_ordinary.cold_down_ms"));
+        assert!(
+            lacked.is_some_and(|line| line.ends_with('–')),
+            "a metric it lacks is a dash: {human}"
+        );
+        assert!(
+            lines.contains(&"over_chain over 90 dabs still to land"),
+            "{human}"
+        );
+        assert!(
+            lines.contains(&"open strokes held at most 100.0 MiB of their 1024 MiB (9.8 %)"),
+            "{human}"
+        );
+        // A strokes record says nothing of it.
+        let strokes = Recorded {
+            segments: vec![("stroke_far".to_owned(), 10.0, 100.0)],
+            ..Recorded::default()
+        };
+        let mut none = Output::new(Vec::new(), Vec::new());
+        say_over(Path::new("strokes.jsonl"), &strokes, &mut none).unwrap();
+        let (no_json, no_line) = none.into_parts();
+        assert!(no_json.is_empty() && no_line.is_empty(), "nothing said");
     }
 
     #[test]

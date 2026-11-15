@@ -16,7 +16,9 @@
 //! - **the renderer** on each project: the app's scripted camera path (`brushcraft --script`,
 //!   offscreen, on a hardware GPU at 4K) in a copy with its display layer saved: orbit frame time
 //!   on the GPU and the CPU, tiles over budget during the orbit, spin catch-up and open to correct
-//!   ([`render`]); "not run: no adapter" on a machine with no GPU;
+//!   ([`render`]); the pen's strokes, and a stroke drawn over one still landing (its `Down` to its
+//!   first dab shown, cold, after a hover, and once the earlier stroke has landed); "not run: no
+//!   adapter" on a machine with no GPU;
 //! - with `--full`, **the full project** (the benchmark sphere, measured through a reflinked copy):
 //!   the same set, for milestones.
 //!
@@ -882,6 +884,45 @@ mod tests {
         let target = Target::check(&capped.metric);
         let over = table_line(&capped, None, Some(Verdict::New), target);
         assert!(over.contains("OVER TARGET by 0.2 ms (ceiling 2)"), "{over}");
+    }
+
+    /// A metric the baseline run didn't have (one added to the suite since) is new: printed so,
+    /// neither flagged nor inconclusive, beside the metrics the baseline does have.
+    #[test]
+    fn a_metric_the_baseline_lacks_is_new_and_flags_nothing() {
+        let run = [
+            entry(
+                "medium.brush.p99_ms",
+                2.0,
+                "2026-10-24T00:00:02Z",
+                false,
+                "cpu",
+            ),
+            entry(
+                "medium.render.over_heavy.warmed_down_ms",
+                60.0,
+                "2026-10-24T00:00:02Z",
+                false,
+                "cpu",
+            ),
+        ];
+        let base = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:01Z",
+            true,
+            "cpu",
+        );
+        let mut out = Output::new(Vec::new(), Vec::new());
+        let (flagged, noisy) = report(&run, &[base], Label::Quiet, &mut out).unwrap();
+        assert_eq!((flagged, noisy), (0, 0), "nothing to hold it against");
+        assert_eq!(status(flagged, noisy, &mut out).unwrap(), Status::Clean);
+        let (_, human) = out.into_parts();
+        let human = String::from_utf8(human).unwrap();
+        let line = |name: &str| human.lines().find(|line| line.starts_with(name)).unwrap();
+        let new = line("medium.render.over_heavy.warmed_down_ms");
+        assert!(new.ends_with("new") && !new.contains("was"), "{new}");
+        assert!(line("medium.brush.p99_ms").ends_with("same"), "{human}");
     }
 
     /// A timed metric never reached against its ceiling is a target miss: printed as such, and
