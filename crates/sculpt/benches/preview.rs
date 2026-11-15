@@ -44,6 +44,14 @@
 //!   pays for the backlog, on the finest tiles and on display tiles.
 //! - [`note_late_in_stroke`]: [`Preview::note_applied`] of one dab with [`LONG_STROKE`]'s dabs
 //!   before it: what a dab pays for the stroke's length in `push_stroke`.
+//! - [`over_first`], [`over_first_noted`] and [`over_steady`]: [`Preview::show_over`] of a dab of a
+//!   small stroke drawn along a small stroke's ridge still landing ([`Over`]: both of
+//!   [`LATE_RADIUS`], the earlier one's [`OVER_DABS`] dabs shown and none landed, the later one's
+//!   op reserved over its futures), drawn at every level: its first dab, where its previews first
+//!   meet the earlier stroke's and the seams between them are made (with what the stitch looks up
+//!   noted ahead, as under a hovering pen, or not), and a dab well into it, where they are kept.
+//!   [`alone_first`] and [`alone_steady`] are the same dabs of a stroke with no other under way:
+//!   what the showing costs without the seams.
 
 #![expect(
     clippy::expect_used,
@@ -51,12 +59,19 @@
 )]
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
-use sculpt::{DrawsAll, Preview, StoreSurface, Stroke, apply_dabs};
-use store::{Evaluation, Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
+use sculpt::{
+    DrawsAll, Futures, OpenStrokes, PenDownTiles, Preview, StoreSurface, Stroke, StrokeEdits,
+    apply_dabs,
+};
+use store::{
+    CacheError, Evaluation, OpId, PenDownReading, Project, ProjectConfig, Ray, ReservedOp,
+    SpatialIndex, StoreConfig, TileStore,
+};
 use stroke::{DVec3, Dab, Surface};
 
 fn main() {
@@ -71,6 +86,15 @@ const LATE_STROKE: [usize; 2] = [1_370, 5_000];
 
 /// The radius of those dabs: the benchmark's small brush, a few tiles a dab.
 const LATE_RADIUS: f32 = 0.05;
+
+/// The earlier stroke's dabs in the benches of a stroke over one still landing ([`Over`]).
+const OVER_DABS: u32 = 120;
+
+/// Which of the earlier stroke's dabs the later stroke begins on ([`Over`]): the ridge's middle.
+const OVER_FROM: u32 = 60;
+
+/// The later stroke's dabs shown before the one [`over_steady`] times.
+const OVER_SHOWN: u32 = 10;
 
 /// The dabs before the one noted in [`note_late_in_stroke`].
 const LONG_STROKE: [usize; 3] = [100, 1_000, 10_000];
@@ -784,4 +808,306 @@ fn area_normal_cold(bencher: divan::Bencher<'_, '_>) {
             surface.finish().expect("the area normal");
             sum
         });
+}
+
+/// The strokes of [`Over`] as the previews read them: the earlier one's op begun, the later
+/// one's reserved over futures all installed.
+struct Two<'a> {
+    /// The store.
+    store: &'a mut TileStore,
+    /// The spatial index, refitted over the futures.
+    index: &'a SpatialIndex,
+    /// The earlier stroke's op.
+    earlier: OpId,
+    /// The later stroke's.
+    later: &'a ReservedOp,
+}
+
+impl OpenStrokes for Two<'_> {
+    fn current(&mut self) -> (PenDownReading<'_>, &SpatialIndex) {
+        (self.store.read_pen_down(), self.index)
+    }
+
+    fn read(&mut self, op: OpId) -> Result<(PenDownReading<'_>, &SpatialIndex), CacheError> {
+        if op == self.earlier {
+            return Ok(self.current());
+        }
+        Ok((self.store.read_pen_down_of(self.later)?, self.index))
+    }
+
+    fn reserved(&self, op: OpId) -> bool {
+        op == self.later.op()
+    }
+
+    fn ready(&mut self, _op: OpId, _dabs: &[Dab], _displays: &[TileKey]) -> bool {
+        true
+    }
+}
+
+/// A small stroke about to be drawn along a small stroke's ridge.
+///
+/// The earlier stroke's [`OVER_DABS`] dabs of [`LATE_RADIUS`] are shown and none landed; with
+/// `landing`, the later stroke's op is reserved behind it, the future of every tile the earlier
+/// one changes installed and the index refitted over them, as the app has them by the time a
+/// stroke's dabs are shown. Without, the earlier stroke has landed and ended, and the later one
+/// is alone.
+struct Over {
+    /// The project, with the earlier stroke's dabs shown (or landed).
+    ridge: Ridge,
+    /// The strokes' ops, the later one's reserved, while the earlier stroke still lands.
+    ops: Option<(OpId, ReservedOp)>,
+    /// How many dabs of the later stroke are placed.
+    drawn: u32,
+}
+
+impl Over {
+    /// The strokes, the later one with no dab yet.
+    ///
+    /// # Panics
+    ///
+    /// If the fixed setup is rejected, which would be a bug.
+    fn new(landing: bool) -> Self {
+        let mut ridge = Ridge::made(LATE_RADIUS, 0, true);
+        let earlier = ridge
+            .project
+            .store()
+            .current_op()
+            .expect("the ridge's stroke");
+        let dabs: Vec<Dab> = (0..OVER_DABS).map(|_| ridge.next_dab()).collect();
+        if !landing {
+            ridge.apply(&dabs);
+            ridge.project.end_unrecorded_stroke().expect("ended");
+            ridge.project.begin_stroke_and_wait().expect("stroke");
+            ridge.stroke = Stroke::new(ridge.project.store());
+            return Self {
+                ridge,
+                ops: None,
+                drawn: 0,
+            };
+        }
+        let later = ridge.project.begin_stroke_after().expect("reserved");
+        let reached = dabs.iter().flat_map(|dab| {
+            let [x, y, z] = dab.position;
+            ridge
+                .index
+                .query_sphere(Vec3::new(x, y, z), dab.radius * 1.01)
+        });
+        let reached: BTreeSet<TileKey> = reached.collect();
+        let keys: Vec<TileKey> = reached.iter().copied().collect();
+        let mut edits = StrokeEdits::new(earlier, None);
+        {
+            let store = ridge.project.store();
+            let pen_down = PenDownTiles::of_oldest(store, earlier, &reached).expect("pen-down");
+            edits.place(store, &dabs, &pen_down).expect("placed");
+            edits.seal();
+            let futures = Futures::new(store, &ridge.stroke, &[&edits]).expect("futures");
+            let made = futures.futures_of(store, &keys);
+            for (key, future) in keys.iter().zip(made) {
+                let tile = future.expect("a future").into_tile();
+                store
+                    .install_pen_down_of(&later, *key, tile, Some(earlier))
+                    .expect("installed");
+            }
+        }
+        ridge
+            .index
+            .refit(ridge.project.store(), &keys)
+            .expect("refitted");
+        let mut over = Self {
+            ridge,
+            ops: Some((earlier, later)),
+            drawn: 0,
+        };
+        over.show_of(earlier, &dabs);
+        over
+    }
+
+    /// Shows `dabs` of stroke `op`, drawn at every level.
+    ///
+    /// # Panics
+    ///
+    /// If showing fails or shows fewer, which would be a bug.
+    fn show_of(&mut self, op: OpId, dabs: &[Dab]) {
+        let (earlier, later) = self.ops.as_ref().expect("two strokes");
+        let mut two = Two {
+            store: self.ridge.project.store(),
+            index: &self.ridge.index,
+            earlier: *earlier,
+            later,
+        };
+        let shown = self
+            .ridge
+            .preview
+            .show_over(&mut two, op, dabs, &DrawsAll)
+            .expect("show");
+        assert_eq!(shown.dabs, dabs.len(), "every dab shown");
+    }
+
+    /// Shows `dab` of the later stroke.
+    ///
+    /// # Panics
+    ///
+    /// As [`Over::show_of`].
+    fn show(&mut self, dab: &Dab) {
+        let dabs = std::slice::from_ref(dab);
+        if let Some(later) = self.ops.as_ref().map(|(_, later)| later.op()) {
+            self.show_of(later, dabs);
+            return;
+        }
+        let ridge = &mut self.ridge;
+        let store = ridge.project.store();
+        let shown = ridge.preview.show(store, &ridge.index, dabs, &DrawsAll);
+        assert_eq!(shown.expect("show").dabs, 1, "the dab shown");
+    }
+
+    /// The later stroke's next dab: along the earlier stroke's path from its middle, its centre
+    /// on the later stroke's pen-down surface (the ridge as it will land), its normal outward.
+    ///
+    /// # Panics
+    ///
+    /// If the raycast fails or misses the closed surface, which would be a bug.
+    fn next_dab(&mut self) -> Dab {
+        let direction = self.ridge.direction(OVER_FROM + self.drawn);
+        let ray = stroke::Ray::new(
+            DVec3::from_f32(direction * 3.0),
+            DVec3::from_f32(direction * -1.0),
+        )
+        .expect("ray");
+        let (store, index) = (self.ridge.project.store(), &self.ridge.index);
+        let mut surface = match &self.ops {
+            Some((_, later)) => StoreSurface::of_reserved(store, index, later).expect("reserved"),
+            None => StoreSurface::new(store, index),
+        };
+        let hit = surface
+            .raycast(&ray)
+            .expect("the ray meets the closed surface");
+        surface.finish().expect("the raycast");
+        let centre = hit.position.to_f32();
+        let dab = Dab {
+            position: [centre.x, centre.y, centre.z],
+            normal: [direction.x, direction.y, direction.z],
+            tangent: [0.0, 0.0, 1.0],
+            radius: LATE_RADIUS,
+            strength: 0.1 * LATE_RADIUS,
+            hardness: 0.0,
+            seq: self.drawn,
+            ..Dab::default()
+        };
+        self.drawn += 1;
+        dab
+    }
+
+    /// The finest tiles `dab` reaches by the index.
+    fn reach(&self, dab: &Dab) -> Vec<TileKey> {
+        let [x, y, z] = dab.position;
+        let reached = self
+            .ridge
+            .index
+            .query_sphere(Vec3::new(x, y, z), dab.radius * 1.01);
+        reached.collect()
+    }
+}
+
+/// The first dab of the later stroke of an [`Over`] made per sample (`landing` as [`Over::new`]),
+/// shown: what [`over_first`] and [`alone_first`] time.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+fn first_dab(bencher: divan::Bencher<'_, '_>, landing: bool) {
+    bencher
+        .with_inputs(|| {
+            let mut over = Over::new(landing);
+            let dab = over.next_dab();
+            (over, dab)
+        })
+        .bench_local_values(|(mut over, dab)| {
+            over.show(&dab);
+            over
+        });
+}
+
+/// A dab of the later stroke of an [`Over`] with [`OVER_SHOWN`] of its dabs shown before
+/// (`landing` as [`Over::new`]), shown: what [`over_steady`] and [`alone_steady`] time.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+fn steady_dab(bencher: divan::Bencher<'_, '_>, landing: bool) {
+    let over = RefCell::new(Over::new(landing));
+    for _ in 0..OVER_SHOWN {
+        let over = &mut *over.borrow_mut();
+        let dab = over.next_dab();
+        over.show(&dab);
+    }
+    bencher
+        .with_inputs(|| over.borrow_mut().next_dab())
+        .bench_local_values(|dab| over.borrow_mut().show(&dab));
+}
+
+/// [`Preview::show_over`] of the first dab of a stroke over one still landing: see the module
+/// notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 7, sample_size = 1)]
+fn over_first(bencher: divan::Bencher<'_, '_>) {
+    first_dab(bencher, true);
+}
+
+/// [`Preview::show_over`] of the first dab of a stroke over one still landing, the seams about
+/// it noted ahead: see the module notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 7, sample_size = 1)]
+fn over_first_noted(bencher: divan::Bencher<'_, '_>) {
+    bencher
+        .with_inputs(|| {
+            let mut over = Over::new(true);
+            let dab = over.next_dab();
+            let near = over.reach(&dab);
+            let store = over.ridge.project.store();
+            over.ridge.preview.warm_seams(store, &near);
+            (over, dab)
+        })
+        .bench_local_values(|(mut over, dab)| {
+            over.show(&dab);
+            over
+        });
+}
+
+/// [`Preview::show_over`] of a dab of a stroke well into its way over one still landing: see the
+/// module notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 40, sample_size = 1)]
+fn over_steady(bencher: divan::Bencher<'_, '_>) {
+    steady_dab(bencher, true);
+}
+
+/// [`Preview::show`] of the first dab of the same stroke with no other under way: see the module
+/// notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 7, sample_size = 1)]
+fn alone_first(bencher: divan::Bencher<'_, '_>) {
+    first_dab(bencher, false);
+}
+
+/// [`Preview::show`] of a dab of the same stroke well into its way, with no other under way: see
+/// the module notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 40, sample_size = 1)]
+fn alone_steady(bencher: divan::Bencher<'_, '_>) {
+    steady_dab(bencher, false);
 }
