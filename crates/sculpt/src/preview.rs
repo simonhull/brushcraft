@@ -1869,7 +1869,9 @@ impl Preview {
     /// Hands the display previews of `keys` to the store, each held as the store says now, and
     /// drawing a later stroke's bits at the vertices it shares with that stroke's previews, as
     /// the call's last seams left them (see "Seams" in the module notes; [`Preview::stitch`]
-    /// makes them again at the call's end).
+    /// makes them again at the call's end). One that comes out as the store holds it already,
+    /// every bit of it ([`same_bits`]), is left there: what the store holds is what it compares
+    /// with, so nothing is kept to go stale, and a preview the refresh dropped is handed over.
     ///
     /// # Errors
     ///
@@ -1917,6 +1919,12 @@ impl Preview {
         drop(publishing);
         self.put_states(taken);
         for (key, _, preview) in made {
+            // One the store holds already, bit for bit, isn't handed over again: a renderer has
+            // it, or is about to, and a stitch finds most of the previews about it as they were.
+            let held = store.display_preview(&key);
+            if held.is_some_and(|held| same_bits(held, &preview)) {
+                continue;
+            }
             store.set_display_preview(key, preview)?;
             stats.tiles_set += 1;
         }
@@ -2592,6 +2600,22 @@ impl Preview {
         }
         Ok(())
     }
+}
+
+/// Whether display previews `a` and `b` are the same, bit for bit: what is drawn, its normals,
+/// its roughness, its bound and whether it is held. A renderer handed one has the other.
+///
+/// Bits, not values: a `-0.0` for a `0.0` is another preview, and a NaN equals itself.
+fn same_bits(a: &DisplayPreview, b: &DisplayPreview) -> bool {
+    let same = |these: &[Vec3], those: &[Vec3]| {
+        let mut pairs = these.iter().zip(those);
+        these.len() == those.len() && pairs.all(|(p, q)| p.to_bits() == q.to_bits())
+    };
+    a.held == b.held
+        && a.bound.to_bits() == b.bound.to_bits()
+        && a.roughness == b.roughness
+        && same(&a.positions, &b.positions)
+        && same(&a.normals, &b.normals)
 }
 
 /// The tiles `keys`, gathered with their rings, as tiles to move, with their pen-down blocks: each
