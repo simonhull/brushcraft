@@ -37,4 +37,5 @@ rustix = { workspace = true, features = ["net", "process"] }
 
 [dev-dependencies]
 bolero.workspace = true
+sculpt = { workspace = true, features = ["test-hooks"] }
 store = { workspace = true, features = ["test-hooks"] }

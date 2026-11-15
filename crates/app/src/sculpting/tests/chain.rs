@@ -1874,6 +1874,227 @@ fn with_futures_at_hand_the_tiles_asked_for_lie_between_those_a_read_reaches_and
     run.close();
 }
 
+/// A display preview as the store holds it, bit for bit.
+#[derive(Debug, PartialEq, Eq)]
+struct DisplayBits {
+    /// Its positions.
+    positions: Vec<[u32; 3]>,
+    /// Its normals.
+    normals: Vec<[u32; 3]>,
+    /// Its roughness.
+    roughness: Vec<u8>,
+    /// Its bound.
+    bound: u32,
+    /// Whether it is held.
+    held: bool,
+}
+
+/// Everything the store's previews hold, bit for bit: what a renderer is handed.
+#[derive(Debug, PartialEq, Eq)]
+struct ShownBits {
+    /// Each finest preview's every point, its ring and its base-vertex rings included.
+    finest: BTreeMap<TileKey, Vec<[u32; 3]>>,
+    /// Each display preview.
+    display: BTreeMap<TileKey, DisplayBits>,
+    /// Where two previews holding the same vertex draw it differently ([`cracks`]).
+    cracks: Vec<String>,
+}
+
+impl ShownBits {
+    /// What `store` previews now.
+    fn of(store: &TileStore) -> Self {
+        let bits = |v: &Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+        let finest = store.previewed().map(|&key| {
+            let block = store.preview(&key).expect("previewed");
+            (key, points(block).iter().map(bits).collect())
+        });
+        let display = store.display_previewed().filter_map(|&key| {
+            let preview = store.display_preview(&key)?;
+            let shown = DisplayBits {
+                positions: preview.positions.iter().map(bits).collect(),
+                normals: preview.normals.iter().map(bits).collect(),
+                roughness: preview.roughness.clone(),
+                bound: preview.bound.to_bits(),
+                held: preview.held,
+            };
+            Some((key, shown))
+        });
+        Self {
+            finest: finest.collect(),
+            display: display.collect(),
+            cracks: cracks(store),
+        }
+    }
+}
+
+/// How a run of [`seams_drawn`] ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeamsEnd {
+    /// Every stroke lands, one after another.
+    Landed,
+    /// The oldest stroke's landing fails: it drops its dabs, and the strokes after it go too.
+    Dropped,
+}
+
+/// Draws three strokes of `strokes` (each `Down` to `Up`), each over those before it still
+/// landing, and lands them, on a face of many tiles; returns what the previews hold after every
+/// step, bit for bit.
+///
+/// The steps are those that change what previews of different strokes meet on: each sample of
+/// the second stroke (its `Down` where the pen hovered first, so the seams there were noted
+/// ahead), dabs of the first landing, each sample of the third stroke over both, the first
+/// landing whole and ending, then, as `end` says, the second landing a few dabs and everything
+/// landing, or the oldest dropping its dabs and the others going with it.
+///
+/// With `afresh`, the brush's previews forget before every step what their stitches keep
+/// between calls ([`sculpt::Preview::forget_seams`]), so every stitch makes it again.
+///
+/// A step is settled before it is looked at: frames with no sample until every dab placed is
+/// shown, and `prepare`s until no display preview waits to be made a later stroke's. How much of
+/// that a step does itself goes by the clock ([`over::FUTURES_TIME`]); what is shown once it is
+/// done doesn't.
+fn seams_drawn(
+    epoch: Instant,
+    strokes: &[Vec<PenSample>; 3],
+    afresh: bool,
+    end: SeamsEnd,
+) -> Vec<ShownBits> {
+    let level = Level::new(BACKLOG_LEVEL).expect("a level");
+    let config = StoreConfig::new(256 << 20, 1).with_display(level);
+    let mut run = Chain::new(epoch, Some(config));
+    run.build_display();
+    run.brush.set_radius(ORDINARY_RADIUS);
+    let [first, second, third] = strokes;
+    let mut shown: Vec<ShownBits> = Vec::new();
+    let forget = |chain: &mut Chain| {
+        if let Some(preview) = chain.brush.preview.as_mut().filter(|_| afresh) {
+            preview.forget_seams();
+        }
+    };
+    let settle = |chain: &mut Chain, steps: &mut Vec<ShownBits>| {
+        for _ in 0..HOVER_FRAMES {
+            let unshown = chain.brush.strokes.iter().any(|stroke| {
+                let mut sources = stroke.sources.iter();
+                sources.any(|source| !source.shown)
+            });
+            let preview = chain.brush.preview.as_ref();
+            let pending = preview.is_some_and(Preview::displays_pending);
+            if !unshown && !pending {
+                break;
+            }
+            forget(chain);
+            if unshown {
+                chain.frame(&[]);
+            } else {
+                chain.prepare();
+            }
+        }
+        steps.push(ShownBits::of(chain.project.store()));
+    };
+    run.frame(first);
+    run.prepare();
+    run.cut();
+    // The second stroke, where the pen hovered: its seams noted ahead.
+    let down = second.first().expect("a Down");
+    run.hover(pixel_of(down));
+    if !afresh {
+        let kept = run.brush.preview.as_ref().map(Preview::seams_kept);
+        assert!(kept > Some(0), "the hover noted seams ahead: {kept:?}");
+    }
+    forget(&mut run);
+    assert_eq!(run.route(down), Route::Brush, "on the surface");
+    for sample in second {
+        forget(&mut run);
+        run.frame(std::slice::from_ref(sample));
+        settle(&mut run, &mut shown);
+    }
+    assert_eq!(run.ops().len(), 2, "the second began over the first");
+    let kept = run.brush.preview.as_ref().map(Preview::seams_kept);
+    assert!(
+        kept > Some(0),
+        "the stitches kept what they looked up: {kept:?}"
+    );
+    // Dabs of the first land under both.
+    for _ in 0..3 {
+        forget(&mut run);
+        assert_eq!(run.land_one().dabs_applied, 1, "the first lands a dab");
+        settle(&mut run, &mut shown);
+    }
+    // A third stroke, over both.
+    for sample in third {
+        forget(&mut run);
+        run.frame(std::slice::from_ref(sample));
+        settle(&mut run, &mut shown);
+    }
+    assert_eq!(run.ops().len(), 3, "the third began over both");
+    if end == SeamsEnd::Dropped {
+        run.brush.knob = Knob::LandingFails;
+        forget(&mut run);
+        run.land_one();
+        assert!(run.ops().is_empty(), "every stroke ended");
+        run.brush.knob = Knob::None;
+        // The strokes over, the display previews left are released, each as its stroke left
+        // it, drawn until the refresh replaces it: no stitch makes them meet any more.
+        let mut left = ShownBits::of(run.project.store());
+        left.cracks.clear();
+        shown.push(left);
+        run.brush.abandon();
+        run.close();
+        return shown;
+    }
+    // The first lands whole and ends: the second's op begins.
+    let mut steps = 0;
+    while run.ops().len() > 2 {
+        forget(&mut run);
+        run.land_one();
+        settle(&mut run, &mut shown);
+        steps += 1;
+        assert!(steps < 10_000, "the first lands");
+    }
+    run.cut();
+    for _ in 0..3 {
+        forget(&mut run);
+        assert_eq!(run.land_one().dabs_applied, 1, "the second lands a dab");
+        settle(&mut run, &mut shown);
+    }
+    forget(&mut run);
+    run.land_all();
+    shown.push(ShownBits::of(run.project.store()));
+    run.close();
+    shown
+}
+
+#[test]
+fn what_a_stitch_keeps_between_calls_changes_nothing_the_previews_show() {
+    // The tiles around each preview and the previews' places, kept from stitch to stitch and
+    // noted ahead under a hovering pen, against the same made afresh by every stitch: the same
+    // previews after every step, bit for bit.
+    for end in [SeamsEnd::Landed, SeamsEnd::Dropped] {
+        let epoch = Instant::now();
+        let strokes = [
+            stroke(((110.0, 100.0), (210.0, 110.0)), 30),
+            stroke(((150.0, 101.0), (176.0, 112.0)), 8),
+            stroke(((140.0, 110.0), (185.0, 100.0)), 8),
+        ];
+        let kept = seams_drawn(epoch, &strokes, false, end);
+        let afresh = seams_drawn(epoch, &strokes, true, end);
+        assert_eq!(kept.len(), afresh.len(), "{end:?}: the same steps");
+        let met = kept.iter().any(|shown| shown.finest.len() > 1);
+        assert!(met, "{end:?}: finest previews were shown");
+        let steps = kept.iter().zip(&afresh).enumerate();
+        for (step, (with, without)) in steps {
+            let same = with == without;
+            assert!(same, "{end:?}: the previews differ after step {step}");
+            assert!(
+                with.cracks.is_empty(),
+                "{end:?}: previews apart after step {step}: {} vertices, the first {:?}",
+                with.cracks.len(),
+                with.cracks.first()
+            );
+        }
+    }
+}
+
 /// How many times each timed case is drawn ([`time_downs`]): the median and the spread are said.
 const TIMED_RUNS: usize = 7;
 

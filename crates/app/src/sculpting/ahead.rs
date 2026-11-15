@@ -53,6 +53,11 @@ pub(super) const HOVER_SETTLED: Duration = Duration::from_millis(50);
 /// they are few; a `Down` reading more makes the rest as it comes.
 pub(super) const AHEAD_MOST: usize = 128;
 
+/// How many of the tiles whose futures are made ahead have the seams about them noted in one
+/// `prepare` ([`Sculpting::note_seams_ahead`]): each some tens of microseconds a preview about
+/// it, the first time.
+pub(super) const SEAMS_A_CALL: usize = 8;
+
 /// What is to be done of the futures made ahead, in one `prepare`
 /// ([`Sculpting::list_to_warm`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +122,9 @@ pub(super) struct Ahead {
     pub(super) todo: Vec<TileKey>,
     /// When a batch of them was last made; `None` if none was since they were let go.
     pub(super) made_at: Option<Instant>,
+    /// How many of `tiles`, in key order, have had the seams about them noted ahead
+    /// ([`Sculpting::note_seams_ahead`]) since they were last listed.
+    pub(super) seamed: usize,
 }
 
 impl Ahead {
@@ -325,6 +333,46 @@ impl Sculpting {
             .rev()
             .filter(|key| !self.ahead.tiles.contains_key(key));
         self.ahead.todo = todo.collect();
+        self.ahead.seamed = 0;
+    }
+
+    /// Notes ahead, for the previews about the tiles whose futures are made ahead, what the
+    /// first stitch of a stroke begun there looks up ([`sculpt::Preview::warm_seams`]):
+    /// [`SEAMS_A_CALL`] tiles a call, while the clock is before `deadline`. Returns whether some
+    /// are still to note.
+    ///
+    /// Only once every future listed for where the pen hovers is made, up to the newest stroke
+    /// under way: the tiles those futures are of are the ones a `Down` there reads of the
+    /// strokes under way, so the ones its first dabs' previews meet theirs on. Never for a pen
+    /// moving fast (`warming`, [`Sculpting::list_to_warm`]'s answer), as no future is.
+    ///
+    /// What is noted follows from the mesh alone, so nothing here can go stale, and a `Down`
+    /// that finds none noted notes them itself, as before.
+    pub(super) fn note_seams_ahead(
+        &mut self,
+        scene: &mut Scene<'_>,
+        warming: Warming,
+        deadline: Instant,
+    ) -> bool {
+        let newest = self.strokes.last().map(|stroke| stroke.op.id());
+        let hovering = self.warm.wanted.is_some() && !self.warm.fast;
+        let made = warming != Warming::Later
+            && self.ahead.todo.is_empty()
+            && self.ahead.target.is_some()
+            && self.ahead.after == newest;
+        let Some(preview) = self.preview.as_mut().filter(|_| hovering && made) else {
+            return false;
+        };
+        let left = self.ahead.tiles.keys().skip(self.ahead.seamed);
+        let next: Vec<TileKey> = left.take(SEAMS_A_CALL).copied().collect();
+        if next.is_empty() {
+            return false;
+        }
+        if Instant::now() < deadline {
+            preview.warm_seams(scene.project.store(), &next);
+            self.ahead.seamed += next.len();
+        }
+        self.ahead.seamed < self.ahead.tiles.len()
     }
 
     /// Installs, ahead of a pen drawing over strokes still landing, the futures its next samples

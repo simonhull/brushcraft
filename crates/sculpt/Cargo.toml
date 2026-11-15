@@ -9,6 +9,11 @@ description = "Brushes: steps that edit a project's corrections through its stor
 [lints]
 workspace = true
 
+[features]
+# `Preview::forget_seams` and `Preview::seams_kept`: what the app's tests need to show that what
+# a stitch keeps between calls changes nothing drawn. Turned on by tests only.
+test-hooks = []
+
 [dependencies]
 bytemuck.workspace = true
 geom.workspace = true

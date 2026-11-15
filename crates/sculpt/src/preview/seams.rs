@@ -7,8 +7,9 @@
 //! ([`Places`]) tells, slot by slot, which vertex of which face the tile holds there: its
 //! **place** ([`Place`]), the same in every tile holding it.
 
-use geom::{FaceId, GatheredBlock, Level, PositionSource, Region, TileKey, Vec3, gather_block};
-use store::TileStore;
+use geom::{
+    BaseMesh, FaceId, GatheredBlock, Level, PositionSource, Region, TileKey, Vec3, gather_block,
+};
 
 /// A vertex of a face's grid at a level: its face's index, its column and its row.
 pub(super) type Place = (u32, u32, u32);
@@ -48,8 +49,8 @@ pub(super) fn place_of(point: Vec3) -> Option<Place> {
 ///
 /// Row-major: those it shares with the tiles around it, at its level, its region gathered at its
 /// own level. Empty if the region can't be gathered.
-pub(super) fn border_places(store: &TileStore, key: &TileKey) -> Vec<(usize, Place)> {
-    let Ok(block) = gather_block(store.mesh(), &Places, Region::of_tile(key)) else {
+pub(super) fn border_places(mesh: &BaseMesh, key: &TileKey) -> Vec<(usize, Place)> {
+    let Ok(block) = gather_block(mesh, &Places, Region::of_tile(key)) else {
         return Vec::new();
     };
     let side = key.side();
@@ -80,9 +81,9 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    /// Finest tile `key`'s; `None` if its region can't be gathered.
-    pub(super) fn of(store: &TileStore, key: &TileKey) -> Option<Self> {
-        let block = gather_block(store.mesh(), &Places, Region::of_tile(key)).ok()?;
+    /// Finest tile `key`'s on `mesh`; `None` if its region can't be gathered.
+    pub(super) fn of(mesh: &BaseMesh, key: &TileKey) -> Option<Self> {
+        let block = gather_block(mesh, &Places, Region::of_tile(key)).ok()?;
         let side = usize::try_from(block.side()).ok()?;
         let padded = side * side;
         // Padded lines 0 ..= side - 1 are the block's lines -1 ..= quads + 1.

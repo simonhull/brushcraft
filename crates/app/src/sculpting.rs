@@ -304,6 +304,11 @@
 //!   and stands in the way of a stroke beginning alone; a future kept apart needs none of that, and
 //!   is right for as long as the stroke it was made up to is under way (see [`Ahead`] for why, and
 //!   when it goes).
+//! - **The seams noted ahead** ([`Sculpting::note_seams_ahead`]): once those futures are made, what
+//!   the first stitch of a stroke begun there looks up of the previews about their tiles (which
+//!   tiles lie around each, and where their vertices lie on the faces' grids:
+//!   [`Preview::warm_seams`]) is noted, a few tiles a call. It follows from the mesh alone, so it
+//!   never goes stale, and a `Down` elsewhere notes its own.
 //! - **At the `Down`**, the futures it reads are installed from those ([`over::install`]), none
 //!   made; and a tile whose future is at hand is asked for only if the read reaches the box it has
 //!   as stored or its future's own ([`over::needed`]), so the `Down` installs the few it reads, not
@@ -314,9 +319,10 @@
 //!   straight in.
 //! - **What is left on the pen's path** once warmed: installing each future (its shape's box, then
 //!   its positions, normals and raycast blocks as the stroke first reads them, which only an op's
-//!   own set can hold), and the first frame's previews over them, the seams with the earlier
-//!   strokes' previews above all. A batch under way when the `Down` arrives is finished first: the
-//!   tiles it holds are those the `Down` would have made.
+//!   own set can hold), and the first frame's previews over them with their seams: choosing, where
+//!   they meet the earlier strokes' previews, whose bits show, and drawing those. A batch under way
+//!   when the `Down` arrives is finished first: the tiles it holds are those the `Down` would have
+//!   made.
 //!
 //! # Errors
 //!
@@ -3297,11 +3303,13 @@ impl Brush for Sculpting {
                 self.caught_up = std::mem::take(&mut self.caught_up).then(report);
             }
             let more_ahead = listed && self.make_ahead_in_time(&mut scene, ahead_first, deadline);
+            let more_ahead = more_ahead || self.note_seams_ahead(&mut scene, warming, deadline);
             // More of the catch-up wanted only while it moves on: a pen drawing takes only dabs
             // that fit, and the next frame (wanted while dabs are queued) tries again.
             return Ok((progress && self.queued() > 0) || more_ahead);
         }
         let more_ahead = listed && self.make_ahead_in_time(&mut scene, ahead_first, deadline);
+        let more_ahead = more_ahead || self.note_seams_ahead(&mut scene, warming, deadline);
         // At least one piece of work each call, so warming finishes even in frames that overrun.
         let mut worked = false;
         if self.warm.wanted != self.warm.target {

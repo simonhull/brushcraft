@@ -111,6 +111,14 @@
 //! bound measures the vertices it draws (the `display` module's "The bound"). One whose vertex
 //! another no longer wins (the later stroke's preview gone) is made again.
 //!
+//! A stitch looks at the previews about the tiles its call changed, and what it looks up there
+//! is kept from call to call, until the last stroke ends: which tiles lie around each preview
+//! (`Neighbours`) and where each preview's vertices lie on the faces' grids (the `seams`
+//! module), both set by the mesh alone, so nothing a dab or a landing does makes them stale.
+//! Which previews hold a vertex, whose they are and what they draw there is asked afresh by
+//! every stitch. A caller that knows where a stroke is about to begin over those landing has
+//! them noted ahead ([`Preview::warm_seams`]).
+//!
 //! # Which tiles
 //!
 //! A dab moves the points within its radius at pen-down. A finest tile holds such a point only if
@@ -370,6 +378,9 @@ pub struct Preview {
     finest_subs: BTreeMap<TileKey, BTreeSet<Place>>,
     /// Per display preview, the vertices it draws as a later stroke's preview does.
     display_subs: BTreeMap<TileKey, Vec<Seam>>,
+    /// Per preview a call looked around, the tiles whose previews may hold a vertex it holds
+    /// ([`Neighbours`]).
+    neighbours: BTreeMap<TileKey, Neighbours>,
 }
 
 /// A display preview being handed to the store ([`Preview::publish`]): whether it is held, its
@@ -380,6 +391,27 @@ type Publishing<'a> = (bool, f64, &'a [Seam], &'a mut DisplayState);
 /// A vertex a display preview draws as other previews do (see "Seams" in the module notes): its
 /// index, and the position and the normal it draws there, where those are another's.
 type Seam = (usize, Option<Vec3>, Option<Vec3>);
+
+/// The tiles whose previews may hold a vertex a preview holds: where it may meet others
+/// ([`Preview::around`]).
+///
+/// For a finest tile, the tiles its normals read ([`TileStore::normal_inputs`]: itself, and the
+/// tiles of its ring); for a display tile, those of every finest tile along its border
+/// ([`display::finest_on_border`]). And the display tiles above each of them.
+///
+/// **Valid as long as the place tables are** ([`Preview::finest_places`],
+/// [`Preview::border_places`]): it follows from the tile's key, the base mesh and the display
+/// layer's finest level alone, none of which a dab, a landing or a stroke beginning or ending
+/// changes; which of these tiles are previewed is asked afresh at every use. Forgotten with those
+/// tables as the last stroke ends ([`Preview::end_stroke`]), and a tile whose list can't be made
+/// has none kept.
+#[derive(Debug)]
+struct Neighbours {
+    /// The finest tiles, in key order, each once.
+    finest: Vec<TileKey>,
+    /// The display tiles above them, in key order, each once.
+    display: Vec<TileKey>,
+}
 
 /// The preview whose bits a place shows ([`Preview::choose`]).
 #[derive(Debug, Clone, Copy)]
@@ -639,35 +671,130 @@ impl Preview {
         owners.any(|owner| Some(owner) != first)
     }
 
-    /// The previews that may hold a vertex preview `key` holds, `key`'s included: for a finest
-    /// tile, the finest tiles of its ring and the display tiles above them; for a display tile,
-    /// the same around the finest tiles along its border, where it meets the tiles around it.
-    /// Only those previewed (a finest tile) or with a state (a display tile).
+    /// Notes the tiles whose previews may hold a vertex preview `key` holds ([`Neighbours`]), if
+    /// they aren't noted yet: what [`Preview::around`] picks the previews of.
+    ///
+    /// None is noted for a display tile of a store with no display layer.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::normal_inputs`].
-    fn around(&self, store: &TileStore, key: &TileKey) -> Result<BTreeSet<TileKey>, CacheError> {
-        let finest: Vec<TileKey> = if key.channel() == geom::Channel::DISPLAY {
+    /// As [`TileStore::normal_inputs`]: nothing is noted then.
+    fn note_neighbours(&mut self, store: &TileStore, key: &TileKey) -> Result<(), CacheError> {
+        if self.neighbours.contains_key(key) {
+            return Ok(());
+        }
+        let on_border: Vec<TileKey> = if key.channel() == geom::Channel::DISPLAY {
             let Some(level) = store.display_finest() else {
-                return Ok(BTreeSet::new());
+                return Ok(());
             };
             display::finest_on_border(key, level)
         } else {
             vec![*key]
         };
-        let mut around = BTreeSet::new();
-        around.insert(*key);
-        for tile in &finest {
-            for input in store.normal_inputs(tile)?.iter() {
-                if self.shown_by(input).is_some() {
-                    around.insert(*input);
-                }
-                let above = display_ancestors(input).filter(|up| self.displays.contains_key(up));
-                around.extend(above);
+        let mut finest: BTreeSet<TileKey> = BTreeSet::new();
+        for tile in &on_border {
+            finest.extend(store.normal_inputs(tile)?.iter().copied());
+        }
+        let above: BTreeSet<TileKey> = finest.iter().flat_map(display_ancestors).collect();
+        let neighbours = Neighbours {
+            finest: finest.into_iter().collect(),
+            display: above.into_iter().collect(),
+        };
+        self.neighbours.insert(*key, neighbours);
+        Ok(())
+    }
+
+    /// The previews that may hold a vertex preview `key` holds: for a finest tile, the finest
+    /// tiles of its ring and the display tiles above them; for a display tile, the same around
+    /// the finest tiles along its border, where it meets the tiles around it.
+    /// Only those previewed (a finest tile) or with a state (a display tile), each with the
+    /// stroke whose preview it is, of the tiles noted for `key` ([`Preview::note_neighbours`]);
+    /// none for a key with none noted. `key` itself comes if it has a preview: the caller
+    /// counts it in either way.
+    fn around(&self, key: &TileKey) -> impl Iterator<Item = (TileKey, Tag)> + '_ {
+        let noted = self.neighbours.get(key).into_iter();
+        noted.flat_map(|neighbours| {
+            let previewed = neighbours
+                .finest
+                .iter()
+                .filter_map(|tile| Some((*tile, self.shown_by(tile)?)));
+            let stated = neighbours
+                .display
+                .iter()
+                .filter_map(|tile| Some((*tile, self.displays.get(tile)?.op)));
+            previewed.chain(stated)
+        })
+    }
+
+    /// Notes the places of the vertices each preview of `keys` may share with others, those not
+    /// noted yet, made together on the store's workers: a finest tile's points along its border,
+    /// on either side, and its base-vertex rings' ([`seams::Shared`]), at the finest level; a
+    /// display tile's border vertices, at its own level ([`seams::border_places`]).
+    fn note_places(&mut self, store: &TileStore, keys: &BTreeSet<TileKey>) {
+        let mesh = store.mesh();
+        let (display, finest): (Vec<TileKey>, Vec<TileKey>) = keys
+            .iter()
+            .filter(|key| {
+                !self.finest_places.contains_key(key) && !self.border_places.contains_key(key)
+            })
+            .partition(|key| key.channel() == geom::Channel::DISPLAY);
+        if !finest.is_empty() {
+            let shared = store.par_map(&finest, |key| seams::Shared::of(mesh, key));
+            self.finest_places.extend(finest.into_iter().zip(shared));
+        }
+        if !display.is_empty() {
+            let borders = store.par_map(&display, |key| seams::border_places(mesh, key));
+            self.border_places.extend(display.into_iter().zip(borders));
+        }
+    }
+
+    /// Notes ahead what the stitches about finest tiles `tiles` look up (see "Seams" in the
+    /// module notes): the tiles around each, around the display tiles above it and its ring,
+    /// and around every preview there now, and where the vertices of all of those lie on the
+    /// faces' grids. For a caller that knows where a stroke over those landing is about to
+    /// begin (a pen hovering there): its first stitch finds them noted.
+    ///
+    /// Nothing shown changes, and nothing a later call does: what is noted follows from the
+    /// mesh alone, and a stitch notes whatever it finds missing. A tile whose neighbours can't
+    /// be listed is passed over, for the stitch to say. Nothing is noted while no dab is shown.
+    pub fn warm_seams(&mut self, store: &TileStore, tiles: &[TileKey]) {
+        if self.shown.is_empty() {
+            return;
+        }
+        // Each tile and the display tiles above it and its ring, which the stroke about to
+        // begin previews itself, and the previews there now.
+        let mut near: BTreeSet<TileKey> = BTreeSet::new();
+        for tile in tiles {
+            if self.note_neighbours(store, tile).is_ok() {
+                near.insert(*tile);
+                let above = self.neighbours.get(tile).into_iter();
+                near.extend(above.flat_map(|neighbours| neighbours.display.iter().copied()));
+                near.extend(self.around(tile).map(|(other, _)| other));
             }
         }
-        Ok(around)
+        for key in &near {
+            // One that can't be listed is left to the stitch, which reports it.
+            let _unlisted = self.note_neighbours(store, key);
+        }
+        self.note_places(store, &near);
+    }
+
+    /// Forgets what the stitches keep between calls (see "Seams" in the module notes: the
+    /// tiles around each preview and the previews' places): the next makes them afresh. For the
+    /// tests that keeping them changes nothing shown.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn forget_seams(&mut self) {
+        self.neighbours.clear();
+        self.finest_places.clear();
+        self.border_places.clear();
+    }
+
+    /// How many previews have something kept for the stitches to come
+    /// ([`Preview::forget_seams`] forgets it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn seams_kept(&self) -> usize {
+        self.neighbours.len() + self.finest_places.len() + self.border_places.len()
     }
 
     /// The places of the vertices preview `key` may share with others, each with its slot: a
@@ -683,7 +810,7 @@ impl Preview {
             let border = self
                 .border_places
                 .entry(*key)
-                .or_insert_with(|| seams::border_places(store, key));
+                .or_insert_with(|| seams::border_places(store.mesh(), key));
             let scaled = border
                 .iter()
                 .map(|&(v, (face, i, j))| (v, (face, i << shift, j << shift)));
@@ -692,7 +819,7 @@ impl Preview {
         let shared = self
             .finest_places
             .entry(*key)
-            .or_insert_with(|| seams::Shared::of(store, key));
+            .or_insert_with(|| seams::Shared::of(store.mesh(), key));
         shared
             .as_ref()
             .map_or_else(Vec::new, |shared| shared.slots.clone())
@@ -725,21 +852,26 @@ impl Preview {
         // they meet bit for bit already.
         let (affected, holders) = {
             let (store, _) = strokes.current();
-            let mut near = BTreeSet::new();
+            let mut near: BTreeSet<TileKey> = BTreeSet::new();
             for seed in &seeds {
-                near.extend(self.around(&store, seed)?);
+                self.note_neighbours(&store, seed)?;
+                if self.neighbours.contains_key(seed) {
+                    near.insert(*seed);
+                    near.extend(self.around(seed).map(|(other, _)| other));
+                }
             }
             let mut affected = BTreeSet::new();
             let mut holders = BTreeSet::new();
             for key in near {
-                let around = self.around(&store, &key)?;
+                self.note_neighbours(&store, &key)?;
                 let own = self.owner_of(&key);
-                let meets = around.iter().any(|other| self.owner_of(other) != own);
+                let meets = self.around(&key).any(|(_, owner)| Some(owner) != own);
                 let drew =
                     self.finest_subs.contains_key(&key) || self.display_subs.contains_key(&key);
                 if meets || drew {
+                    holders.extend(self.around(&key).map(|(other, _)| other));
+                    holders.insert(key);
                     affected.insert(key);
-                    holders.extend(around);
                 }
             }
             (affected, holders)
@@ -1229,6 +1361,7 @@ impl Preview {
         self.touched.clear();
         self.display_seeds.clear();
         self.finest_places.clear();
+        self.neighbours.clear();
         self.finest_subs.clear();
         self.display_subs.clear();
         store.take_pen_down_added();
@@ -1261,10 +1394,11 @@ impl Preview {
         let mut listed = Ok(());
         for key in &dropped {
             // The previews it met: their seams with it are made again.
-            match self.around(store, key) {
-                Ok(around) => {
-                    let (display, finest): (Vec<TileKey>, Vec<TileKey>) = around
-                        .into_iter()
+            match self.note_neighbours(store, key) {
+                Ok(()) => {
+                    let (display, finest): (Vec<TileKey>, Vec<TileKey>) = self
+                        .around(key)
+                        .map(|(other, _)| other)
                         .filter(|other| other != key)
                         .partition(|other| other.channel() == geom::Channel::DISPLAY);
                     self.display_seeds.extend(display);
