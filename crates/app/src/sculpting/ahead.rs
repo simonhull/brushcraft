@@ -53,8 +53,10 @@ pub(super) const HOVER_SETTLED: Duration = Duration::from_millis(50);
 /// they are few; a `Down` reading more makes the rest as it comes.
 pub(super) const AHEAD_MOST: usize = 128;
 
-/// How many of the tiles whose futures are made ahead have the seams about them noted in one
-/// `prepare` ([`Sculpting::note_seams_ahead`]): each some tens of microseconds a preview about
+/// The most tiles whose futures are made ahead that have the seams about them noted in one
+/// `prepare` ([`Sculpting::note_seams_ahead`]).
+///
+/// The clock is looked at before each: a tile costs some tens of microseconds a preview about
 /// it, the first time.
 pub(super) const SEAMS_A_CALL: usize = 8;
 
@@ -122,8 +124,11 @@ pub(super) struct Ahead {
     pub(super) todo: Vec<TileKey>,
     /// When a batch of them was last made; `None` if none was since they were let go.
     pub(super) made_at: Option<Instant>,
-    /// How many of `tiles`, in key order, have had the seams about them noted ahead
-    /// ([`Sculpting::note_seams_ahead`]) since they were last listed.
+    /// The tiles listed for `target`, in the order a `Down` there reads them, the nearest first
+    /// in each group ([`Sculpting::list_ahead`]): those whose futures are made, or to make.
+    pub(super) listed: Vec<TileKey>,
+    /// How many of `listed`, from its first, have had the seams about them noted ahead
+    /// ([`Sculpting::note_seams_ahead`]) since they were listed.
     pub(super) seamed: usize,
 }
 
@@ -329,25 +334,31 @@ impl Sculpting {
         let kept: BTreeSet<TileKey> = listed.iter().copied().collect();
         self.ahead.tiles.retain(|key, _| kept.contains(key));
         let todo = listed
-            .into_iter()
+            .iter()
             .rev()
             .filter(|key| !self.ahead.tiles.contains_key(key));
-        self.ahead.todo = todo.collect();
+        self.ahead.todo = todo.copied().collect();
+        self.ahead.listed = listed;
         self.ahead.seamed = 0;
     }
 
     /// Notes ahead, for the previews about the tiles whose futures are made ahead, what the
-    /// first stitch of a stroke begun there looks up ([`sculpt::Preview::warm_seams`]):
-    /// [`SEAMS_A_CALL`] tiles a call, while the clock is before `deadline`. Returns whether some
-    /// are still to note.
+    /// first stitch of a stroke begun there looks up ([`sculpt::Preview::warm_seams`]): the
+    /// tiles listed, nearest first as their futures were made, a tile at a time while the clock
+    /// is before `deadline`, [`SEAMS_A_CALL`] a call at most. Returns whether it noted some and
+    /// some are still to note.
+    ///
+    /// A call out of time notes nothing and asks for nothing: a `prepare` that says more is
+    /// wanted has always done some of it, so a loop whose frames overrun isn't kept turning for
+    /// work no call gets to. The tiles left wait for a `prepare` with time, which every frame
+    /// brings while the strokes land; and a `Down` that finds none noted notes them itself.
     ///
     /// Only once every future listed for where the pen hovers is made, up to the newest stroke
     /// under way: the tiles those futures are of are the ones a `Down` there reads of the
     /// strokes under way, so the ones its first dabs' previews meet theirs on. Never for a pen
     /// moving fast (`warming`, [`Sculpting::list_to_warm`]'s answer), as no future is.
     ///
-    /// What is noted follows from the mesh alone, so nothing here can go stale, and a `Down`
-    /// that finds none noted notes them itself, as before.
+    /// What is noted follows from the mesh alone, so nothing here can go stale.
     pub(super) fn note_seams_ahead(
         &mut self,
         scene: &mut Scene<'_>,
@@ -363,16 +374,19 @@ impl Sculpting {
         let Some(preview) = self.preview.as_mut().filter(|_| hovering && made) else {
             return false;
         };
-        let left = self.ahead.tiles.keys().skip(self.ahead.seamed);
+        let left = self.ahead.listed.iter().skip(self.ahead.seamed);
         let next: Vec<TileKey> = left.take(SEAMS_A_CALL).copied().collect();
-        if next.is_empty() {
-            return false;
+        let mut noted = false;
+        for tile in &next {
+            // Looked at before every tile: one beside a coarse display tile lists many.
+            if Instant::now() >= deadline {
+                break;
+            }
+            preview.warm_seams(scene.project.store(), std::slice::from_ref(tile));
+            self.ahead.seamed += 1;
+            noted = true;
         }
-        if Instant::now() < deadline {
-            preview.warm_seams(scene.project.store(), &next);
-            self.ahead.seamed += next.len();
-        }
-        self.ahead.seamed < self.ahead.tiles.len()
+        noted && self.ahead.seamed < self.ahead.listed.len()
     }
 
     /// Installs, ahead of a pen drawing over strokes still landing, the futures its next samples

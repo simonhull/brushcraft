@@ -10,6 +10,7 @@ use sculpt::{Future, Futures};
 use store::{DabBatch, DisplayPreview, FLUSH_INTERVAL, PenDown};
 
 use super::*;
+use crate::sculpting::ahead::SEAMS_A_CALL;
 use crate::sculpting::over::{
     Moves, Reach, Read, box_distance_squared, chain_of, needed, ray_meets_box, rounded_up,
 };
@@ -209,6 +210,17 @@ impl Chain {
                 break;
             }
             assert!(took.0 < HOVER_FRAMES, "the warming ends");
+        }
+        // The seams about those futures are noted in calls with time left, which the call
+        // that made the last future may not have had: the frames after it, as a loop brings
+        // them while strokes land.
+        for _ in 0..HOVER_FRAMES {
+            if self.brush.ahead.seamed >= self.brush.ahead.listed.len() {
+                break;
+            }
+            let prepared = context(&mut self.project, self.picker.index_mut(), &self.camera);
+            let by = Instant::now() + Duration::from_millis(4);
+            self.brush.prepare(prepared, by).expect("prepared");
         }
         self.brush.landing = landing;
         took
@@ -2711,6 +2723,53 @@ fn a_hover_that_moves_keeps_the_futures_near_and_one_moving_fast_makes_none() {
     assert!(!run.brush.warm.fast, "at rest");
     run.prepare_out();
     assert_ne!(run.brush.ahead.target, walked_at, "listed where it rests");
+    run.brush.abandon();
+    run.close();
+}
+
+#[test]
+fn a_prepare_out_of_time_notes_no_seam_ahead_and_asks_for_no_more() {
+    let mut run = across_many_tiles(Some(ORDINARY_RADIUS));
+    run.brush.ahead.clear();
+    // Nothing lands meanwhile (held, as during a close): the warming alone is looked at.
+    run.brush.landing = Landing::InSteps;
+    run.hover_step((150.0, 104.0), Instant::now() + Duration::from_secs(10));
+    // The futures made, then the seams about them, in the calls with time left after.
+    run.prepare_out();
+    run.prepare_out();
+    let listed = run.brush.ahead.listed.len();
+    assert!(listed > 0, "futures listed where it hovers");
+    assert_eq!(
+        run.brush.ahead.seamed, listed,
+        "with time, every seam noted"
+    );
+    // The same hover, its futures made, with no seam noted yet.
+    let kept = |chain: &Chain| chain.brush.preview.as_ref().map(Preview::seams_kept);
+    run.brush.ahead.seamed = 0;
+    if let Some(preview) = &mut run.brush.preview {
+        preview.forget_seams();
+    }
+    // Out of time, call after call (a loop whose frames overrun): nothing is noted, and no call
+    // says more is wanted, as none did any of it.
+    for _ in 0..3 {
+        assert!(
+            !run.prepare_late(),
+            "no more wanted of a call that did none"
+        );
+        assert_eq!(run.brush.ahead.seamed, 0, "none noted out of time");
+        assert_eq!(kept(&run), Some(0), "nothing kept");
+    }
+    // A call with time goes on from where they stand, and says more while it notes some.
+    let by = Instant::now() + Duration::from_secs(1);
+    let prepared = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    let more = run.brush.prepare(prepared, by).expect("prepared");
+    let first = run.brush.ahead.seamed;
+    assert_eq!(first, listed.min(SEAMS_A_CALL), "a call's worth noted");
+    assert_eq!(more, first < listed, "more wanted while some are left");
+    assert!(kept(&run) > Some(0), "and kept");
+    run.prepare_out();
+    assert_eq!(run.brush.ahead.seamed, listed, "all noted in the end");
+    assert!(!run.prepare_late(), "and nothing more to do");
     run.brush.abandon();
     run.close();
 }
