@@ -10,6 +10,7 @@ use sculpt::{Future, Futures};
 use store::{DabBatch, DisplayPreview, FLUSH_INTERVAL, PenDown};
 
 use super::*;
+use crate::frame::BETWEEN_SLICE;
 use crate::sculpting::ahead::SEAMS_A_CALL;
 use crate::sculpting::over::{
     Moves, Reach, Read, box_distance_squared, chain_of, needed, ray_meets_box, rounded_up,
@@ -2150,6 +2151,59 @@ fn a_down_refused_for_room_first_lets_go_of_the_seams_noted_ahead() {
     assert_eq!(left, 0, "bytes noted ahead still held as a stroke waits");
     assert_eq!(run.brush.error(), None);
     run.land_all();
+    run.close();
+}
+
+#[test]
+fn a_step_that_shows_a_downs_dabs_lands_none_however_long_since_its_samples_came() {
+    // A step that takes a `Down` over a stroke still landing may run long (its futures, its
+    // previews): by its end the samples it took came long ago, as a resting pen's did. It lands
+    // nothing of the earlier stroke all the same: what it showed reaches a frame first.
+    let mut run = Chain::new(Instant::now(), None);
+    run.frame(&stroke(ACROSS, 12));
+    run.cut();
+    let queued = |chain: &Chain| chain.rows().first().map_or(0, Vec::len);
+    let before = queued(&run);
+    assert!(before > 0, "the earlier stroke still lands");
+    // A microsecond a dab: a catch-up given a sample's interval lands them all, one given no
+    // time none.
+    run.brush.cost = DabCost::new(0.0, 1000.0, 0.0, 0.0);
+    let long_ago = Instant::now()
+        .checked_sub(STROKE_QUIET * 2)
+        .expect("after the epoch");
+    let late = |mut taken: PenSample| {
+        taken.timestamp = long_ago;
+        taken.received = long_ago;
+        taken
+    };
+    let mut pen = PenFrame::default();
+    pen.push(
+        late(sample(Phase::Down, (150.0, 80.0), 0.8)),
+        Some(Route::Brush),
+    );
+    pen.push(
+        late(sample(Phase::Drag, (153.0, 86.0), 0.8)),
+        Some(Route::Brush),
+    );
+    // Between frames, as the frame loop steps the brush over a stroke's samples.
+    let budget = BrushBudget::slice(Instant::now(), BETWEEN_SLICE);
+    let stepped = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    let report = run.brush.step(stepped, &pen, &budget).expect("a step");
+    assert_eq!(run.ops().len(), 2, "it began over the earlier stroke");
+    assert!(report.dabs_shown > 0, "its dabs are shown: {report:?}");
+    assert_eq!(
+        report.dabs_applied, 0,
+        "none landed in its step: {report:?}"
+    );
+    assert_eq!(queued(&run), before, "the earlier stroke's dabs wait");
+    // The pen resting on from there, a step that shows nothing catches up as before.
+    let rested = context(&mut run.project, run.picker.index_mut(), &run.camera);
+    let slice = BrushBudget::slice(Instant::now(), BETWEEN_SLICE);
+    run.brush.unframed = false;
+    let resting = run.brush.step(rested, &PenFrame::default(), &slice);
+    let resting = resting.expect("a step");
+    assert!(resting.dabs_applied > 0, "a resting pen's: {resting:?}");
+    run.brush.abandon();
     run.close();
 }
 

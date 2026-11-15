@@ -82,7 +82,8 @@
 //! frame's own step, which waits on no catch-up. While the pen draws ([`STROKE_QUIET`] since its
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
 //! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
-//! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
+//! on the surface, batches of a sample's interval (never in a step that showed dabs, however long
+//! that step took: their frame comes first); once the pen lifts, each step takes at least
 //! one dab, in batches of up to [`CATCH_UP_BATCH`] ([`WAITED_BATCH`] while the next stroke waits),
 //! a frame between batches.
 //! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
@@ -2255,8 +2256,11 @@ impl Sculpting {
         // to merge dabs per tile.
         let batch = self.preview.is_some() && forced && budget.is_some() && !moving;
         // A pen resting on the surface sends no samples to wait for: the catch-up takes a
-        // sample's interval at a time, so one arriving waits at most that.
-        let resting = down && !moving;
+        // sample's interval at a time, so one arriving waits at most that. A step that showed
+        // dabs isn't a resting pen's, however long ago its samples came by now (a `Down` over
+        // strokes still landing may take longer than [`STROKE_QUIET`] to route, place and
+        // show): what it showed reaches a frame before anything lands.
+        let resting = down && !moving && report.dabs_shown == 0;
         let interval = self
             .strokes
             .last()
