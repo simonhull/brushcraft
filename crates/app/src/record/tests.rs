@@ -340,11 +340,21 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
     let [stroke] = touched.as_slice() else {
         panic!("one segment with a touch: {touched:?}");
     };
+    // Its touch: the first report at or after 5 s, the pen having come into range at 4.7 s.
+    let touch = near.first_down(ms(4500), ms(6500)).unwrap();
     assert!(
-        stroke.starts_with(
-            r#"{"bench":"render","result":"segment","segment":"stroke_near","start_ms":4500,"end_ms":6500,"down_ms":500"#
-        ),
-        "{stroke}"
+        (ms(5000)..ms(5006)).contains(&touch),
+        "within a report of 5 s: {touch:?}"
+    );
+    let head = r#"{"bench":"render","result":"segment","segment":"stroke_near","start_ms":4500,"end_ms":6500,"down_ms":"#;
+    let said: f64 = stroke
+        .strip_prefix(head)
+        .and_then(|rest| rest.strip_suffix('}'))
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("the touch is the line's last field: {stroke}"));
+    assert!(
+        (said - touch.as_secs_f64() * 1e3).abs() < 1e-6,
+        "{said} for {touch:?}"
     );
     assert!(
         lines[0]
