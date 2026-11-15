@@ -7,12 +7,64 @@
 //! ([`Places`]) tells, slot by slot, which vertex of which face the tile holds there: its
 //! **place** ([`Place`]), the same in every tile holding it.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
 use geom::{
     BaseMesh, FaceId, GatheredBlock, Level, PositionSource, Region, TileKey, Vec3, gather_block,
 };
 
 /// A vertex of a face's grid at a level: its face's index, its column and its row.
 pub(super) type Place = (u32, u32, u32);
+
+/// A table by place (or by a display level and a place), built and read within one call and
+/// never walked: hashed by [`PlaceHasher`].
+pub(super) type ByPlace<K, V> = HashMap<K, V, BuildHasherDefault<PlaceHasher>>;
+
+/// The hasher of the tables by place ([`ByPlace`]): a multiply and a rotation a number, where the
+/// standard one's rounds cost more than everything else a seam's lookup does.
+///
+/// Its keys are a few small whole numbers the mesh sets (a face's index, a column, a row, a
+/// level), not anything a file or a peer can choose to collide: it need not resist that.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PlaceHasher(u64);
+
+impl PlaceHasher {
+    /// An odd number near 2⁶⁴ over the golden ratio: multiplying by it spreads a small number's
+    /// bits over the high ones.
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// Mixes `word` into the hash.
+    const fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::SPREAD);
+    }
+}
+
+impl Hasher for PlaceHasher {
+    fn finish(&self) -> u64 {
+        // The multiply leaves the low bits weakest, which pick a table's bucket: the high ones
+        // are brought down.
+        self.0.rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.mix(u64::from(byte));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.mix(u64::from(i));
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.mix(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+}
 
 /// A source answering each vertex with its own place, as exact small integers.
 struct Places;

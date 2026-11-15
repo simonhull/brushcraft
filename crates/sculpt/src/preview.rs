@@ -149,7 +149,8 @@
 //!
 //! Once no dab is shown, no tile is previewed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use brush::{Imprint, Smoothstep, draw_imprint_vertex};
 use geom::{GatheredBlock, Level, TileKey, Vec3};
@@ -375,7 +376,7 @@ pub struct Preview {
     /// a region that can't be gathered.
     finest_places: BTreeMap<TileKey, Option<seams::Shared>>,
     /// Per finest preview drawing a later stroke's bits at some vertices, their places.
-    finest_subs: BTreeMap<TileKey, BTreeSet<Place>>,
+    finest_subs: BTreeMap<TileKey, Vec<Place>>,
     /// Per display preview, the vertices it draws as a later stroke's preview does.
     display_subs: BTreeMap<TileKey, Vec<Seam>>,
     /// Per preview a call looked around, the tiles whose previews may hold a vertex it holds
@@ -413,13 +414,135 @@ struct Neighbours {
     display: Vec<TileKey>,
 }
 
+/// What each place the previews around a call's seams hold shows ([`Preview::choose`]): built
+/// for one stitch and dropped with it.
+///
+/// A stitch offers some hundreds of points a preview, so what a table keeps of each is small:
+/// a preview and its stroke are numbers into lists kept once ([`Chosen`]), a third of their keys'
+/// size, and the tables stay within a processor's nearer caches.
+#[derive(Debug, Default)]
+struct Winners {
+    /// The previews that offered, in key order: what [`Chosen::holder`] numbers.
+    holders: Vec<TileKey>,
+    /// Per place, the preview whose position shows there.
+    positions: seams::ByPlace<Place, Chosen>,
+    /// Per display level and place, the display preview whose normal shows there.
+    normals: seams::ByPlace<(Level, Place), Chosen>,
+}
+
+impl Winners {
+    /// Offers `drawn` for `at` in `table`: it shows there if nothing does yet, or if what does
+    /// is an older stroke's. Of one stroke's previews, the first offered stays.
+    fn offer<K: Eq + std::hash::Hash>(table: &mut seams::ByPlace<K, Chosen>, at: K, drawn: Chosen) {
+        match table.entry(at) {
+            Entry::Occupied(mut was) => {
+                if was.get().owner < drawn.owner {
+                    was.insert(drawn);
+                }
+            }
+            Entry::Vacant(free) => {
+                free.insert(drawn);
+            }
+        }
+    }
+
+    /// Preview `key`'s number among those that offered ([`Chosen::holder`]); `None` if it didn't.
+    fn number_of(&self, key: &TileKey) -> Option<u32> {
+        let at = self.holders.binary_search(key).ok()?;
+        u32::try_from(at).ok()
+    }
+
+    /// Finest preview `key`, its points' places `shared` and its block `block`, with another
+    /// preview's bits at each point where one shows; `drew` says whether it drew any so before.
+    /// `None` if none shows anywhere and none did: there is nothing to do or to note.
+    fn stitched(
+        &self,
+        key: &TileKey,
+        shared: &seams::Shared,
+        block: &GatheredBlock,
+        drew: bool,
+    ) -> Option<Stitched> {
+        let own = self.number_of(key);
+        // Each slot another preview shows at, with its place and the position that one draws.
+        let others = shared.slots.iter().filter_map(|&(slot, place)| {
+            let winner = self.positions.get(&place)?;
+            (Some(winner.holder) != own).then_some((slot, place, winner.at))
+        });
+        let newer: Vec<(usize, Place, Vec3)> = others.collect();
+        if newer.is_empty() && !drew {
+            return None;
+        }
+        // Drawn so already, as a preview mostly is a call later: left as it is.
+        let differs = newer.iter().any(|&(slot, _, at)| {
+            seams::point_at(block, slot).map(Vec3::to_bits) != Some(at.to_bits())
+        });
+        let mut stitched = None;
+        if differs {
+            let subs: seams::ByPlace<Place, Vec3> =
+                newer.iter().map(|&(_, place, at)| (place, at)).collect();
+            let mut moved = block.clone();
+            let mut changed = false;
+            let matched = moved.displace_along(&shared.block, |p, at| {
+                let Some(&drawn) = seams::place_of(at).and_then(|place| subs.get(&place)) else {
+                    return p;
+                };
+                changed |= drawn.to_bits() != p.to_bits();
+                drawn
+            });
+            if matched && changed {
+                stitched = Some(moved);
+            }
+        }
+        let drawn_as = newer.iter().map(|&(_, place, _)| place).collect();
+        Some(Stitched {
+            key: *key,
+            drawn_as,
+            block: stitched,
+        })
+    }
+
+    /// The vertices display preview `key` draws as another preview does: of `border`, its
+    /// border vertices with their places at its own level, those where another's position
+    /// shows, or another display preview's normal at its level; `finest` is the finest level,
+    /// which the places are scaled to.
+    fn seams_of(&self, key: &TileKey, finest: Level, border: &[(usize, Place)]) -> Vec<Seam> {
+        let level = key.level();
+        let own = self.number_of(key);
+        let shift = finest.get().saturating_sub(level.get());
+        let seams = border.iter().filter_map(|&(v, (face, i, j))| {
+            let place = (face, i << shift, j << shift);
+            let other = |winner: &&Chosen| Some(winner.holder) != own;
+            let at = self.positions.get(&place).filter(other);
+            let normal = self.normals.get(&(level, place)).filter(other);
+            let (at, normal) = (at.map(|winner| winner.at), normal.map(|winner| winner.at));
+            (at.is_some() || normal.is_some()).then_some((v, at, normal))
+        });
+        seams.collect()
+    }
+}
+
+/// The previews of a stitch, each with its number among them ([`Chosen::holder`]).
+type Numbered = Vec<(u32, TileKey)>;
+
+/// A finest preview as a stitch leaves it ([`Winners::stitched`]).
+#[derive(Debug)]
+struct Stitched {
+    /// The tile.
+    key: TileKey,
+    /// The places where it draws another preview's bits; none if it draws its own everywhere.
+    drawn_as: Vec<Place>,
+    /// Its block with those bits, if they changed it: what is handed to the store.
+    block: Option<GatheredBlock>,
+}
+
 /// The preview whose bits a place shows ([`Preview::choose`]).
 #[derive(Debug, Clone, Copy)]
 struct Chosen {
-    /// The stroke whose preview it is.
-    owner: Tag,
-    /// The preview: a finest tile's or a display tile's.
-    holder: TileKey,
+    /// The stroke whose preview it is, as its rank among the strokes of the stitch's previews:
+    /// a later stroke's is greater.
+    owner: u32,
+    /// The preview, a finest tile's or a display tile's: its number in [`Winners::holders`].
+    holder: u32,
     /// What it draws there: its position, or for a display level's normals, its normal.
     at: Vec3,
 }
@@ -797,34 +920,6 @@ impl Preview {
         self.neighbours.len() + self.finest_places.len() + self.border_places.len()
     }
 
-    /// The places of the vertices preview `key` may share with others, each with its slot: a
-    /// finest tile's points along its border, on either side, and its base-vertex rings'
-    /// ([`seams::Shared`]), at the finest level; a display tile's border vertices, its own index,
-    /// scaled to the finest level.
-    fn held_places(&mut self, store: &TileStore, key: &TileKey) -> Vec<(usize, Place)> {
-        if key.channel() == geom::Channel::DISPLAY {
-            let Some(finest) = store.display_finest() else {
-                return Vec::new();
-            };
-            let shift = finest.get().saturating_sub(key.level().get());
-            let border = self
-                .border_places
-                .entry(*key)
-                .or_insert_with(|| seams::border_places(store.mesh(), key));
-            let scaled = border
-                .iter()
-                .map(|&(v, (face, i, j))| (v, (face, i << shift, j << shift)));
-            return scaled.collect();
-        }
-        let shared = self
-            .finest_places
-            .entry(*key)
-            .or_insert_with(|| seams::Shared::of(store.mesh(), key));
-        shared
-            .as_ref()
-            .map_or_else(Vec::new, |shared| shared.slots.clone())
-    }
-
     /// Makes the previews of different strokes meet bit for bit where `seeds`, the finest tiles
     /// the call made, kept or cleared, and the display tiles it handed over lie (see "Seams" in
     /// the module notes): at a vertex previews of different strokes hold, every one draws the
@@ -877,20 +972,19 @@ impl Preview {
             (affected, holders)
         };
         // A finest preview drawing another's bits where that one doesn't win any more: made again.
-        let mut chosen = {
+        let mut winners = {
             let (store, _) = strokes.current();
             self.choose(&store, &holders)
         };
         let lost: BTreeSet<TileKey> = {
-            let (winners, _) = &chosen;
             let lost = affected.iter().filter(|key| {
                 let previewed = self.owner_of(key).is_some();
+                let own = winners.number_of(key);
                 previewed
                     && self.finest_subs.get(key).is_some_and(|subs| {
                         subs.iter().any(|place| {
-                            winners
-                                .get(place)
-                                .is_none_or(|winner| winner.holder == **key)
+                            let winner = winners.positions.get(place);
+                            winner.is_none_or(|winner| Some(winner.holder) == own)
                         })
                     })
             });
@@ -902,42 +996,35 @@ impl Preview {
             }
             self.remake(strokes, &lost, stats)?;
             let (store, _) = strokes.current();
-            chosen = self.choose(&store, &holders);
+            winners = self.choose(&store, &holders);
         }
         let (mut store, _) = strokes.current();
-        let (chosen, normals) = chosen;
+        self.note_places(&store, &affected);
+        let finest_level = store.display_finest();
         let mut republish: Vec<TileKey> = Vec::new();
+        let mut restitch: Vec<TileKey> = Vec::new();
         for key in &affected {
+            let display = key.channel() == geom::Channel::DISPLAY;
             if self.owner_of(key).is_none() {
-                if key.channel() == geom::Channel::DISPLAY {
+                if display {
                     self.display_subs.remove(key);
                 } else {
                     self.finest_subs.remove(key);
                 }
                 continue;
             }
-            let held = self.held_places(&store, key);
-            let other = |place: &Place| chosen.get(place).filter(|winner| winner.holder != *key);
-            if key.channel() == geom::Channel::DISPLAY {
-                let level = key.level();
-                let seams = held.into_iter().filter_map(|(v, place)| {
-                    let at = other(&place).map(|winner| winner.at);
-                    let normal = normals.get(&(level, place));
-                    let normal = normal.filter(|winner| winner.holder != *key);
-                    let normal = normal.map(|winner| winner.at);
-                    (at.is_some() || normal.is_some()).then_some((v, at, normal))
+            if display {
+                let border = finest_level.zip(self.border_places.get(key));
+                let seams = border.map_or_else(Vec::new, |(finest, border)| {
+                    winners.seams_of(key, finest, border)
                 });
-                let seams: Vec<Seam> = seams.collect();
                 self.display_subs.insert(*key, seams);
                 republish.push(*key);
             } else {
-                let taken = held
-                    .into_iter()
-                    .filter_map(|(slot, place)| Some((slot, place, other(&place)?.at)));
-                let taken: Vec<(usize, Place, Vec3)> = taken.collect();
-                self.substitute(&mut store, key, &taken, stats)?;
+                restitch.push(*key);
             }
         }
+        self.substitute(&mut store, &restitch, &winners, stats)?;
         self.publish(&mut store, &republish, stats)?;
         self.display_seeds.clear();
         Ok(())
@@ -946,123 +1033,121 @@ impl Preview {
     /// What each place a preview of `holders` holds shows (see "Seams" in the module notes): the
     /// newest stroke's preview holding it, a finest one before a display one of the same stroke,
     /// and the position it draws there, its own; and per display level and place, the newest
-    /// stroke's display preview holding it and its normal there.
-    fn choose(
-        &mut self,
-        store: &TileStore,
-        holders: &BTreeSet<TileKey>,
-    ) -> (HashMap<Place, Chosen>, HashMap<(Level, Place), Chosen>) {
-        let mut chosen: HashMap<Place, Chosen> = HashMap::new();
-        let mut normals: HashMap<(Level, Place), Chosen> = HashMap::new();
-        // The finest previews first: of one stroke, theirs win.
-        let (finest, display): (Vec<TileKey>, Vec<TileKey>) = holders
+    /// stroke's display preview holding it and its normal there. Of previews of one stroke, the
+    /// first in key order shows.
+    fn choose(&mut self, store: &TileStore, holders: &BTreeSet<TileKey>) -> Winners {
+        self.note_places(store, holders);
+        let finest_level = store.display_finest();
+        // The strokes of the previews, oldest first: a stroke's place among them is its rank.
+        let strokes: BTreeSet<Tag> = holders
             .iter()
-            .partition(|key| key.channel() != geom::Channel::DISPLAY);
-        let ordered = finest.into_iter().chain(display);
-        for key in ordered {
-            let Some(owner) = self.owner_of(&key) else {
+            .filter_map(|key| self.owner_of(key))
+            .collect();
+        let strokes: Vec<Tag> = strokes.into_iter().collect();
+        let rank_of = |stroke: Tag| {
+            let rank = strokes.binary_search(&stroke).ok()?;
+            u32::try_from(rank).ok()
+        };
+        // The finest previews first: of one stroke, theirs win.
+        let numbered = (0_u32..).zip(holders.iter().copied());
+        let (display, finest): (Numbered, Numbered) =
+            numbered.partition(|(_, key)| key.channel() == geom::Channel::DISPLAY);
+        // Room for the points offered, so the tables don't grow as they fill: a place is mostly
+        // offered by two previews or more.
+        let tables = finest
+            .iter()
+            .filter_map(|(_, key)| self.finest_places.get(key));
+        let points: usize = tables.flatten().map(|table| table.slots.len()).sum();
+        let borders = display
+            .iter()
+            .filter_map(|(_, key)| self.border_places.get(key));
+        let vertices: usize = borders.map(Vec::len).sum();
+        let mut winners = Winners {
+            holders: holders.iter().copied().collect(),
+            ..Winners::default()
+        };
+        winners.positions.reserve(usize::midpoint(points, vertices));
+        winners.normals.reserve(vertices);
+        for (holder, key) in finest {
+            let Some(owner) = self.shown_by(&key).and_then(rank_of) else {
                 continue;
             };
-            let held = self.held_places(store, &key);
-            if key.channel() == geom::Channel::DISPLAY {
-                let Some(state) = self.displays.get_mut(&key) else {
+            let shared = self.finest_places.get(&key).and_then(Option::as_ref);
+            let (Some(shared), Some(block)) = (shared, store.preview(&key)) else {
+                continue;
+            };
+            for &(slot, place) in &shared.slots {
+                let Some(at) = seams::point_at(block, slot) else {
                     continue;
                 };
-                state.refresh_normals();
-                for (v, place) in held {
-                    let Some((at, normal)) = state.vertex(v) else {
-                        continue;
-                    };
-                    let holder = key;
-                    let wins = |was: &Chosen| was.owner < owner;
-                    if chosen.get(&place).is_none_or(wins) {
-                        chosen.insert(place, Chosen { owner, holder, at });
-                    }
-                    let level = key.level();
-                    if normals.get(&(level, place)).is_none_or(wins) {
-                        let drawn = Chosen {
-                            owner,
-                            holder,
-                            at: normal,
-                        };
-                        normals.insert((level, place), drawn);
-                    }
-                }
-            } else {
-                let Some(block) = store.preview(&key) else {
-                    continue;
-                };
-                for (slot, place) in held {
-                    let Some(at) = seams::point_at(block, slot) else {
-                        continue;
-                    };
-                    if chosen.get(&place).is_none_or(|was| was.owner < owner) {
-                        let holder = key;
-                        chosen.insert(place, Chosen { owner, holder, at });
-                    }
-                }
+                Winners::offer(&mut winners.positions, place, Chosen { owner, holder, at });
             }
         }
-        (chosen, normals)
+        for (holder, key) in display {
+            let Some(state) = self.displays.get_mut(&key) else {
+                continue;
+            };
+            state.refresh_normals();
+            let border = finest_level.zip(self.border_places.get(&key));
+            let Some(((deepest, border), owner)) = border.zip(rank_of(state.op)) else {
+                continue;
+            };
+            let level = key.level();
+            let shift = deepest.get().saturating_sub(level.get());
+            for &(v, (face, i, j)) in border {
+                let Some((at, normal)) = state.vertex(v) else {
+                    continue;
+                };
+                let place = (face, i << shift, j << shift);
+                Winners::offer(&mut winners.positions, place, Chosen { owner, holder, at });
+                let drawn = Chosen {
+                    owner,
+                    holder,
+                    at: normal,
+                };
+                Winners::offer(&mut winners.normals, (level, place), drawn);
+            }
+        }
+        winners
     }
 
-    /// Finest preview `key` draws, at each of `newer` (a slot, its place, and the position the
-    /// preview chosen there draws: see "Seams" in the module notes), that preview's bits; handed
-    /// to the store if that changed it.
+    /// The finest previews of `keys` draw, at each point where `winners` has another preview show
+    /// (see "Seams" in the module notes), that preview's bits: worked out together on the
+    /// store's workers ([`Winners::stitched`]), then handed to the store, in key order, where
+    /// that changed one. The places each draws so are noted.
     ///
     /// # Errors
     ///
-    /// [`SculptError::Cache`] if the store refuses the preview.
+    /// [`SculptError::Cache`] if the store refuses a preview.
     fn substitute(
         &mut self,
         store: &mut TileStore,
-        key: &TileKey,
-        newer: &[(usize, Place, Vec3)],
+        keys: &[TileKey],
+        winners: &Winners,
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        if newer.is_empty() && !self.finest_subs.contains_key(key) {
-            return Ok(());
-        }
-        let places = self.finest_places.get(key).and_then(Option::as_ref);
-        let places = places.map(|shared| &shared.block);
-        let (Some(places), Some(block)) = (places, store.preview(key)) else {
-            return Ok(());
+        let stitched: Vec<Option<Stitched>> = {
+            let held = keys.iter().filter_map(|key| {
+                let shared = self.finest_places.get(key)?.as_ref()?;
+                let drew = self.finest_subs.contains_key(key);
+                Some((*key, shared, store.preview(key)?, drew))
+            });
+            let held: Vec<(TileKey, &seams::Shared, &GatheredBlock, bool)> = held.collect();
+            store.par_map(&held, |&(key, shared, block, drew)| {
+                winners.stitched(&key, shared, block, drew)
+            })
         };
-        // Drawn so already, as a preview mostly is a call later: left as it is.
-        let differs = newer.iter().any(|&(slot, _, at)| {
-            seams::point_at(block, slot).map(Vec3::to_bits) != Some(at.to_bits())
-        });
-        let drawn_as: BTreeSet<Place> = newer.iter().map(|&(_, place, _)| place).collect();
-        if !differs {
-            if drawn_as.is_empty() {
-                self.finest_subs.remove(key);
-            } else {
-                self.finest_subs.insert(*key, drawn_as);
+        let stitched = stitched.into_iter().flatten();
+        for done in stitched {
+            if let Some(block) = done.block {
+                store.set_preview(done.key, block)?;
+                stats.tiles_set += 1;
             }
-            return Ok(());
-        }
-        let subs: HashMap<Place, Vec3> = newer.iter().map(|&(_, place, at)| (place, at)).collect();
-        let mut stitched = block.clone();
-        let matched = stitched.displace_along(places, |p, at| {
-            seams::place_of(at)
-                .and_then(|place| subs.get(&place))
-                .copied()
-                .unwrap_or(p)
-        });
-        let before = seams::points(block);
-        let after = seams::points(&stitched);
-        let same = before
-            .iter()
-            .zip(&after)
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-        if matched && !same {
-            store.set_preview(*key, stitched)?;
-            stats.tiles_set += 1;
-        }
-        if subs.is_empty() {
-            self.finest_subs.remove(key);
-        } else {
-            self.finest_subs.insert(*key, drawn_as);
+            if done.drawn_as.is_empty() {
+                self.finest_subs.remove(&done.key);
+            } else {
+                self.finest_subs.insert(done.key, done.drawn_as);
+            }
         }
         Ok(())
     }
