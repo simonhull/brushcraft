@@ -1715,7 +1715,29 @@ impl Sculpting {
     /// them brought up to date ([`Sculpting::make_remaining`]), and the engine begun on their
     /// futures, those it reads installed for the op ([`on_futures`]). But for [`Over::Begun`],
     /// which holds the op's token, the op is given back before this returns.
+    ///
+    /// A stroke that can't begin for room (past the open strokes' share, typically) is tried
+    /// once more with what was noted ahead of the previews' seams let go
+    /// ([`Preview::let_go_unheld_seams`]), if any was: that counts with the open strokes' data,
+    /// and is only ever kept in room no stroke needs.
     fn engine_over(&mut self, scene: &mut Scene<'_>, first: Sample, id: StrokeId) -> Over {
+        let begun = self.engine_over_once(scene, first, id);
+        if !matches!(begun, Over::Waits) {
+            return begun;
+        }
+        let store = scene.project.store();
+        let preview = self.preview.as_mut();
+        let freed = preview.map_or(0, |preview| preview.let_go_unheld_seams(store, &[]));
+        if freed == 0 {
+            return begun;
+        }
+        // Noted again where the hover's list stands, if room comes back.
+        self.ahead.seamed = 0;
+        self.engine_over_once(scene, first, id)
+    }
+
+    /// [`Sculpting::engine_over`], tried once.
+    fn engine_over_once(&mut self, scene: &mut Scene<'_>, first: Sample, id: StrokeId) -> Over {
         #[cfg(test)]
         if matches!(self.knob, Knob::WaitsOverLanding) {
             return Over::Waits;

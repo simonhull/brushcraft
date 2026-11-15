@@ -2105,6 +2105,54 @@ fn what_a_stitch_keeps_between_calls_changes_nothing_the_previews_show() {
     }
 }
 
+#[test]
+fn a_down_refused_for_room_first_lets_go_of_the_seams_noted_ahead() {
+    // Small pools, as `past_the_open_strokes_share_the_next_down_waits_as_before` has, and a
+    // small brush: its strokes preview a few tiles of the sphere's 24.
+    let config = |budget: usize| {
+        StoreConfig::new(budget, 1)
+            .with_chunk_bytes(64 << 10)
+            .with_kept_predictions(0)
+            .with_stroke_tiles(8)
+            .with_display(Level::new(LEVEL).expect("a level"))
+    };
+    let minimum = config(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
+    let mut run = Chain::new(Instant::now(), Some(config(minimum + (8 << 20))));
+    run.brush.set_radius(ORDINARY_RADIUS);
+    let strokes = [stroke(ACROSS, 6), crossing(), over_both()];
+    run.frame(&strokes[0]);
+    // The seams about every tile noted ahead, while there is room: far more than is previewed.
+    let every = tile_keys(&mut run.project);
+    let store = run.project.store();
+    let (held, share) = (store.pen_down_bytes(), store.open_strokes_share());
+    let preview = run.brush.preview.as_mut().expect("the brush previews");
+    let noted = preview.warm_seams(store, &every);
+    assert!(noted, "room to note ahead: {held} of {share} held");
+    let unheld = every.len() - store.previewed().count();
+    assert!(unheld > 0, "tiles with seams noted and no preview");
+    // Strokes over strokes until one is refused for room.
+    let mut began = 1;
+    let drawn = strokes.iter().cycle().skip(1).take(MOST_OPEN);
+    for samples in drawn {
+        run.frame(samples);
+        if !run.brush.deferred.is_empty() {
+            break;
+        }
+        began += 1;
+    }
+    assert!(
+        !run.brush.deferred.is_empty(),
+        "past the share, a stroke waits: {began} began"
+    );
+    // Before it waited, what was noted ahead went: none of it holds room a stroke was refused.
+    let waiting = run.brush.preview.as_mut().expect("the brush previews");
+    let left = waiting.let_go_unheld_seams(run.project.store(), &[]);
+    assert_eq!(left, 0, "bytes noted ahead still held as a stroke waits");
+    assert_eq!(run.brush.error(), None);
+    run.land_all();
+    run.close();
+}
+
 /// How many times each timed case is drawn ([`time_downs`]): the median and the spread are said.
 const TIMED_RUNS: usize = 7;
 

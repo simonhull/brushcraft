@@ -919,7 +919,12 @@ impl Preview {
     }
 
     /// Lets go of what the stitches keep for every tile with no preview (see "Seams" in the
-    /// module notes), and tells the store what is left.
+    /// module notes) but those about the finest tiles `listed` (each of them, the tiles of its
+    /// ring and the display tiles above those: what noting ahead about it notes), and tells the
+    /// store what is left. Returns about how many bytes went.
+    ///
+    /// `listed` is where a stroke is still about to begin (a hover's present list): none, to
+    /// let go of everything noted ahead, as when a stroke is refused for room.
     ///
     /// **The rule:** what is kept for a tile (the tiles around it, its places) follows from
     /// the mesh alone and is noted again by whichever call next looks it up, so any of it may
@@ -928,9 +933,19 @@ impl Preview {
     /// ([`Preview::warm_seams`]) until the caller says that place is left: a pen hovering on
     /// would otherwise leave some megabytes behind at every place it rested, held until the
     /// last stroke ends.
-    pub fn let_go_unheld_seams(&mut self, store: &mut TileStore) {
+    pub fn let_go_unheld_seams(&mut self, store: &mut TileStore, listed: &[TileKey]) -> usize {
+        // What noting ahead about the tiles listed notes: kept, where it is noted.
+        let mut about: BTreeSet<TileKey> = listed.iter().copied().collect();
+        let noted = listed.iter().filter_map(|tile| self.neighbours.get(tile));
+        for neighbours in noted {
+            about.extend(neighbours.finest.iter().copied());
+            about.extend(neighbours.display.iter().copied());
+        }
         let (reached, displays) = (&self.reached, &self.displays);
         let held = |key: &TileKey| {
+            if about.contains(key) {
+                return true;
+            }
             if key.channel() == geom::Channel::DISPLAY {
                 displays.contains_key(key)
             } else {
@@ -941,8 +956,10 @@ impl Preview {
         self.neighbours.retain(|key, _| held(key));
         self.finest_places.retain(|key, _| held(key));
         self.border_places.retain(|key, _| held(key));
+        let before = self.seam_bytes;
         self.seam_bytes = self.seams_counted();
         self.note_bytes(store);
+        before.saturating_sub(self.seam_bytes)
     }
 
     /// Notes ahead what the stitches about finest tiles `tiles` look up (see "Seams" in the
@@ -958,9 +975,20 @@ impl Preview {
     /// What is noted is counted in the store's budget with the previews' states, and kept
     /// until the last stroke ends or the caller lets go of what no preview holds
     /// ([`Preview::let_go_unheld_seams`]).
-    pub fn warm_seams(&mut self, store: &mut TileStore, tiles: &[TileKey]) {
+    ///
+    /// **It never takes room a stroke could need.** That count is the open strokes' own
+    /// ([`TileStore::pen_down_bytes`]), against which the store refuses to reserve an op or
+    /// install a future ([`TileStore::open_strokes_share`]): so once the open strokes hold more
+    /// than half their share, nothing more is noted ahead, and this returns `false` (the caller
+    /// stops asking; the stitches note what they look up, as without it). And what was noted
+    /// ahead is the first thing let go when a stroke is refused for room
+    /// ([`Preview::let_go_unheld_seams`]).
+    pub fn warm_seams(&mut self, store: &mut TileStore, tiles: &[TileKey]) -> bool {
+        if store.pen_down_bytes().saturating_mul(2) > store.open_strokes_share() {
+            return false;
+        }
         if self.shown.is_empty() {
-            return;
+            return true;
         }
         // Each tile and the display tiles above it and its ring, which the stroke about to
         // begin previews itself, and the previews there now.
@@ -979,6 +1007,7 @@ impl Preview {
         }
         self.note_places(store, &near);
         self.note_bytes(store);
+        true
     }
 
     /// Forgets what the stitches keep between calls (see "Seams" in the module notes: the

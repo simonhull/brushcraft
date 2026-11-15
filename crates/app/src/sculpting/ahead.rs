@@ -280,16 +280,12 @@ impl Sculpting {
     /// ([`stroke::REACH_RADII`] radii, its first drag's walk). The hit on the surface the
     /// strokes leave may lie elsewhere along the ray, and so may what the `Down` reads about it:
     /// the list is a good guess, and the `Down` makes what it lacks. At most [`AHEAD_MOST`]; the
-    /// futures made before that aren't listed now are let go, the others kept. So is what was
-    /// noted ahead of the seams about the tiles listed before, where no preview holds it
-    /// ([`sculpt::Preview::let_go_unheld_seams`]): a hover that wanders keeps its last place's.
+    /// futures made before that aren't listed now are let go, the others kept. So, once the
+    /// new list is made, is what was noted ahead of the seams about tiles no longer listed,
+    /// where no preview holds it ([`sculpt::Preview::let_go_unheld_seams`]): what the tiles
+    /// still listed read stays, and a hover that wanders keeps its last place's alone.
     pub(super) fn list_ahead(&mut self, scene: &mut Scene<'_>, at: Pixel) {
         self.ahead.todo.clear();
-        // What was noted of the seams about the place it hovered before, where no preview came
-        // to hold it, goes: it is noted again for where the pen is now.
-        if let Some(preview) = &mut self.preview {
-            preview.let_go_unheld_seams(scene.project.store());
-        }
         let projector = scene.projector;
         let screen = ScreenPoint::new(at.x, at.y).ok();
         let Some(ray) = screen.and_then(|screen| projector.ray(screen)) else {
@@ -346,6 +342,9 @@ impl Sculpting {
             .filter(|key| !self.ahead.tiles.contains_key(key));
         self.ahead.todo = todo.copied().collect();
         self.ahead.listed = listed;
+        if let Some(preview) = &mut self.preview {
+            preview.let_go_unheld_seams(scene.project.store(), &self.ahead.listed);
+        }
         self.ahead.seamed = 0;
     }
 
@@ -354,6 +353,10 @@ impl Sculpting {
     /// tiles listed, nearest first as their futures were made, a tile at a time while the clock
     /// is before `deadline`, [`SEAMS_A_CALL`] a call at most. Returns whether it noted some and
     /// some are still to note.
+    ///
+    /// Nor is anything noted, or asked for, while the open strokes hold more than half their
+    /// share of the store's budget: what is noted ahead counts with their pen-down data, and
+    /// must never take the room a stroke's futures need.
     ///
     /// A call out of time notes nothing and asks for nothing: a `prepare` that says more is
     /// wanted has always done some of it, so a loop whose frames overrun isn't kept turning for
@@ -389,7 +392,10 @@ impl Sculpting {
             if Instant::now() >= deadline {
                 break;
             }
-            preview.warm_seams(scene.project.store(), std::slice::from_ref(tile));
+            // No room to note ahead (the open strokes hold half their share): no more is asked.
+            if !preview.warm_seams(scene.project.store(), std::slice::from_ref(tile)) {
+                return false;
+            }
             self.ahead.seamed += 1;
             noted = true;
         }

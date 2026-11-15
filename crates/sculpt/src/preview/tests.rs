@@ -658,7 +658,7 @@ fn what_the_stitches_keep_is_counted_in_the_stores_budget_and_let_go_where_no_pr
         .flat_map(|face| (0..4_u16).map(move |n| (face, n % 2, n / 2)))
         .map(|(face, tx, ty)| TileKey::displacement(FaceId::new(face), level(), tx, ty).unwrap())
         .collect();
-    preview.warm_seams(store, &every);
+    assert!(preview.warm_seams(store, &every), "room to note ahead");
     let noted = preview.seam_bytes;
     assert_eq!(noted, preview.seams_counted(), "kept up as they are noted");
     assert_eq!(
@@ -677,7 +677,7 @@ fn what_the_stitches_keep_is_counted_in_the_stores_budget_and_let_go_where_no_pr
     let previewed: Vec<TileKey> = store.previewed().copied().collect();
     assert!(previewed.len() < every.len(), "not every tile is previewed");
     // The place left: only what the previews hold stays, and the count follows.
-    preview.let_go_unheld_seams(store);
+    let went = preview.let_go_unheld_seams(store, &[]);
     let kept: Vec<TileKey> = preview.finest_places.keys().copied().collect();
     assert_eq!(kept, previewed, "the previewed tiles' places stay");
     assert!(
@@ -688,13 +688,72 @@ fn what_the_stitches_keep_is_counted_in_the_stores_budget_and_let_go_where_no_pr
     assert_eq!(around, previewed, "and the tiles around them");
     let left = preview.seam_bytes;
     assert!(left > 0 && left < noted, "{left} of {noted} bytes left");
+    assert_eq!(went, noted - left, "and says how much went");
     assert_eq!(left, preview.seams_counted(), "kept up as they are let go");
     assert_eq!(store.pen_down_bytes() - before, left, "and in the store");
     // Noted again where it is looked up: the same count as before.
-    preview.warm_seams(store, &every);
+    assert!(preview.warm_seams(store, &every));
     assert_eq!(preview.seam_bytes, noted, "noted again, the same");
+    // Let go but for a tile still listed (a hover's list): what was noted about it stays, its
+    // ring's and the display tiles' above it; a tile neither previewed nor about it goes.
+    let unheld = |key: &&TileKey| !previewed.contains(key);
+    let listed = *every.iter().find(unheld).unwrap();
+    let ring: Vec<TileKey> = preview.neighbours[&listed].finest.clone();
+    let far = *every
+        .iter()
+        .find(|key| unheld(key) && !ring.contains(key))
+        .unwrap();
+    preview.let_go_unheld_seams(store, &[listed]);
+    assert!(preview.finest_places.contains_key(&listed), "its places");
+    assert!(
+        preview.neighbours.contains_key(&listed),
+        "the tiles around it"
+    );
+    let mut above = super::display_ancestors(&listed);
+    assert!(
+        above.all(|up| preview.border_places.contains_key(&up)),
+        "and the display tiles' above it"
+    );
+    assert!(!preview.finest_places.contains_key(&far), "{far:?} goes");
+    assert_eq!(preview.seam_bytes, preview.seams_counted());
     preview.end_stroke(store).unwrap();
     assert_eq!(preview.seam_bytes, 0, "nothing kept past the last stroke");
     assert_eq!(preview.seams_counted(), 0);
+    drop(project.close(false));
+}
+
+#[test]
+fn nothing_is_noted_ahead_once_the_open_strokes_hold_half_their_share() {
+    // A store whose open strokes' share a stroke's previews half fill: what is noted ahead
+    // counts with them, and would take the room a later stroke's futures need.
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let path_of = dir.path().join("tight.bcrf");
+    std::fs::copy(&base, &path_of).unwrap();
+    let tight = |budget: usize| ProjectConfig {
+        store: StoreConfig::new(budget, 1)
+            .with_chunk_bytes(64 << 10)
+            .with_kept_predictions(0)
+            .with_stroke_tiles(8)
+            .with_display(level())
+            .with_workers(fixed(2)),
+        recovery_dir: dir.path().join("recovery-tight"),
+    };
+    let least = tight(0).store.minimum_budget(&cube_sphere(1).unwrap());
+    let mut project = Project::open(&path_of, tight(least + (4 << 20))).unwrap();
+    let index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
+    let dabs = path(project.store(), 8);
+    let store = project.store();
+    let mut preview = Preview::new();
+    preview
+        .show(store, &index, &dabs, &super::DrawsAll)
+        .unwrap();
+    let (held, share) = (store.pen_down_bytes(), store.open_strokes_share());
+    assert!(held * 2 > share, "past half the share: {held} of {share}");
+    let tiles: Vec<TileKey> = store.previewed().copied().collect();
+    assert!(!preview.warm_seams(store, &tiles), "no room to note ahead");
+    assert_eq!(preview.seam_bytes, 0, "nothing noted");
+    assert_eq!(store.pen_down_bytes(), held, "nor counted");
+    preview.end_stroke(store).unwrap();
     drop(project.close(false));
 }
