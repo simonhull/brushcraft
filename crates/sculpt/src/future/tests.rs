@@ -2,13 +2,14 @@
 //! stroke state has; and that taking one writes nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use geom::{CorrectionTile, FaceId, Level, TileKey, Vec3};
 use store::{Aabb, OpId, Project, ProjectConfig, SpatialIndex, StoreConfig, TileStore};
 use stroke::Dab;
 
 use super::{FutureError, Futures, PenDownTiles, Start, StrokeEdits};
-use crate::apply::SculptError;
+use crate::apply::{Plan, SculptError};
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab, fixed, tiles, vertex};
 use crate::{apply_dabs, dab_span};
@@ -1050,11 +1051,46 @@ fn assert_fast_path(store: &TileStore, state: &Stroke, edits: &StrokeEdits, case
     assert_eq!(*kept, *afresh, "{case}: the decisions kept");
     if unheld > free {
         let again = edits.plan(store, state);
-        assert!(
-            std::sync::Arc::ptr_eq(&kept, &again),
-            "{case}: decided once"
-        );
+        assert!(Arc::ptr_eq(&kept, &again), "{case}: decided once");
     }
+}
+
+#[test]
+fn decisions_kept_are_made_again_once_only_the_stroke_states_book_has_changed() {
+    // A stroke's later dabs are placed before any of it lands, and their decisions made: from
+    // a book with every buffer free, the stroke's state not yet this op's. Its first dabs then
+    // land, by another path than these edits: no dab of theirs is placed or dropped, and only
+    // the book the decisions start from has moved.
+    let mut rng = Rng::new(77);
+    let dir = TestDir::new();
+    let (mut project, mut index) = project(&dir, |config| config.with_stroke_tiles(2));
+    let dabs = random_stroke(project.store(), &mut rng, 16, 0);
+    let (first, rest) = dabs.split_at(4);
+    let mut state = Stroke::new(project.store());
+    let op = project.begin_stroke_and_wait().unwrap();
+    let pen_down = PenDownTiles::of_oldest(project.store(), op, &reach(&index, rest)).unwrap();
+    let mut edits = StrokeEdits::new(op, None);
+    edits.place(project.store(), rest, &pen_down).unwrap();
+    let before = edits.plan(project.store(), &state);
+    assert_ne!(*before, Plan::Continuous, "decided dab by dab");
+    let again = edits.plan(project.store(), &state);
+    assert!(Arc::ptr_eq(&before, &again), "kept while nothing changes");
+    let book = state.book_for(project.store(), op);
+    land(project.store(), &mut index, &mut state, first, &mut rng);
+    assert_ne!(state.book_for(project.store(), op), book, "the book moved");
+    assert_eq!(edits.remaining(), rest.len(), "no dab of theirs landed");
+    let after = edits.plan(project.store(), &state);
+    let afresh = edits.clone().plan(project.store(), &state);
+    assert_eq!(*after, *afresh, "the decisions of the book as it is now");
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "made again, not the ones kept"
+    );
+    assert_ne!(
+        *before, *after,
+        "and other decisions than the book before gave"
+    );
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// One interleaved case, of `seed`, over 2 to 13 tiles of stroke state.

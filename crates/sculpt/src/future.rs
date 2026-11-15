@@ -75,7 +75,9 @@
 //!   once for as long as nothing they follow from changes: a stroke's [`StrokeEdits`] keeps them
 //!   until a dab of it is placed or lands or the stroke state's bookkeeping moves, so the
 //!   [`Futures`] made again and again between two landings (a `Down`'s rounds, a batch made ahead)
-//!   decide once.
+//!   decide once. What is kept (a few megabytes for such a stroke) isn't counted in the open
+//!   strokes' share, and whatever changes a stroke's dabs other than by placing or landing them
+//!   must let it go: see `Decided`.
 //! - **A future**: one tile replayed over the dabs of each stroke that touch it: about what landing
 //!   that tile costs.
 //!
@@ -391,6 +393,23 @@ impl Clone for Decisions {
 
 /// Decisions made dab by dab, and what they were made from: the same book over the same dabs
 /// gives the same decisions ([`Plan::decide`] reads nothing else).
+///
+/// **What keeps them right.** They are given again only for the very book and the very dabs
+/// they were made of. The book is compared whole; the dabs by their range alone (`first`,
+/// `dabs`), which names them only because a [`StrokeEdits`]' dabs change in two ways:
+/// [`StrokeEdits::place`] adds after the last, [`StrokeEdits::land`] drops from the first.
+/// **Anything added later that changes them otherwise (edits a dab in place, drops one from
+/// the middle, puts others in their stead) must let these go**, or a future would be replayed
+/// under another stroke's grants: wrong bits, with nothing to say so.
+///
+/// **Not counted in the open strokes' share.** A copy of the book (a map of at most the stroke
+/// state's tiles, 512 entries) and the plan's grants, one for each tile each dab edits: a few
+/// megabytes for a stroke of 26,000 dabs still to land, tens of kilobytes for an ordinary one.
+/// They are kept only for a stroke whose remaining dabs edit more tiles than its state has
+/// buffers free, one set a stroke, and go as its edits do; the pen-down data such a stroke holds
+/// is hundreds of megabytes (432 MiB measured for that one), so they are under a hundredth of
+/// what the share already counts for it, and counting them would mean the store being told of
+/// a `sculpt` cache each time a plan is made.
 #[derive(Debug)]
 struct Decided {
     /// The stroke state's bookkeeping they start from.
